@@ -5,9 +5,11 @@ use anyhow::{Result, bail};
 use crate::memory::decay::apply_time_decay;
 use crate::memory::traits::Memory;
 use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider};
+use crate::security::prompt_guard::{PromptGuard, ScanResult};
 use crate::tools::traits::{Tool, ToolSpec};
 
 use super::context::SystemPromptBuilder;
+use super::scrub;
 
 /// The core agent that orchestrates provider calls, tool execution, and memory.
 pub struct Agent {
@@ -23,6 +25,7 @@ pub struct Agent {
     temperature: f64,
     memory_context_limit: usize,
     half_life_days: f64,
+    prompt_guard: Option<PromptGuard>,
 }
 
 impl Agent {
@@ -31,6 +34,23 @@ impl Agent {
     /// On the first turn the system prompt is built (with memory context) and
     /// frozen for the remainder of the session. Subsequent turns reuse it.
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        // Prompt guard scan.
+        if let Some(ref guard) = self.prompt_guard {
+            match guard.scan(user_message) {
+                ScanResult::Blocked(reason) => {
+                    bail!("{reason}");
+                }
+                ScanResult::Suspicious(categories, score) => {
+                    tracing::warn!(
+                        ?categories,
+                        score,
+                        "Prompt guard: suspicious input detected"
+                    );
+                }
+                ScanResult::Safe => {}
+            }
+        }
+
         // Build system prompt on first turn.
         if self.system_prompt.is_none() {
             let memory_context = self.load_memory_context(user_message).await?;
@@ -91,10 +111,10 @@ impl Agent {
         self.provider.chat(request).await
     }
 
-    /// Find a tool by name and execute it. Returns the formatted output string.
+    /// Find a tool by name and execute it. Returns the formatted output string
+    /// with credentials scrubbed.
     async fn execute_tool(&self, name: &str, args: &serde_json::Value) -> String {
-        let tool = self.tools.iter().find(|t| t.name() == name);
-        match tool {
+        let raw = match self.tools.iter().find(|t| t.name() == name) {
             Some(t) => match t.execute(args.clone()).await {
                 Ok(result) => {
                     if result.success {
@@ -109,7 +129,8 @@ impl Agent {
                 Err(e) => format!("Tool execution failed: {e}"),
             },
             None => format!("Unknown tool: {name}"),
-        }
+        };
+        scrub::scrub_credentials(&raw)
     }
 
     /// Load memory context for the given query.
@@ -159,6 +180,7 @@ pub struct AgentBuilder {
     temperature: Option<f64>,
     memory_context_limit: Option<usize>,
     half_life_days: Option<f64>,
+    prompt_guard: Option<PromptGuard>,
 }
 
 impl AgentBuilder {
@@ -174,6 +196,7 @@ impl AgentBuilder {
             temperature: None,
             memory_context_limit: None,
             half_life_days: None,
+            prompt_guard: None,
         }
     }
 
@@ -232,6 +255,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn prompt_guard(mut self, guard: PromptGuard) -> Self {
+        self.prompt_guard = Some(guard);
+        self
+    }
+
     /// Build the [`Agent`], validating that required fields are set.
     pub fn build(self) -> Result<Agent> {
         let provider = self
@@ -262,6 +290,7 @@ impl AgentBuilder {
             temperature: self.temperature.unwrap_or(0.7),
             memory_context_limit: self.memory_context_limit.unwrap_or(5),
             half_life_days: self.half_life_days.unwrap_or(7.0),
+            prompt_guard: self.prompt_guard,
         })
     }
 }
