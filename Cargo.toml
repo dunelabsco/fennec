@@ -1,0 +1,49 @@
+[package]
+name = "fennec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "The fastest personal AI agent with collective intelligence"
+license = "MIT"
+
+[[bin]]
+name = "fennec"
+path = "src/main.rs"
+
+[lib]
+name = "fennec"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+chacha20poly1305 = "0.10"
+async-trait = "0.1"
+parking_lot = "0.12"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.22", features = ["v4"] }
+sha2 = "0.10"
+regex = "1.10"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.9"
+futures = "0.3"
+dirs = "6.0"
+hex = "0.4"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3.15"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
