@@ -7,12 +7,16 @@ use fennec::agent::AgentBuilder;
 use fennec::channels::cli::CliChannel;
 use fennec::channels::traits::{Channel, SendMessage};
 use fennec::config::FennecConfig;
-use fennec::memory::embedding::NoopEmbedding;
+use fennec::memory::embedding::{NoopEmbedding, OpenAIEmbedding};
+use fennec::memory::snapshot;
 use fennec::memory::sqlite::SqliteMemory;
+use fennec::memory::Memory;
 use fennec::providers::anthropic::AnthropicProvider;
+use fennec::security::prompt_guard::{GuardAction, PromptGuard};
 use fennec::security::SecretStore;
 use fennec::tools::files::{ListDirTool, ReadFileTool, WriteFileTool};
 use fennec::tools::shell::ShellTool;
+use fennec::tools::web::{WebFetchTool, WebSearchTool};
 
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
@@ -55,6 +59,15 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         .context("API key not found: set provider.api_key in config or ANTHROPIC_API_KEY env var")
 }
 
+/// Parse the guard action string from config into a GuardAction enum.
+fn parse_guard_action(action: &str) -> GuardAction {
+    match action.to_lowercase().as_str() {
+        "block" => GuardAction::Block,
+        "sanitize" => GuardAction::Sanitize,
+        _ => GuardAction::Warn,
+    }
+}
+
 async fn run_agent(
     config: FennecConfig,
     home_dir: std::path::PathBuf,
@@ -71,6 +84,26 @@ async fn run_agent(
     // Create AnthropicProvider with optional model override.
     let provider = AnthropicProvider::new(api_key, model.or(Some(config.provider.model.clone())));
 
+    // Create embedding provider based on config.
+    let embedder: Arc<dyn fennec::memory::embedding::EmbeddingProvider> =
+        match config.memory.embedding_provider.as_str() {
+            "openai" => {
+                let embedding_key = if !config.memory.embedding_api_key.is_empty() {
+                    config.memory.embedding_api_key.clone()
+                } else {
+                    std::env::var("OPENAI_API_KEY")
+                        .unwrap_or_default()
+                };
+                if embedding_key.is_empty() {
+                    tracing::warn!("embedding_provider is 'openai' but no API key found; falling back to noop");
+                    Arc::new(NoopEmbedding::new(1536))
+                } else {
+                    Arc::new(OpenAIEmbedding::new(embedding_key, None, None, None))
+                }
+            }
+            _ => Arc::new(NoopEmbedding::new(1536)),
+        };
+
     // Create SqliteMemory.
     let db_path = config
         .memory
@@ -78,9 +111,8 @@ async fn run_agent(
         .as_ref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| home_dir.join("memory").join("brain.db"));
-    let embedder = Arc::new(NoopEmbedding::new(1536));
     let memory = SqliteMemory::new(
-        db_path,
+        db_path.clone(),
         config.memory.vector_weight as f32,
         config.memory.keyword_weight as f32,
         config.memory.cache_max,
@@ -88,6 +120,25 @@ async fn run_agent(
     )
     .context("creating sqlite memory")?;
     let memory = Arc::new(memory);
+
+    // Soul snapshot: hydrate from snapshot if DB is fresh and snapshot exists.
+    let snapshot_path = home_dir.join("MEMORY_SNAPSHOT.md");
+    let db_is_new = !db_path.exists() || {
+        // Check if the file was just created (size 0 or very small = new).
+        // SqliteMemory::new already created the file, so check if entries exist.
+        let entries = memory.list(None, 1).await.unwrap_or_default();
+        entries.is_empty()
+    };
+    if db_is_new && snapshot_path.exists() {
+        match snapshot::hydrate_from_snapshot(memory.as_ref(), &snapshot_path).await {
+            Ok(count) => {
+                tracing::info!(count, "hydrated memories from snapshot");
+            }
+            Err(e) => {
+                tracing::warn!("failed to hydrate from snapshot: {e}");
+            }
+        }
+    }
 
     // Create tools.
     let shell_tool = ShellTool::new(
@@ -98,15 +149,23 @@ async fn run_agent(
     let read_file_tool = ReadFileTool::new();
     let write_file_tool = WriteFileTool::new();
     let list_dir_tool = ListDirTool::new();
+    let web_fetch_tool = WebFetchTool::new();
+    let web_search_tool = WebSearchTool::new();
+
+    // Create prompt guard from config security settings.
+    let guard_action = parse_guard_action(&config.security.prompt_guard_action);
+    let prompt_guard = PromptGuard::new(guard_action, config.security.prompt_guard_sensitivity);
 
     // Build Agent.
     let mut agent = AgentBuilder::new()
         .provider(Box::new(provider))
-        .memory(memory)
+        .memory(memory.clone())
         .tool(Box::new(shell_tool))
         .tool(Box::new(read_file_tool))
         .tool(Box::new(write_file_tool))
         .tool(Box::new(list_dir_tool))
+        .tool(Box::new(web_fetch_tool))
+        .tool(Box::new(web_search_tool))
         .identity_name(&config.identity.name)
         .identity_persona(&config.identity.persona)
         .max_tool_iterations(config.agent.max_tool_iterations as usize)
@@ -114,6 +173,7 @@ async fn run_agent(
         .temperature(config.provider.temperature)
         .memory_context_limit(config.memory.context_limit)
         .half_life_days(config.memory.half_life_days)
+        .prompt_guard(prompt_guard)
         .build()
         .context("building agent")?;
 
@@ -140,6 +200,8 @@ async fn run_agent(
         use std::io::Write;
         let _ = std::io::stdout().flush();
 
+        let consolidation_enabled = config.memory.consolidation_enabled;
+
         // Process messages.
         while let Some(msg) = rx.recv().await {
             if msg.content.is_empty() {
@@ -151,10 +213,27 @@ async fn run_agent(
                     let send_msg = SendMessage::new(&response, "user");
                     // Print via channel send (writes to stdout).
                     println!("Fennec: {}", send_msg.content);
+
+                    // Fire-and-forget consolidation hint.
+                    if consolidation_enabled {
+                        tracing::debug!(
+                            "consolidation: would consolidate after turn (provider sharing needed for full implementation)"
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
                 }
+            }
+        }
+
+        // Clean exit — export soul snapshot.
+        match snapshot::export_snapshot(memory.as_ref(), &snapshot_path).await {
+            Ok(count) => {
+                tracing::info!(count, path = %snapshot_path.display(), "exported soul snapshot on exit");
+            }
+            Err(e) => {
+                tracing::warn!("failed to export soul snapshot on exit: {e}");
             }
         }
 

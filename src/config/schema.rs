@@ -74,6 +74,7 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub temperature: f64,
     pub max_tokens: u32,
+    pub fallback_models: Vec<String>,
 }
 
 impl Default for ProviderConfig {
@@ -84,6 +85,7 @@ impl Default for ProviderConfig {
             api_key: String::new(),
             temperature: 0.7,
             max_tokens: 8192,
+            fallback_models: Vec::new(),
         }
     }
 }
@@ -98,6 +100,9 @@ pub struct MemoryConfig {
     pub half_life_days: f64,
     pub cache_max: usize,
     pub context_limit: usize,
+    pub embedding_provider: String,
+    pub embedding_api_key: String,
+    pub consolidation_enabled: bool,
 }
 
 impl Default for MemoryConfig {
@@ -109,6 +114,9 @@ impl Default for MemoryConfig {
             half_life_days: 7.0,
             cache_max: 10000,
             context_limit: 5,
+            embedding_provider: "noop".to_string(),
+            embedding_api_key: String::new(),
+            consolidation_enabled: true,
         }
     }
 }
@@ -153,6 +161,7 @@ impl Default for SecurityConfig {
 pub struct AgentConfig {
     pub max_tool_iterations: u32,
     pub context_window: u64,
+    pub compression_threshold: f64,
 }
 
 impl Default for AgentConfig {
@@ -160,6 +169,7 @@ impl Default for AgentConfig {
         Self {
             max_tool_iterations: 15,
             context_window: 200_000,
+            compression_threshold: 0.50,
         }
     }
 }
