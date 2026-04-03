@@ -1,0 +1,165 @@
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Top-level Fennec configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FennecConfig {
+    pub identity: IdentityConfig,
+    pub provider: ProviderConfig,
+    pub memory: MemoryConfig,
+    pub security: SecurityConfig,
+    pub agent: AgentConfig,
+}
+
+impl Default for FennecConfig {
+    fn default() -> Self {
+        Self {
+            identity: IdentityConfig::default(),
+            provider: ProviderConfig::default(),
+            memory: MemoryConfig::default(),
+            security: SecurityConfig::default(),
+            agent: AgentConfig::default(),
+        }
+    }
+}
+
+impl FennecConfig {
+    /// Resolve the Fennec home directory.
+    /// Priority: override arg > $FENNEC_HOME > ~/.fennec
+    pub fn resolve_home(override_path: Option<&str>) -> PathBuf {
+        if let Some(p) = override_path {
+            return PathBuf::from(p);
+        }
+        if let Ok(env_home) = std::env::var("FENNEC_HOME") {
+            return PathBuf::from(env_home);
+        }
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".fennec")
+    }
+
+    /// Load configuration from a TOML file at `path`.
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let contents = std::fs::read_to_string(path)?;
+        let config: FennecConfig = toml::from_str(&contents)?;
+        Ok(config)
+    }
+}
+
+/// Identity configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IdentityConfig {
+    pub name: String,
+    pub persona: String,
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            name: "Fennec".to_string(),
+            persona: "A fast, helpful AI assistant with collective intelligence.".to_string(),
+        }
+    }
+}
+
+/// LLM provider configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderConfig {
+    pub name: String,
+    pub model: String,
+    pub api_key: String,
+    pub temperature: f64,
+    pub max_tokens: u32,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            name: "anthropic".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            api_key: String::new(),
+            temperature: 0.7,
+            max_tokens: 8192,
+        }
+    }
+}
+
+/// Memory subsystem configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    pub db_path: Option<String>,
+    pub vector_weight: f64,
+    pub keyword_weight: f64,
+    pub half_life_days: f64,
+    pub cache_max: usize,
+    pub context_limit: usize,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            db_path: None,
+            vector_weight: 0.7,
+            keyword_weight: 0.3,
+            half_life_days: 7.0,
+            cache_max: 10000,
+            context_limit: 5,
+        }
+    }
+}
+
+/// Security configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    pub prompt_guard_action: String,
+    pub prompt_guard_sensitivity: f64,
+    pub encrypt_secrets: bool,
+    pub command_allowlist: Vec<String>,
+    pub forbidden_paths: Vec<String>,
+    pub command_timeout_secs: u64,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            prompt_guard_action: "warn".to_string(),
+            prompt_guard_sensitivity: 0.7,
+            encrypt_secrets: true,
+            command_allowlist: vec![
+                "git", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail", "date",
+                "df", "du", "uname", "cargo", "npm", "node", "python", "python3", "pip",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            forbidden_paths: vec!["/etc", "/root", "/boot", "/dev", "/proc", "/sys"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            command_timeout_secs: 60,
+        }
+    }
+}
+
+/// Agent behaviour configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub max_tool_iterations: u32,
+    pub context_window: u64,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            max_tool_iterations: 15,
+            context_window: 200_000,
+        }
+    }
+}
