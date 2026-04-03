@@ -1,4 +1,4 @@
-use fennec::providers::traits::{ChatMessage, ChatResponse, ToolCall, UsageInfo};
+use fennec::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall, UsageInfo};
 
 #[test]
 fn chat_message_user() {
@@ -96,4 +96,69 @@ fn chat_message_serialization_roundtrip() {
     let deserialized: ChatMessage = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(deserialized.role, "user");
     assert_eq!(deserialized.content.as_deref(), Some("test message"));
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Provider Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn openai_provider_defaults() {
+    let provider = fennec::providers::OpenAIProvider::new(
+        "sk-test".to_string(),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(provider.name(), "openai");
+    assert!(provider.supports_tool_calling());
+    assert_eq!(provider.context_window(), 128_000);
+}
+
+#[test]
+fn openai_provider_custom() {
+    let provider = fennec::providers::OpenAIProvider::new(
+        "sk-test".to_string(),
+        Some("gpt-4o-mini".to_string()),
+        Some("https://custom.api.com/v1".to_string()),
+        Some(64_000),
+    );
+    assert_eq!(provider.context_window(), 64_000);
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter Provider Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn openrouter_provider_basics() {
+    let provider = fennec::providers::OpenRouterProvider::new(
+        "sk-or-test".to_string(),
+        Some("anthropic/claude-3-haiku".to_string()),
+        None,
+    );
+    assert_eq!(provider.name(), "openrouter");
+    assert!(provider.supports_tool_calling());
+}
+
+// ---------------------------------------------------------------------------
+// Ollama Provider Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ollama_provider_defaults() {
+    let provider = fennec::providers::OllamaProvider::new(None, None, None);
+    assert_eq!(provider.name(), "ollama");
+    assert!(provider.supports_tool_calling());
+    assert_eq!(provider.context_window(), 8192);
+}
+
+#[test]
+fn ollama_provider_custom() {
+    let provider = fennec::providers::OllamaProvider::new(
+        Some("mistral".to_string()),
+        Some("http://myserver:11434".to_string()),
+        Some(32768),
+    );
+    assert_eq!(provider.context_window(), 32768);
 }
