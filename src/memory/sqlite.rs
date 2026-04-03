@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use sha2::{Sha256, Digest};
 
 use crate::memory::embedding::EmbeddingProvider;
+use crate::memory::experience::{Experience, ExperienceContext};
 use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
 use crate::memory::vector::{cosine_similarity, hybrid_merge, ScoredResult};
 
@@ -99,7 +100,41 @@ impl SqliteMemory {
                 embedding    BLOB,
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS experiences (
+                id          TEXT PRIMARY KEY,
+                goal        TEXT NOT NULL,
+                context_json TEXT NOT NULL DEFAULT '{}',
+                attempts_json TEXT NOT NULL DEFAULT '[]',
+                solution    TEXT,
+                gotchas_json TEXT NOT NULL DEFAULT '[]',
+                tags_json   TEXT NOT NULL DEFAULT '[]',
+                confidence  REAL NOT NULL DEFAULT 0.5,
+                session_id  TEXT,
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS experiences_fts USING fts5(
+                goal, solution, content=experiences, content_rowid=rowid
+            );
+
+            CREATE TRIGGER IF NOT EXISTS experiences_ai AFTER INSERT ON experiences BEGIN
+                INSERT INTO experiences_fts(rowid, goal, solution)
+                VALUES (new.rowid, new.goal, COALESCE(new.solution, ''));
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS experiences_ad AFTER DELETE ON experiences BEGIN
+                INSERT INTO experiences_fts(experiences_fts, rowid, goal, solution)
+                VALUES ('delete', old.rowid, old.goal, COALESCE(old.solution, ''));
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS experiences_au AFTER UPDATE ON experiences BEGIN
+                INSERT INTO experiences_fts(experiences_fts, rowid, goal, solution)
+                VALUES ('delete', old.rowid, old.goal, COALESCE(old.solution, ''));
+                INSERT INTO experiences_fts(rowid, goal, solution)
+                VALUES (new.rowid, new.goal, COALESCE(new.solution, ''));
+            END;",
         )
         .context("creating schema")?;
 
@@ -539,6 +574,187 @@ impl Memory for SqliteMemory {
             let conn = conn.lock();
             conn.query_row("SELECT 1", [], |_row| Ok(()))?;
             Ok(())
+        })
+        .await?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Experience methods (not part of the Memory trait)
+// ---------------------------------------------------------------------------
+
+impl SqliteMemory {
+    /// Store an experience, serialising JSON fields.
+    pub async fn store_experience(&self, exp: &Experience) -> Result<()> {
+        let exp = exp.clone();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let context_json = serde_json::to_string(&exp.context)?;
+            let attempts_json = serde_json::to_string(&exp.attempts)?;
+            let gotchas_json = serde_json::to_string(&exp.gotchas)?;
+            let tags_json = serde_json::to_string(&exp.tags)?;
+
+            conn.execute(
+                "INSERT OR REPLACE INTO experiences
+                 (id, goal, context_json, attempts_json, solution, gotchas_json, tags_json, confidence, session_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    exp.id,
+                    exp.goal,
+                    context_json,
+                    attempts_json,
+                    exp.solution,
+                    gotchas_json,
+                    tags_json,
+                    exp.confidence,
+                    exp.session_id,
+                    exp.created_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Full-text search on experiences by goal / solution text.
+    pub async fn search_experiences(&self, query: &str, limit: usize) -> Result<Vec<Experience>> {
+        let conn = Arc::clone(&self.conn);
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+
+            // Build FTS5 query: wrap each word in quotes, join with OR.
+            let fts_query: String = query
+                .split_whitespace()
+                .map(|w| format!("\"{}\"", w))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+
+            if fts_query.is_empty() {
+                return Ok(vec![]);
+            }
+
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.goal, e.context_json, e.attempts_json, e.solution,
+                        e.gotchas_json, e.tags_json, e.confidence, e.session_id, e.created_at
+                 FROM experiences_fts AS f
+                 JOIN experiences AS e ON e.rowid = f.rowid
+                 WHERE experiences_fts MATCH ?1
+                 LIMIT ?2",
+            )?;
+
+            let rows = stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
+                let context_json: String = row.get(2)?;
+                let attempts_json: String = row.get(3)?;
+                let gotchas_json: String = row.get(5)?;
+                let tags_json: String = row.get(6)?;
+
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    context_json,
+                    attempts_json,
+                    row.get::<_, Option<String>>(4)?,
+                    gotchas_json,
+                    tags_json,
+                    row.get::<_, f32>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })?;
+
+            let mut experiences = Vec::new();
+            for row in rows {
+                let (id, goal, ctx_json, att_json, solution, got_json, tag_json, confidence, session_id, created_at) = row?;
+                let context: ExperienceContext = serde_json::from_str(&ctx_json).unwrap_or(ExperienceContext {
+                    tools_used: vec![],
+                    environment: String::new(),
+                    constraints: String::new(),
+                });
+                let attempts = serde_json::from_str(&att_json).unwrap_or_default();
+                let gotchas = serde_json::from_str(&got_json).unwrap_or_default();
+                let tags = serde_json::from_str(&tag_json).unwrap_or_default();
+
+                experiences.push(Experience {
+                    id,
+                    goal,
+                    context,
+                    attempts,
+                    solution,
+                    gotchas,
+                    tags,
+                    confidence,
+                    session_id,
+                    created_at,
+                });
+            }
+
+            Ok(experiences)
+        })
+        .await?
+    }
+
+    /// List the most recent experiences.
+    pub async fn list_experiences(&self, limit: usize) -> Result<Vec<Experience>> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, goal, context_json, attempts_json, solution,
+                        gotchas_json, tags_json, confidence, session_id, created_at
+                 FROM experiences
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+            )?;
+
+            let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+                let context_json: String = row.get(2)?;
+                let attempts_json: String = row.get(3)?;
+                let gotchas_json: String = row.get(5)?;
+                let tags_json: String = row.get(6)?;
+
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    context_json,
+                    attempts_json,
+                    row.get::<_, Option<String>>(4)?,
+                    gotchas_json,
+                    tags_json,
+                    row.get::<_, f32>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })?;
+
+            let mut experiences = Vec::new();
+            for row in rows {
+                let (id, goal, ctx_json, att_json, solution, got_json, tag_json, confidence, session_id, created_at) = row?;
+                let context: ExperienceContext = serde_json::from_str(&ctx_json).unwrap_or(ExperienceContext {
+                    tools_used: vec![],
+                    environment: String::new(),
+                    constraints: String::new(),
+                });
+                let attempts = serde_json::from_str(&att_json).unwrap_or_default();
+                let gotchas = serde_json::from_str(&got_json).unwrap_or_default();
+                let tags = serde_json::from_str(&tag_json).unwrap_or_default();
+
+                experiences.push(Experience {
+                    id,
+                    goal,
+                    context,
+                    attempts,
+                    solution,
+                    gotchas,
+                    tags,
+                    confidence,
+                    session_id,
+                    created_at,
+                });
+            }
+
+            Ok(experiences)
         })
         .await?
     }
