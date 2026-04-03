@@ -1,11 +1,15 @@
+use std::sync::Arc;
+
 use fennec::memory::traits::{Memory, MemoryCategory, MemoryEntry};
 use fennec::memory::sqlite::SqliteMemory;
+use fennec::memory::embedding::NoopEmbedding;
 use tempfile::TempDir;
 
 fn make_db() -> (TempDir, SqliteMemory) {
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("test.db");
-    let mem = SqliteMemory::new(db_path, 0.7, 0.3, 10_000).expect("new sqlite memory");
+    let embedder = Arc::new(NoopEmbedding::new(1536));
+    let mem = SqliteMemory::new(db_path, 0.7, 0.3, 10_000, embedder).expect("new sqlite memory");
     (dir, mem)
 }
 

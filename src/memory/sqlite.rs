@@ -5,20 +5,22 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rusqlite::Connection;
+use sha2::{Sha256, Digest};
 
+use crate::memory::embedding::EmbeddingProvider;
 use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
+use crate::memory::vector::{cosine_similarity, hybrid_merge, ScoredResult};
 
 /// SQLite-backed memory store.
 pub struct SqliteMemory {
     conn: Arc<Mutex<Connection>>,
     #[allow(dead_code)]
     db_path: PathBuf,
-    #[allow(dead_code)]
     vector_weight: f32,
-    #[allow(dead_code)]
     keyword_weight: f32,
     #[allow(dead_code)]
     cache_max: usize,
+    embedder: Arc<dyn EmbeddingProvider>,
 }
 
 impl SqliteMemory {
@@ -31,6 +33,7 @@ impl SqliteMemory {
         vector_weight: f32,
         keyword_weight: f32,
         cache_max: usize,
+        embedder: Arc<dyn EmbeddingProvider>,
     ) -> Result<Self> {
         // Create parent directories if they don't exist.
         if let Some(parent) = db_path.parent() {
@@ -106,6 +109,7 @@ impl SqliteMemory {
             vector_weight,
             keyword_weight,
             cache_max,
+            embedder,
         })
     }
 }
@@ -177,6 +181,61 @@ fn keyword_search(
     Ok(results)
 }
 
+/// Serialize a Vec<f32> as a little-endian byte blob.
+fn serialize_embedding(vec: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vec.len() * 4);
+    for &v in vec {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
+/// Deserialize a little-endian byte blob back into a Vec<f32>.
+fn deserialize_embedding(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|chunk| {
+            let arr: [u8; 4] = chunk.try_into().unwrap();
+            f32::from_le_bytes(arr)
+        })
+        .collect()
+}
+
+/// Perform a vector search by computing cosine similarity against all stored embeddings.
+///
+/// Returns `(id, score)` pairs sorted by similarity descending. Only rows with
+/// non-NULL embeddings are considered.
+fn vector_search(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<(String, f64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        Ok((id, blob))
+    })?;
+
+    let mut results: Vec<(String, f64)> = Vec::new();
+    for row in rows {
+        let (id, blob) = row?;
+        let stored_embedding = deserialize_embedding(&blob);
+        if stored_embedding.len() != query_embedding.len() {
+            continue; // Skip mismatched dimensions.
+        }
+        let similarity = cosine_similarity(query_embedding, &stored_embedding);
+        results.push((id, similarity));
+    }
+
+    // Sort by similarity descending.
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    Ok(results)
+}
+
 /// Read a full `MemoryEntry` row from the database.
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let cat_str: String = row.get(3)?;
@@ -205,6 +264,55 @@ impl Memory for SqliteMemory {
     }
 
     async fn store(&self, entry: MemoryEntry) -> Result<()> {
+        // Compute embedding if the embedder is not noop.
+        let embedding_blob = if self.embedder.name() != "noop" {
+            // Check cache first using SHA-256 hash of content.
+            let content_hash = {
+                let mut hasher = Sha256::new();
+                hasher.update(entry.content.as_bytes());
+                hex::encode(hasher.finalize())
+            };
+
+            let cached = {
+                let conn = self.conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT embedding FROM embedding_cache WHERE content_hash = ?1",
+                )?;
+                let mut rows = stmt.query(rusqlite::params![content_hash])?;
+                if let Some(row) = rows.next()? {
+                    let blob: Vec<u8> = row.get(0)?;
+                    Some(blob)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(blob) = cached {
+                // Update accessed_at in cache.
+                let now = chrono::Utc::now().to_rfc3339();
+                let conn = self.conn.lock();
+                conn.execute(
+                    "UPDATE embedding_cache SET accessed_at = ?1 WHERE content_hash = ?2",
+                    rusqlite::params![now, content_hash],
+                )?;
+                Some(blob)
+            } else {
+                let vec = self.embedder.embed(&entry.content).await?;
+                let blob = serialize_embedding(&vec);
+                // Store in cache.
+                let now = chrono::Utc::now().to_rfc3339();
+                let conn = self.conn.lock();
+                conn.execute(
+                    "INSERT OR REPLACE INTO embedding_cache (content_hash, embedding, created_at, accessed_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![content_hash, blob, now, now],
+                )?;
+                Some(blob)
+            }
+        } else {
+            None
+        };
+
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
@@ -225,7 +333,7 @@ impl Memory for SqliteMemory {
                     entry.key,
                     entry.content,
                     category_to_str(&entry.category),
-                    None::<Vec<u8>>, // embedding not set here
+                    embedding_blob,
                     entry.created_at,
                     entry.updated_at,
                     entry.session_id,
@@ -240,19 +348,69 @@ impl Memory for SqliteMemory {
     }
 
     async fn recall(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+        let use_vector = self.embedder.name() != "noop";
+
+        // Compute query embedding if we have a real embedder.
+        let query_embedding = if use_vector {
+            Some(self.embedder.embed(query).await?)
+        } else {
+            None
+        };
+
         let conn = Arc::clone(&self.conn);
         let query = query.to_string();
+        let vector_weight = self.vector_weight as f64;
+        let keyword_weight = self.keyword_weight as f64;
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
 
             // Keyword search via FTS5.
-            let keyword_results = keyword_search(&conn, &query, limit)?;
-            if keyword_results.is_empty() {
+            let keyword_results = keyword_search(&conn, &query, limit * 2)?;
+
+            // Vector search if we have a query embedding.
+            let merged_ids: Vec<(String, f64)> = if let Some(ref qe) = query_embedding {
+                let vector_results = vector_search(&conn, qe, limit * 2)?;
+
+                // Convert to ScoredResult for hybrid_merge.
+                let vec_scored: Vec<ScoredResult> = vector_results
+                    .iter()
+                    .map(|(id, score)| ScoredResult {
+                        id: id.clone(),
+                        score: *score,
+                    })
+                    .collect();
+                let kw_scored: Vec<ScoredResult> = keyword_results
+                    .iter()
+                    .map(|(id, score)| ScoredResult {
+                        id: id.clone(),
+                        score: *score,
+                    })
+                    .collect();
+
+                let merged = hybrid_merge(
+                    &vec_scored,
+                    &kw_scored,
+                    vector_weight,
+                    keyword_weight,
+                    limit,
+                );
+
+                merged.into_iter().map(|r| (r.id, r.score)).collect()
+            } else {
+                // Keyword-only.
+                keyword_results
+                    .iter()
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            };
+
+            if merged_ids.is_empty() {
                 return Ok(vec![]);
             }
 
             // Fetch full rows for matched IDs.
-            let ids: Vec<String> = keyword_results.iter().map(|(id, _)| id.clone()).collect();
+            let ids: Vec<String> = merged_ids.iter().map(|(id, _)| id.clone()).collect();
             let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT id, key, content, category, created_at, updated_at, session_id, namespace, embedding, importance, superseded_by
@@ -274,8 +432,8 @@ impl Memory for SqliteMemory {
             let mut entries: Vec<MemoryEntry> = Vec::new();
             for row in rows {
                 let mut entry = row?;
-                // Attach the keyword score.
-                if let Some((_, score)) = keyword_results.iter().find(|(id, _)| *id == entry.id) {
+                // Attach the merged score.
+                if let Some((_, score)) = merged_ids.iter().find(|(id, _)| *id == entry.id) {
                     entry.score = Some(*score);
                 }
                 entries.push(entry);

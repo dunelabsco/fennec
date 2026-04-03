@@ -7,6 +7,7 @@ use fennec::agent::AgentBuilder;
 use fennec::channels::cli::CliChannel;
 use fennec::channels::traits::{Channel, SendMessage};
 use fennec::config::FennecConfig;
+use fennec::memory::embedding::NoopEmbedding;
 use fennec::memory::sqlite::SqliteMemory;
 use fennec::providers::anthropic::AnthropicProvider;
 use fennec::security::SecretStore;
@@ -77,11 +78,13 @@ async fn run_agent(
         .as_ref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| home_dir.join("memory").join("brain.db"));
+    let embedder = Arc::new(NoopEmbedding::new(1536));
     let memory = SqliteMemory::new(
         db_path,
         config.memory.vector_weight as f32,
         config.memory.keyword_weight as f32,
         config.memory.cache_max,
+        embedder,
     )
     .context("creating sqlite memory")?;
     let memory = Arc::new(memory);
