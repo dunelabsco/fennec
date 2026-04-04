@@ -165,9 +165,12 @@ setup_config() {
         else
             log "Registering with Plurum..."
             local register_response=""
+            local agent_username
+            agent_username=$(echo "$agent_name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')
+            agent_username="${agent_username}-$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
             register_response=$(curl -s --max-time 10 -X POST "https://api.plurum.ai/api/v1/agents/register" \
                 -H "Content-Type: application/json" \
-                -d "{\"name\": \"$agent_name\"}" 2>/dev/null) || register_response=""
+                -d "{\"name\": \"$agent_name\", \"username\": \"$agent_username\"}" 2>/dev/null) || register_response=""
 
             if [ -n "$register_response" ]; then
                 plurum_key=$(echo "$register_response" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('api_key',''))" 2>/dev/null) || plurum_key=""
