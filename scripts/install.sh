@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="https://github.com/dunelabsco/fennec.git"
+INSTALL_DIR="$HOME/.local/bin"
+FENNEC_HOME="$HOME/.fennec"
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+print_banner() {
+    echo -e "${BOLD}"
+    echo "  ╔═══════════════════════════════════════╗"
+    echo "  ║           FENNEC INSTALLER             ║"
+    echo "  ║  The fastest AI agent with collective  ║"
+    echo "  ║           intelligence                 ║"
+    echo "  ╚═══════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+log()   { echo -e "${GREEN}[fennec]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[fennec]${NC} $1"; }
+error() { echo -e "${RED}[fennec]${NC} $1"; exit 1; }
+
+check_deps() {
+    log "Checking dependencies..."
+
+    if ! command -v git &>/dev/null; then
+        error "git is required. Install it first."
+    fi
+
+    if ! command -v cargo &>/dev/null; then
+        warn "Rust not found. Installing via rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source "$HOME/.cargo/env"
+        log "Rust installed: $(rustc --version)"
+    else
+        log "Rust found: $(rustc --version)"
+    fi
+}
+
+build_fennec() {
+    local build_dir
+    build_dir=$(mktemp -d)
+    log "Cloning Fennec into $build_dir..."
+    git clone --depth=1 "$REPO" "$build_dir/fennec"
+    cd "$build_dir/fennec"
+
+    log "Building release binary (this may take a minute)..."
+    cargo build --release
+
+    mkdir -p "$INSTALL_DIR"
+    cp target/release/fennec "$INSTALL_DIR/fennec"
+    chmod +x "$INSTALL_DIR/fennec"
+    log "Installed to $INSTALL_DIR/fennec"
+
+    # Cleanup
+    rm -rf "$build_dir"
+}
+
+setup_config() {
+    mkdir -p "$FENNEC_HOME"
+    mkdir -p "$FENNEC_HOME/memory"
+    mkdir -p "$FENNEC_HOME/cron"
+    mkdir -p "$FENNEC_HOME/pairing"
+
+    if [ -f "$FENNEC_HOME/config.toml" ]; then
+        log "Config already exists at $FENNEC_HOME/config.toml — skipping."
+        return
+    fi
+
+    echo ""
+    echo -e "${BOLD}Quick Setup${NC}"
+    echo ""
+
+    # Provider selection
+    echo "Which LLM provider? (default: anthropic)"
+    echo "  1) anthropic (Claude)"
+    echo "  2) openai (GPT-4o)"
+    echo "  3) openrouter (any model)"
+    echo "  4) ollama (local)"
+    read -rp "> " provider_choice
+    case "${provider_choice:-1}" in
+        1) provider="anthropic"; model="claude-sonnet-4-20250514"; key_env="ANTHROPIC_API_KEY" ;;
+        2) provider="openai"; model="gpt-4o"; key_env="OPENAI_API_KEY" ;;
+        3) provider="openrouter"; model="anthropic/claude-sonnet-4"; key_env="OPENROUTER_API_KEY" ;;
+        4) provider="ollama"; model="llama3.1"; key_env="" ;;
+        *) provider="anthropic"; model="claude-sonnet-4-20250514"; key_env="ANTHROPIC_API_KEY" ;;
+    esac
+
+    # API key
+    api_key=""
+    if [ -n "$key_env" ]; then
+        if [ -n "${!key_env:-}" ]; then
+            api_key="${!key_env}"
+            log "Using $key_env from environment."
+        else
+            read -rp "Enter your API key (or press Enter to set later): " api_key
+        fi
+    fi
+
+    # Agent name
+    read -rp "Agent name (default: Fennec): " agent_name
+    agent_name="${agent_name:-Fennec}"
+
+    # Collective (Plurum)
+    echo ""
+    echo "Enable collective intelligence via Plurum? (y/N)"
+    read -rp "> " enable_collective
+    plurum_key=""
+    if [[ "${enable_collective:-n}" =~ ^[Yy] ]]; then
+        if [ -n "${PLURUM_API_KEY:-}" ]; then
+            plurum_key="$PLURUM_API_KEY"
+            log "Using PLURUM_API_KEY from environment."
+        else
+            read -rp "Enter your Plurum API key: " plurum_key
+        fi
+    fi
+
+    # Write config
+    cat > "$FENNEC_HOME/config.toml" << TOML
+[identity]
+name = "$agent_name"
+persona = "A fast, helpful AI assistant with collective intelligence."
+
+[provider]
+name = "$provider"
+model = "$model"
+api_key = "$api_key"
+temperature = 0.7
+max_tokens = 8192
+
+[memory]
+vector_weight = 0.7
+keyword_weight = 0.3
+half_life_days = 7.0
+consolidation_enabled = true
+
+[security]
+prompt_guard_action = "warn"
+prompt_guard_sensitivity = 0.7
+encrypt_secrets = true
+command_timeout_secs = 60
+
+[agent]
+max_tool_iterations = 15
+context_window = 200000
+
+[channels.telegram]
+enabled = false
+token = ""
+
+[channels.discord]
+enabled = false
+token = ""
+
+[channels.slack]
+enabled = false
+bot_token = ""
+app_token = ""
+
+[gateway]
+host = "127.0.0.1"
+port = 8990
+
+[cron]
+enabled = false
+
+[collective]
+enabled = $([ -n "$plurum_key" ] && echo "true" || echo "false")
+api_key = "$plurum_key"
+base_url = "https://api.plurum.ai"
+publish_enabled = true
+search_enabled = true
+TOML
+
+    log "Config written to $FENNEC_HOME/config.toml"
+}
+
+ensure_path() {
+    if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+        warn "$INSTALL_DIR is not in your PATH."
+        echo ""
+        echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
+        echo ""
+        echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+        echo ""
+    fi
+}
+
+print_done() {
+    echo ""
+    echo -e "${GREEN}${BOLD}Fennec is installed!${NC}"
+    echo ""
+    echo "  Quick start:"
+    echo "    fennec status              # Check it's working"
+    echo "    fennec agent               # Interactive chat"
+    echo "    fennec agent -m 'Hello'    # Single message"
+    echo "    fennec gateway             # Start all channels"
+    echo ""
+    echo "  Config: $FENNEC_HOME/config.toml"
+    echo "  Memory: $FENNEC_HOME/memory/brain.db"
+    echo ""
+    echo "  To add channels (Telegram, Discord, Slack):"
+    echo "    Edit $FENNEC_HOME/config.toml and set tokens"
+    echo ""
+}
+
+main() {
+    print_banner
+    check_deps
+    build_fennec
+    setup_config
+    ensure_path
+    print_done
+}
+
+main "$@"
