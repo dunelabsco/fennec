@@ -72,6 +72,11 @@ check_deps() {
 }
 
 build_fennec() {
+    if [ -x "$INSTALL_DIR/fennec" ]; then
+        log "Fennec binary already exists at $INSTALL_DIR/fennec — skipping build."
+        return
+    fi
+
     local build_dir
     build_dir=$(mktemp -d)
     log "Cloning Fennec into $build_dir..."
