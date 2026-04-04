@@ -134,6 +134,42 @@ impl SqliteMemory {
                 VALUES ('delete', old.rowid, old.goal, COALESCE(old.solution, ''));
                 INSERT INTO experiences_fts(rowid, goal, solution)
                 VALUES (new.rowid, new.goal, COALESCE(new.solution, ''));
+            END;
+
+            CREATE TABLE IF NOT EXISTS collective_cache (
+                id TEXT PRIMARY KEY,
+                original_id TEXT NOT NULL,
+                source_server TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                solution TEXT,
+                gotchas_json TEXT NOT NULL DEFAULT '[]',
+                attempts_json TEXT NOT NULL DEFAULT '[]',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                trust_score REAL NOT NULL DEFAULT 0.3,
+                relevance_score REAL,
+                outcome_success INTEGER NOT NULL DEFAULT 0,
+                outcome_failure INTEGER NOT NULL DEFAULT 0,
+                cached_at TEXT NOT NULL,
+                last_used TEXT
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS collective_cache_fts USING fts5(
+                goal, solution, content=collective_cache, content_rowid=rowid
+            );
+
+            CREATE TRIGGER IF NOT EXISTS cc_ai AFTER INSERT ON collective_cache BEGIN
+                INSERT INTO collective_cache_fts(rowid, goal, solution)
+                VALUES (new.rowid, new.goal, COALESCE(new.solution, ''));
+            END;
+            CREATE TRIGGER IF NOT EXISTS cc_ad AFTER DELETE ON collective_cache BEGIN
+                INSERT INTO collective_cache_fts(collective_cache_fts, rowid, goal, solution)
+                VALUES ('delete', old.rowid, old.goal, COALESCE(old.solution, ''));
+            END;
+            CREATE TRIGGER IF NOT EXISTS cc_au AFTER UPDATE ON collective_cache BEGIN
+                INSERT INTO collective_cache_fts(collective_cache_fts, rowid, goal, solution)
+                VALUES ('delete', old.rowid, old.goal, COALESCE(old.solution, ''));
+                INSERT INTO collective_cache_fts(rowid, goal, solution)
+                VALUES (new.rowid, new.goal, COALESCE(new.solution, ''));
             END;",
         )
         .context("creating schema")?;
@@ -146,6 +182,13 @@ impl SqliteMemory {
             cache_max,
             embedder,
         })
+    }
+}
+
+impl SqliteMemory {
+    /// Expose the underlying connection for use by other modules (e.g. collective cache).
+    pub fn connection(&self) -> Arc<Mutex<Connection>> {
+        Arc::clone(&self.conn)
     }
 }
 
