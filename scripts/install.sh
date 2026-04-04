@@ -112,7 +112,7 @@ setup_config() {
     echo "  3) kimi (Moonshot)"
     echo "  4) openrouter (any model)"
     echo "  5) ollama (local)"
-    read -rp "> " provider_choice
+    read -rp "> " provider_choice < /dev/tty
     provider_base_url=""
     case "${provider_choice:-1}" in
         1) provider="anthropic"; model="claude-sonnet-4-20250514"; key_env="ANTHROPIC_API_KEY" ;;
@@ -130,35 +130,52 @@ setup_config() {
             api_key="${!key_env}"
             log "Using $key_env from environment."
         else
-            read -rp "Enter your API key (or press Enter to set later): " api_key
+            read -rp "Enter your API key (or press Enter to set later): " api_key < /dev/tty
         fi
     fi
 
     # Agent name
-    read -rp "Agent name (default: Fennec): " agent_name
+    read -rp "Agent name (default: Fennec): " agent_name < /dev/tty
     agent_name="${agent_name:-Fennec}"
 
     # Telegram setup
     echo ""
     echo "Set up Telegram channel? (y/N)"
     echo "  (Create a bot via @BotFather on Telegram to get a token)"
-    read -rp "> " enable_telegram
+    read -rp "> " enable_telegram < /dev/tty
     telegram_token=""
     if [[ "${enable_telegram:-n}" =~ ^[Yy] ]]; then
-        read -rp "Enter your Telegram bot token: " telegram_token
+        read -rp "Enter your Telegram bot token: " telegram_token < /dev/tty
     fi
 
     # Collective (Plurum)
     echo ""
     echo "Enable collective intelligence via Plurum? (y/N)"
-    read -rp "> " enable_collective
+    read -rp "> " enable_collective < /dev/tty
     plurum_key=""
     if [[ "${enable_collective:-n}" =~ ^[Yy] ]]; then
         if [ -n "${PLURUM_API_KEY:-}" ]; then
             plurum_key="$PLURUM_API_KEY"
-            log "Using PLURUM_API_KEY from environment."
+            log "Using existing PLURUM_API_KEY from environment."
         else
-            read -rp "Enter your Plurum API key: " plurum_key
+            log "Registering with Plurum..."
+            local register_response
+            register_response=$(curl -s -X POST "https://api.plurum.ai/api/v1/agents/register" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\": \"$agent_name\"}" 2>&1) || true
+
+            plurum_key=$(echo "$register_response" | grep -o '"api_key":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+            if [ -n "$plurum_key" ]; then
+                log "Registered with Plurum! Your agent is now part of the collective."
+                echo ""
+                echo -e "  ${YELLOW}Save this key — it won't be shown again:${NC}"
+                echo "  $plurum_key"
+                echo ""
+            else
+                warn "Could not register with Plurum. You can set PLURUM_API_KEY later."
+                warn "Response: $register_response"
+            fi
         fi
     fi
 
