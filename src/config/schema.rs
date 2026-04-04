@@ -14,6 +14,7 @@ pub struct FennecConfig {
     pub channels: ChannelsConfig,
     pub gateway: GatewayConfig,
     pub cron: CronConfig,
+    pub collective: CollectiveConfig,
 }
 
 impl Default for FennecConfig {
@@ -27,6 +28,7 @@ impl Default for FennecConfig {
             channels: ChannelsConfig::default(),
             gateway: GatewayConfig::default(),
             cron: CronConfig::default(),
+            collective: CollectiveConfig::default(),
         }
     }
 }
@@ -247,5 +249,30 @@ pub struct CronConfig {
 impl Default for CronConfig {
     fn default() -> Self {
         Self { enabled: false }
+    }
+}
+
+/// Collective intelligence configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CollectiveConfig {
+    pub enabled: bool,
+    pub api_key: String,
+    pub base_url: String,
+    pub publish_enabled: bool,
+    pub search_enabled: bool,
+    pub cache_ttl_days: u64,
+}
+
+impl Default for CollectiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            base_url: "https://api.plurum.ai".to_string(),
+            publish_enabled: true,
+            search_enabled: true,
+            cache_ttl_days: 30,
+        }
     }
 }

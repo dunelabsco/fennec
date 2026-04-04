@@ -20,6 +20,9 @@ impl SystemPromptBuilder {
     ///
     /// - `memory_context`: recent memory entries formatted as strings.
     /// - `tool_names`: names of the tools available to the agent.
+    ///
+    /// Note: collective context is injected into the user message, NOT
+    /// into the frozen system prompt.
     pub fn build(&self, memory_context: &[String], tool_names: &[String]) -> String {
         let mut parts = Vec::new();
 
@@ -51,6 +54,17 @@ impl SystemPromptBuilder {
 
         parts.join("\n")
     }
+}
+
+/// Format collective context for injection into a user message.
+///
+/// This keeps collective context out of the frozen system prompt and lets
+/// each turn carry the relevant collective information alongside the
+/// user's actual message.
+pub fn build_collective_injection(collective_context: &str, user_message: &str) -> String {
+    format!(
+        "[Collective context]\n{collective_context}\n[User message]\n{user_message}"
+    )
 }
 
 #[cfg(test)]

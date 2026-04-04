@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
+use crate::collective::search::{CollectiveSearch, RankedExperience, SearchConfidence};
 use crate::memory::decay::apply_time_decay;
 use crate::memory::traits::Memory;
 use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider};
@@ -26,6 +27,7 @@ pub struct Agent {
     memory_context_limit: usize,
     half_life_days: f64,
     prompt_guard: Option<PromptGuard>,
+    collective: Option<Arc<CollectiveSearch>>,
 }
 
 impl Agent {
@@ -51,6 +53,31 @@ impl Agent {
             }
         }
 
+        // Step 3: Search collective for relevant experiences.
+        let collective_context = if let Some(ref collective) = self.collective {
+            match collective.search(user_message, 3).await {
+                Ok(result) => match result.confidence {
+                    SearchConfidence::High => {
+                        let formatted =
+                            self.format_collective_results(&result.experiences, true);
+                        Some(formatted)
+                    }
+                    SearchConfidence::Partial => {
+                        let formatted =
+                            self.format_collective_results(&result.experiences, false);
+                        Some(formatted)
+                    }
+                    SearchConfidence::None => None,
+                },
+                Err(e) => {
+                    tracing::warn!("Collective search failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Build system prompt on first turn.
         if self.system_prompt.is_none() {
             let memory_context = self.load_memory_context(user_message).await?;
@@ -59,8 +86,15 @@ impl Agent {
             self.system_prompt = Some(prompt);
         }
 
+        // Inject collective context into user message if available.
+        let effective_message = if let Some(ref ctx) = collective_context {
+            format!("[Collective context]\n{ctx}\n[User message]\n{user_message}")
+        } else {
+            user_message.to_string()
+        };
+
         // Push user message to history.
-        self.history.push(ChatMessage::user(user_message));
+        self.history.push(ChatMessage::user(&effective_message));
 
         // Tool call loop.
         for _iteration in 0..self.max_tool_iterations {
@@ -157,6 +191,54 @@ impl Agent {
         Ok(formatted)
     }
 
+    /// Format collective search results for injection into the user message.
+    fn format_collective_results(
+        &self,
+        results: &[RankedExperience],
+        high_confidence: bool,
+    ) -> String {
+        let mut output = if high_confidence {
+            "The collective has high-confidence experience with this:\n\n".to_string()
+        } else {
+            "Related experiences from the collective:\n\n".to_string()
+        };
+        for (i, ranked) in results.iter().enumerate() {
+            output.push_str(&format!("{}. Goal: {}\n", i + 1, ranked.result.goal));
+            if let Some(ref solution) = ranked.result.solution {
+                output.push_str(&format!("   Solution: {}\n", solution));
+            }
+            if !ranked.result.gotchas.is_empty() {
+                output.push_str(&format!(
+                    "   Gotchas: {}\n",
+                    ranked.result.gotchas.join("; ")
+                ));
+            }
+            output.push('\n');
+        }
+        output
+    }
+
+    /// Publish an experience to the collective if configured and publish is enabled.
+    ///
+    /// This can be called when an experience is manually extracted or when
+    /// consolidation creates one. It scrubs the experience before publishing.
+    pub async fn publish_experience_if_configured(
+        &self,
+        experience: &crate::memory::experience::Experience,
+    ) -> Result<Option<String>> {
+        let _collective = match self.collective {
+            Some(ref c) => c,
+            None => return Ok(None),
+        };
+        // We only have search access; publishing requires the remote layer.
+        // For now log that publishing would occur.
+        tracing::info!(
+            experience_id = %experience.id,
+            "Would publish experience to collective (requires direct remote access)"
+        );
+        Ok(None)
+    }
+
     /// Clear conversation history and system prompt, resetting for a new session.
     pub fn clear_history(&mut self) {
         self.history.clear();
@@ -181,6 +263,7 @@ pub struct AgentBuilder {
     memory_context_limit: Option<usize>,
     half_life_days: Option<f64>,
     prompt_guard: Option<PromptGuard>,
+    collective: Option<Arc<CollectiveSearch>>,
 }
 
 impl AgentBuilder {
@@ -197,6 +280,7 @@ impl AgentBuilder {
             memory_context_limit: None,
             half_life_days: None,
             prompt_guard: None,
+            collective: None,
         }
     }
 
@@ -260,6 +344,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn collective(mut self, search: Arc<CollectiveSearch>) -> Self {
+        self.collective = Some(search);
+        self
+    }
+
     /// Build the [`Agent`], validating that required fields are set.
     pub fn build(self) -> Result<Agent> {
         let provider = self
@@ -291,6 +380,7 @@ impl AgentBuilder {
             memory_context_limit: self.memory_context_limit.unwrap_or(5),
             half_life_days: self.half_life_days.unwrap_or(7.0),
             prompt_guard: self.prompt_guard,
+            collective: self.collective,
         })
     }
 }

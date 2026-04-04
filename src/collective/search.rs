@@ -26,6 +26,16 @@ pub struct RankedExperience {
     pub final_score: f64,
 }
 
+impl RankedExperience {
+    pub fn source_label(&self) -> &str {
+        match self.source {
+            ExperienceSource::Local => "local",
+            ExperienceSource::Cache => "cache",
+            ExperienceSource::Remote => "remote",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SearchResult {
     pub experiences: Vec<RankedExperience>,
