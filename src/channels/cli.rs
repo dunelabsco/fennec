@@ -1,7 +1,11 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::bus::InboundMessage;
+
+use super::traits::{Channel, SendMessage};
 
 /// Interactive CLI channel that reads from stdin and writes to stdout.
 pub struct CliChannel;
@@ -23,7 +27,7 @@ impl Channel for CliChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<InboundMessage>) -> Result<()> {
         // Spawn a blocking task to read stdin line by line.
         tokio::task::spawn_blocking(move || {
             use std::io::BufRead;
@@ -45,12 +49,15 @@ impl Channel for CliChannel {
                             .unwrap_or_default()
                             .as_secs();
 
-                        let msg = ChannelMessage {
+                        let msg = InboundMessage {
                             id: uuid::Uuid::new_v4().to_string(),
                             sender: "user".to_string(),
                             content: trimmed,
                             channel: "cli".to_string(),
+                            chat_id: "cli_session".to_string(),
                             timestamp: now,
+                            reply_to: None,
+                            metadata: HashMap::new(),
                         };
 
                         // If the receiver is dropped, stop listening.

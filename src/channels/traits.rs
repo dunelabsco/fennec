@@ -1,15 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// A message received from a channel.
-#[derive(Debug, Clone)]
-pub struct ChannelMessage {
-    pub id: String,
-    pub sender: String,
-    pub content: String,
-    pub channel: String,
-    pub timestamp: u64,
-}
+use crate::bus::InboundMessage;
+
+/// Backward-compatible alias: `ChannelMessage` is now [`InboundMessage`].
+pub type ChannelMessage = InboundMessage;
 
 /// A message to send through a channel.
 #[derive(Debug, Clone)]
@@ -37,5 +32,40 @@ pub trait Channel: Send + Sync {
     async fn send(&self, message: &SendMessage) -> Result<()>;
 
     /// Listen for incoming messages, forwarding them through `tx`.
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()>;
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<InboundMessage>) -> Result<()>;
+
+    /// Whether this channel supports streaming responses.
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    /// Begin a streaming response, returning an optional message ID handle.
+    async fn send_streaming_start(&self, _chat_id: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Update a streaming response in-place with the full accumulated text.
+    async fn send_streaming_delta(
+        &self,
+        _chat_id: &str,
+        _message_id: &str,
+        _full_text: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Finalize a streaming response.
+    async fn send_streaming_end(
+        &self,
+        _chat_id: &str,
+        _message_id: &str,
+        _full_text: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Check whether `sender_id` is permitted to interact with this channel.
+    fn allows_sender(&self, _sender_id: &str) -> bool {
+        true
+    }
 }
