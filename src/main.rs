@@ -8,6 +8,11 @@ use fennec::bus::MessageBus;
 use fennec::channels::cli::CliChannel;
 use fennec::channels::traits::{Channel, SendMessage};
 use fennec::channels::ChannelManager;
+use fennec::collective::cache::CollectiveCache;
+use fennec::collective::mock::MockCollective;
+use fennec::collective::plurum::PlurumlClient;
+use fennec::collective::search::CollectiveSearch;
+use fennec::collective::traits::CollectiveLayer;
 use fennec::config::FennecConfig;
 use fennec::cron::{CronScheduler, JobStore};
 use fennec::gateway::GatewayServer;
@@ -18,6 +23,7 @@ use fennec::memory::Memory;
 use fennec::providers::anthropic::AnthropicProvider;
 use fennec::security::prompt_guard::{GuardAction, PromptGuard};
 use fennec::security::SecretStore;
+use fennec::tools::collective_tools::{CollectiveReportTool, CollectiveSearchTool};
 use fennec::tools::files::{ListDirTool, ReadFileTool, WriteFileTool};
 use fennec::tools::shell::ShellTool;
 use fennec::tools::web::{WebFetchTool, WebSearchTool};
@@ -165,8 +171,54 @@ async fn build_agent(
     let guard_action = parse_guard_action(&config.security.prompt_guard_action);
     let prompt_guard = PromptGuard::new(guard_action, config.security.prompt_guard_sensitivity);
 
+    // Set up collective intelligence layer.
+    let collective_search: Option<Arc<CollectiveSearch>> = if config.collective.enabled {
+        // Resolve collective API key.
+        let collective_api_key = if !config.collective.api_key.is_empty() {
+            match secret_store.decrypt(&config.collective.api_key) {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::warn!("Failed to decrypt collective API key: {e}; trying raw value");
+                    config.collective.api_key.clone()
+                }
+            }
+        } else {
+            std::env::var("PLURUM_API_KEY").unwrap_or_default()
+        };
+
+        let remote: Option<Arc<dyn CollectiveLayer>> = if !collective_api_key.is_empty() {
+            let base_url = if config.collective.base_url.is_empty() {
+                None
+            } else {
+                Some(config.collective.base_url.clone())
+            };
+            let client = PlurumlClient::new(collective_api_key, base_url);
+            tracing::info!("Collective intelligence enabled (Plurum remote)");
+            Some(Arc::new(client))
+        } else {
+            tracing::info!("Collective intelligence enabled (local only, no API key)");
+            None
+        };
+
+        let cache = CollectiveCache::new(memory.clone());
+        let search_guard = PromptGuard::new(
+            parse_guard_action(&config.security.prompt_guard_action),
+            config.security.prompt_guard_sensitivity,
+        );
+        let search = CollectiveSearch::new(
+            memory.clone(),
+            cache,
+            remote,
+            Some(search_guard),
+        );
+        Some(Arc::new(search))
+    } else {
+        tracing::debug!("Collective intelligence disabled");
+        None
+    };
+
     // Build Agent.
-    let agent = AgentBuilder::new()
+    let mut builder = AgentBuilder::new()
         .provider(Box::new(provider))
         .memory(memory.clone())
         .tool(Box::new(shell_tool))
@@ -174,7 +226,42 @@ async fn build_agent(
         .tool(Box::new(write_file_tool))
         .tool(Box::new(list_dir_tool))
         .tool(Box::new(web_fetch_tool))
-        .tool(Box::new(web_search_tool))
+        .tool(Box::new(web_search_tool));
+
+    // Add collective tools if enabled.
+    if let Some(ref search) = collective_search {
+        builder = builder.tool(Box::new(CollectiveSearchTool::new(Arc::clone(search))));
+
+        // CollectiveReportTool needs a CollectiveLayer; create one based on config.
+        if config.collective.publish_enabled {
+            let collective_api_key = if !config.collective.api_key.is_empty() {
+                secret_store
+                    .decrypt(&config.collective.api_key)
+                    .unwrap_or_else(|_| config.collective.api_key.clone())
+            } else {
+                std::env::var("PLURUM_API_KEY").unwrap_or_default()
+            };
+
+            let report_layer: Arc<dyn CollectiveLayer> = if !collective_api_key.is_empty() {
+                let base_url = if config.collective.base_url.is_empty() {
+                    None
+                } else {
+                    Some(config.collective.base_url.clone())
+                };
+                Arc::new(PlurumlClient::new(collective_api_key, base_url))
+            } else {
+                Arc::new(MockCollective::new())
+            };
+            builder = builder.tool(Box::new(CollectiveReportTool::new(report_layer)));
+        }
+    }
+
+    // Wire collective search into agent.
+    if let Some(search) = collective_search {
+        builder = builder.collective(search);
+    }
+
+    let agent = builder
         .identity_name(&config.identity.name)
         .identity_persona(&config.identity.persona)
         .max_tool_iterations(config.agent.max_tool_iterations as usize)
