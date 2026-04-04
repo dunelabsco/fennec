@@ -79,14 +79,17 @@ setup_config() {
     echo "Which LLM provider? (default: anthropic)"
     echo "  1) anthropic (Claude)"
     echo "  2) openai (GPT-4o)"
-    echo "  3) openrouter (any model)"
-    echo "  4) ollama (local)"
+    echo "  3) kimi (Moonshot)"
+    echo "  4) openrouter (any model)"
+    echo "  5) ollama (local)"
     read -rp "> " provider_choice
+    provider_base_url=""
     case "${provider_choice:-1}" in
         1) provider="anthropic"; model="claude-sonnet-4-20250514"; key_env="ANTHROPIC_API_KEY" ;;
         2) provider="openai"; model="gpt-4o"; key_env="OPENAI_API_KEY" ;;
-        3) provider="openrouter"; model="anthropic/claude-sonnet-4"; key_env="OPENROUTER_API_KEY" ;;
-        4) provider="ollama"; model="llama3.1"; key_env="" ;;
+        3) provider="kimi"; model="moonshot-v1-128k"; key_env="MOONSHOT_API_KEY"; provider_base_url="https://api.moonshot.cn/v1" ;;
+        4) provider="openrouter"; model="anthropic/claude-sonnet-4"; key_env="OPENROUTER_API_KEY"; provider_base_url="https://openrouter.ai/api/v1" ;;
+        5) provider="ollama"; model="llama3.1"; key_env="" ;;
         *) provider="anthropic"; model="claude-sonnet-4-20250514"; key_env="ANTHROPIC_API_KEY" ;;
     esac
 
@@ -104,6 +107,16 @@ setup_config() {
     # Agent name
     read -rp "Agent name (default: Fennec): " agent_name
     agent_name="${agent_name:-Fennec}"
+
+    # Telegram setup
+    echo ""
+    echo "Set up Telegram channel? (y/N)"
+    echo "  (Create a bot via @BotFather on Telegram to get a token)"
+    read -rp "> " enable_telegram
+    telegram_token=""
+    if [[ "${enable_telegram:-n}" =~ ^[Yy] ]]; then
+        read -rp "Enter your Telegram bot token: " telegram_token
+    fi
 
     # Collective (Plurum)
     echo ""
@@ -129,6 +142,7 @@ persona = "A fast, helpful AI assistant with collective intelligence."
 name = "$provider"
 model = "$model"
 api_key = "$api_key"
+base_url = "$provider_base_url"
 temperature = 0.7
 max_tokens = 8192
 
@@ -149,8 +163,8 @@ max_tool_iterations = 15
 context_window = 200000
 
 [channels.telegram]
-enabled = false
-token = ""
+enabled = $([ -n "$telegram_token" ] && echo "true" || echo "false")
+token = "$telegram_token"
 
 [channels.discord]
 enabled = false

@@ -21,6 +21,9 @@ use fennec::memory::snapshot;
 use fennec::memory::sqlite::SqliteMemory;
 use fennec::memory::Memory;
 use fennec::providers::anthropic::AnthropicProvider;
+use fennec::providers::openai::OpenAIProvider;
+use fennec::providers::ollama::OllamaProvider;
+use fennec::providers::traits::Provider;
 use fennec::security::prompt_guard::{GuardAction, PromptGuard};
 use fennec::security::SecretStore;
 use fennec::tools::collective_tools::{CollectiveReportTool, CollectiveSearchTool};
@@ -61,7 +64,7 @@ enum Commands {
     },
 }
 
-/// Resolve the Anthropic API key from config or environment variable.
+/// Resolve the API key from config or provider-specific environment variable.
 fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<String> {
     // Try config value first.
     if !config.provider.api_key.is_empty() {
@@ -71,9 +74,71 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         return Ok(decrypted);
     }
 
-    // Fall back to environment variable.
-    std::env::var("ANTHROPIC_API_KEY")
-        .context("API key not found: set provider.api_key in config or ANTHROPIC_API_KEY env var")
+    // Fall back to provider-specific environment variable.
+    let env_var = match config.provider.name.as_str() {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "kimi" | "moonshot" => "MOONSHOT_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "ollama" => return Ok(String::new()), // Ollama needs no key
+        _ => "ANTHROPIC_API_KEY",
+    };
+
+    std::env::var(env_var)
+        .with_context(|| format!("API key not found: set provider.api_key in config or {} env var", env_var))
+}
+
+/// Build the LLM provider based on config.
+fn build_provider(
+    config: &FennecConfig,
+    api_key: String,
+    model_override: Option<String>,
+) -> Box<dyn Provider> {
+    let model = model_override.unwrap_or_else(|| config.provider.model.clone());
+    let base_url = if config.provider.base_url.is_empty() {
+        None
+    } else {
+        Some(config.provider.base_url.clone())
+    };
+
+    match config.provider.name.as_str() {
+        "anthropic" => {
+            Box::new(AnthropicProvider::new(api_key, Some(model)))
+        }
+        "openai" => {
+            Box::new(OpenAIProvider::new(api_key, Some(model), base_url, None))
+        }
+        "kimi" | "moonshot" => {
+            let kimi_url = base_url.unwrap_or_else(|| "https://api.moonshot.cn/v1".to_string());
+            let kimi_model = if model.is_empty() || model == "claude-sonnet-4-20250514" {
+                "moonshot-v1-128k".to_string()
+            } else {
+                model
+            };
+            Box::new(OpenAIProvider::new(api_key, Some(kimi_model), Some(kimi_url), Some(128_000)))
+        }
+        "openrouter" => {
+            let or_url = base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
+            Box::new(OpenAIProvider::new(api_key, Some(model), Some(or_url), None))
+        }
+        "ollama" => {
+            let ollama_model = if model.is_empty() || model == "claude-sonnet-4-20250514" {
+                "llama3.1".to_string()
+            } else {
+                model
+            };
+            Box::new(OllamaProvider::new(
+                Some(ollama_model),
+                base_url,
+                None,
+            ))
+        }
+        other => {
+            // Unknown provider — treat as OpenAI-compatible with custom base_url
+            tracing::warn!("Unknown provider '{other}', treating as OpenAI-compatible");
+            Box::new(OpenAIProvider::new(api_key, Some(model), base_url, None))
+        }
+    }
 }
 
 /// Parse the guard action string from config into a GuardAction enum.
@@ -98,9 +163,8 @@ async fn build_agent(
     // Resolve API key.
     let api_key = resolve_api_key(config, &secret_store)?;
 
-    // Create AnthropicProvider with optional model override.
-    let provider =
-        AnthropicProvider::new(api_key, model_override.or(Some(config.provider.model.clone())));
+    // Create LLM provider based on config.
+    let provider = build_provider(config, api_key, model_override);
 
     // Create embedding provider based on config.
     let embedder: Arc<dyn fennec::memory::embedding::EmbeddingProvider> =
@@ -219,7 +283,7 @@ async fn build_agent(
 
     // Build Agent.
     let mut builder = AgentBuilder::new()
-        .provider(Box::new(provider))
+        .provider(provider)
         .memory(memory.clone())
         .tool(Box::new(shell_tool))
         .tool(Box::new(read_file_tool))
