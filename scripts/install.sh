@@ -24,12 +24,42 @@ log()   { echo -e "${GREEN}[fennec]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[fennec]${NC} $1"; }
 error() { echo -e "${RED}[fennec]${NC} $1"; exit 1; }
 
-check_deps() {
-    log "Checking dependencies..."
+install_system_deps() {
+    log "Checking system dependencies..."
 
-    if ! command -v git &>/dev/null; then
-        error "git is required. Install it first."
+    local need_install=false
+
+    for cmd in git gcc make; do
+        if ! command -v "$cmd" &>/dev/null; then
+            need_install=true
+            break
+        fi
+    done
+
+    if [ "$need_install" = true ]; then
+        log "Installing build tools..."
+        if command -v apt-get &>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq build-essential pkg-config libssl-dev git curl
+        elif command -v yum &>/dev/null; then
+            sudo yum install -y gcc gcc-c++ make openssl-devel pkg-config git curl
+        elif command -v dnf &>/dev/null; then
+            sudo dnf install -y gcc gcc-c++ make openssl-devel pkg-config git curl
+        elif command -v pacman &>/dev/null; then
+            sudo pacman -Sy --noconfirm base-devel openssl git curl
+        elif command -v apk &>/dev/null; then
+            sudo apk add build-base openssl-dev pkgconfig git curl
+        else
+            error "Could not detect package manager. Please install: git, gcc, make, pkg-config, libssl-dev"
+        fi
+        log "System dependencies installed."
+    else
+        log "System dependencies already present."
     fi
+}
+
+check_deps() {
+    install_system_deps
 
     if ! command -v cargo &>/dev/null; then
         warn "Rust not found. Installing via rustup..."
