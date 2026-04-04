@@ -11,6 +11,9 @@ pub struct FennecConfig {
     pub memory: MemoryConfig,
     pub security: SecurityConfig,
     pub agent: AgentConfig,
+    pub channels: ChannelsConfig,
+    pub gateway: GatewayConfig,
+    pub cron: CronConfig,
 }
 
 impl Default for FennecConfig {
@@ -21,6 +24,9 @@ impl Default for FennecConfig {
             memory: MemoryConfig::default(),
             security: SecurityConfig::default(),
             agent: AgentConfig::default(),
+            channels: ChannelsConfig::default(),
+            gateway: GatewayConfig::default(),
+            cron: CronConfig::default(),
         }
     }
 }
@@ -171,5 +177,75 @@ impl Default for AgentConfig {
             context_window: 200_000,
             compression_threshold: 0.50,
         }
+    }
+}
+
+/// Channel configuration for all supported messaging channels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChannelsConfig {
+    pub telegram: ChannelEntry,
+    pub discord: ChannelEntry,
+    pub slack: SlackChannelEntry,
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            telegram: ChannelEntry::default(),
+            discord: ChannelEntry::default(),
+            slack: SlackChannelEntry::default(),
+        }
+    }
+}
+
+/// Generic channel entry (Telegram, Discord).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ChannelEntry {
+    pub enabled: bool,
+    pub token: String,
+    pub allowed_users: Vec<String>,
+}
+
+/// Slack-specific channel entry (requires bot_token + app_token).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SlackChannelEntry {
+    pub enabled: bool,
+    pub bot_token: String,
+    pub app_token: String,
+    pub allowed_users: Vec<String>,
+}
+
+/// HTTP gateway configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewayConfig {
+    pub host: String,
+    pub port: u16,
+    pub auth_token: String,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 8990,
+            auth_token: String::new(),
+        }
+    }
+}
+
+/// Cron scheduler configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CronConfig {
+    pub enabled: bool,
+}
+
+impl Default for CronConfig {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
