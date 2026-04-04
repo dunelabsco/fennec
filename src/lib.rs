@@ -6,3 +6,4 @@ pub mod channels;
 pub mod security;
 pub mod agent;
 pub mod bus;
+pub mod gateway;
