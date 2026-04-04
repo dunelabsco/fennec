@@ -78,7 +78,7 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
     let env_var = match config.provider.name.as_str() {
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
-        "kimi" | "moonshot" => "MOONSHOT_API_KEY",
+        "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
         "ollama" => return Ok(String::new()), // Ollama needs no key
         _ => "ANTHROPIC_API_KEY",
@@ -109,13 +109,20 @@ fn build_provider(
             Box::new(OpenAIProvider::new(api_key, Some(model), base_url, None))
         }
         "kimi" | "moonshot" => {
-            let kimi_url = base_url.unwrap_or_else(|| "https://api.moonshot.cn/v1".to_string());
+            let kimi_url = base_url.unwrap_or_else(|| {
+                // Route by key prefix: sk-kimi-* → api.kimi.com, otherwise → api.moonshot.ai
+                if api_key.starts_with("sk-kimi-") {
+                    "https://api.kimi.com/coding/v1".to_string()
+                } else {
+                    "https://api.moonshot.ai/v1".to_string()
+                }
+            });
             let kimi_model = if model.is_empty() || model == "claude-sonnet-4-20250514" {
                 "moonshot-v1-128k".to_string()
             } else {
                 model
             };
-            Box::new(OpenAIProvider::new(api_key, Some(kimi_model), Some(kimi_url), Some(128_000)))
+            Box::new(OpenAIProvider::new(api_key, Some(kimi_model), Some(kimi_url), Some(262_144)))
         }
         "openrouter" => {
             let or_url = base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());

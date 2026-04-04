@@ -122,7 +122,7 @@ setup_config() {
     case "${provider_choice:-1}" in
         1) provider="anthropic"; model="claude-sonnet-4-20250514"; key_env="ANTHROPIC_API_KEY" ;;
         2) provider="openai"; model="gpt-4o"; key_env="OPENAI_API_KEY" ;;
-        3) provider="kimi"; model="moonshot-v1-128k"; key_env="MOONSHOT_API_KEY"; provider_base_url="https://api.moonshot.cn/v1" ;;
+        3) provider="kimi"; model="moonshot-v1-128k"; key_env="KIMI_API_KEY"; provider_base_url="" ;;
         4) provider="openrouter"; model="anthropic/claude-sonnet-4"; key_env="OPENROUTER_API_KEY"; provider_base_url="https://openrouter.ai/api/v1" ;;
         5) provider="ollama"; model="llama3.1"; key_env="" ;;
         *) provider="anthropic"; model="claude-sonnet-4-20250514"; key_env="ANTHROPIC_API_KEY" ;;
