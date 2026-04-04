@@ -164,12 +164,14 @@ setup_config() {
             log "Using existing PLURUM_API_KEY from environment."
         else
             log "Registering with Plurum..."
-            local register_response
-            register_response=$(curl -s -X POST "https://api.plurum.ai/api/v1/agents/register" \
+            local register_response=""
+            register_response=$(curl -s --max-time 10 -X POST "https://api.plurum.ai/api/v1/agents/register" \
                 -H "Content-Type: application/json" \
-                -d "{\"name\": \"$agent_name\"}" 2>&1) || true
+                -d "{\"name\": \"$agent_name\"}" 2>/dev/null) || register_response=""
 
-            plurum_key=$(echo "$register_response" | grep -o '"api_key":"[^"]*"' | head -1 | cut -d'"' -f4)
+            if [ -n "$register_response" ]; then
+                plurum_key=$(echo "$register_response" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('api_key',''))" 2>/dev/null) || plurum_key=""
+            fi
 
             if [ -n "$plurum_key" ]; then
                 log "Registered with Plurum! Your agent is now part of the collective."
@@ -178,8 +180,9 @@ setup_config() {
                 echo "  $plurum_key"
                 echo ""
             else
-                warn "Could not register with Plurum. You can set PLURUM_API_KEY later."
-                warn "Response: $register_response"
+                warn "Could not auto-register with Plurum (server may be unreachable)."
+                warn "You can set collective.api_key in ~/.fennec/config.toml later."
+                read -rp "Or paste a Plurum API key now (Enter to skip): " plurum_key < /dev/tty
             fi
         fi
     fi
