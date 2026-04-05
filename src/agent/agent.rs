@@ -11,6 +11,7 @@ use crate::tools::traits::{Tool, ToolSpec};
 
 use super::context::SystemPromptBuilder;
 use super::scrub;
+use super::thinking::{self, ThinkingLevel};
 
 /// The core agent that orchestrates provider calls, tool execution, and memory.
 pub struct Agent {
@@ -28,6 +29,7 @@ pub struct Agent {
     half_life_days: f64,
     prompt_guard: Option<PromptGuard>,
     collective: Option<Arc<CollectiveSearch>>,
+    thinking_level: ThinkingLevel,
 }
 
 impl Agent {
@@ -36,6 +38,14 @@ impl Agent {
     /// On the first turn the system prompt is built (with memory context) and
     /// frozen for the remainder of the session. Subsequent turns reuse it.
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        // Parse thinking directive before any other processing.
+        let (thinking_override, user_message) = thinking::parse_thinking_directive(user_message);
+        if let Some(level) = thinking_override {
+            self.thinking_level = level;
+            tracing::info!(?level, "Thinking level set via /think directive");
+        }
+        let user_message: &str = &user_message;
+
         // Prompt guard scan.
         if let Some(ref guard) = self.prompt_guard {
             match guard.scan(user_message) {
@@ -311,6 +321,16 @@ impl Agent {
     pub fn memory(&self) -> &Arc<dyn Memory> {
         &self.memory
     }
+
+    /// Get the current thinking level.
+    pub fn thinking_level(&self) -> ThinkingLevel {
+        self.thinking_level
+    }
+
+    /// Set the thinking level programmatically.
+    pub fn set_thinking_level(&mut self, level: ThinkingLevel) {
+        self.thinking_level = level;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +468,7 @@ impl AgentBuilder {
             half_life_days: self.half_life_days.unwrap_or(7.0),
             prompt_guard: self.prompt_guard,
             collective: self.collective,
+            thinking_level: ThinkingLevel::Off,
         })
     }
 }
