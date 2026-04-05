@@ -192,6 +192,7 @@ pub struct ChannelsConfig {
     pub discord: ChannelEntry,
     pub slack: SlackChannelEntry,
     pub whatsapp: WhatsAppChannelEntry,
+    pub email: EmailChannelEntry,
 }
 
 impl Default for ChannelsConfig {
@@ -201,6 +202,7 @@ impl Default for ChannelsConfig {
             discord: ChannelEntry::default(),
             slack: SlackChannelEntry::default(),
             whatsapp: WhatsAppChannelEntry::default(),
+            email: EmailChannelEntry::default(),
         }
     }
 }
@@ -245,6 +247,43 @@ impl Default for WhatsAppChannelEntry {
             verify_token: String::new(),
             webhook_port: 9443,
             allowed_users: Vec::new(),
+        }
+    }
+}
+
+/// Email channel entry (IMAP polling + SMTP sending).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmailChannelEntry {
+    pub enabled: bool,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub imap_user: String,
+    pub imap_password: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_user: String,
+    pub smtp_password: String,
+    pub from_address: String,
+    pub allowed_senders: Vec<String>,
+    pub poll_interval_secs: u64,
+}
+
+impl Default for EmailChannelEntry {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            imap_host: String::new(),
+            imap_port: 993,
+            imap_user: String::new(),
+            imap_password: String::new(),
+            smtp_host: String::new(),
+            smtp_port: 587,
+            smtp_user: String::new(),
+            smtp_password: String::new(),
+            from_address: String::new(),
+            allowed_senders: Vec::new(),
+            poll_interval_secs: 30,
         }
     }
 }

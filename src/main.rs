@@ -489,6 +489,27 @@ async fn run_gateway(
         tracing::info!("WhatsApp channel enabled");
     }
 
+    if ch_config.email.enabled
+        && !ch_config.email.smtp_host.is_empty()
+        && !ch_config.email.imap_host.is_empty()
+    {
+        let ch = fennec::channels::EmailChannel::new(
+            ch_config.email.imap_host.clone(),
+            ch_config.email.imap_port,
+            ch_config.email.imap_user.clone(),
+            ch_config.email.imap_password.clone(),
+            ch_config.email.smtp_host.clone(),
+            ch_config.email.smtp_port,
+            ch_config.email.smtp_user.clone(),
+            ch_config.email.smtp_password.clone(),
+            ch_config.email.from_address.clone(),
+            ch_config.email.allowed_senders.clone(),
+            ch_config.email.poll_interval_secs,
+        );
+        channels.push(Arc::new(ch));
+        tracing::info!("Email channel enabled");
+    }
+
     // 4. Create ChannelManager, start all channels.
     let manager = ChannelManager::new(channels, bus.clone());
     let _listener_handles = manager.start_all();
