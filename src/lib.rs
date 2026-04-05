@@ -13,3 +13,4 @@ pub mod heartbeat;
 pub mod skills;
 pub mod mcp;
 pub mod sessions;
+pub mod onboard;

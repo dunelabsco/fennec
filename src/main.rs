@@ -62,6 +62,12 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Run interactive setup wizard
+    Onboard {
+        /// Overwrite existing config
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Resolve the API key from config or provider-specific environment variable.
@@ -584,6 +590,17 @@ async fn main() -> Result<()> {
         }
         Commands::Gateway { host, port } => {
             run_gateway(config, home_dir, host, port).await?;
+        }
+        Commands::Onboard { force } => {
+            let config_path = home_dir.join("config.toml");
+            if config_path.exists() && !force {
+                eprintln!(
+                    "Config already exists at {}. Use --force to overwrite.",
+                    config_path.display()
+                );
+                std::process::exit(1);
+            }
+            fennec::onboard::run_wizard(&home_dir)?;
         }
     }
 
