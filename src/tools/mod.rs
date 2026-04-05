@@ -8,6 +8,7 @@ pub mod skills_tool;
 pub mod mcp_tools;
 pub mod git_tool;
 pub mod calc_tool;
+pub mod session_tools;
 
 pub use traits::{Tool, ToolResult, ToolSpec};
 pub use web::{WebFetchTool, WebSearchTool};
@@ -18,3 +19,4 @@ pub use mcp_tools::{McpToolBridge, register_mcp_tools};
 pub use git_tool::GitTool;
 pub use calc_tool::CalculatorTool;
 pub use files::{EditFileTool, GlobTool, GrepTool};
+pub use session_tools::{SessionSearchTool, SessionListTool};

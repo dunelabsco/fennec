@@ -12,3 +12,4 @@ pub mod collective;
 pub mod heartbeat;
 pub mod skills;
 pub mod mcp;
+pub mod sessions;
