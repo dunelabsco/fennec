@@ -83,110 +83,122 @@ impl EmailChannel {
         body.to_string()
     }
 
-    /// Connect to IMAP and fetch unseen messages. Returns a list of
-    /// (sender, subject, body) tuples.
+    /// Connect to IMAP and fetch unseen messages via blocking I/O in a
+    /// spawned thread. Returns (sender, subject, body) tuples.
     async fn fetch_unseen(&self) -> Result<Vec<(String, String, String)>> {
-        use futures::StreamExt;
+        let host = self.imap_host.clone();
+        let port = self.imap_port;
+        let user = self.imap_user.clone();
+        let password = self.imap_password.clone();
 
-        let tls = async_native_tls::TlsConnector::new();
-        let imap_addr = (self.imap_host.as_str(), self.imap_port);
+        tokio::task::spawn_blocking(move || {
+            let tls = native_tls::TlsConnector::new()
+                .context("Failed to create TLS connector")?;
+            let addr = format!("{}:{}", host, port);
+            let tcp = std::net::TcpStream::connect(&addr)
+                .context("IMAP TCP connect failed")?;
+            tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+            let tls_stream = tls.connect(&host, tcp)
+                .context("IMAP TLS connect failed")?;
 
-        let tcp_stream = tokio::net::TcpStream::connect(imap_addr)
-            .await
-            .context("IMAP TCP connect failed")?;
+            // Simple IMAP implementation using raw TLS stream.
+            // We use a single stream for both read and write by wrapping
+            // in a BufReader that owns the stream.
+            use std::io::{BufRead, BufReader, Write};
+            let mut stream = BufReader::new(tls_stream);
+            let tag = std::cell::Cell::new(1u32);
 
-        let tls_stream = tls
-            .connect(&self.imap_host, tcp_stream)
-            .await
-            .context("IMAP TLS connect failed")?;
+            let send_cmd = |stream: &mut BufReader<native_tls::TlsStream<std::net::TcpStream>>, cmd: &str| -> Result<Vec<String>> {
+                let t = tag.get();
+                let tagged = format!("A{} {}\r\n", t, cmd);
+                tag.set(t + 1);
+                stream.get_mut().write_all(tagged.as_bytes())?;
+                stream.get_mut().flush()?;
 
-        let client = async_imap::Client::new(tls_stream);
-        let mut session = client
-            .login(&self.imap_user, &self.imap_password)
-            .await
-            .map_err(|e| anyhow::anyhow!("IMAP login failed: {}", e.0))?;
-
-        session
-            .select("INBOX")
-            .await
-            .context("IMAP SELECT INBOX failed")?;
-
-        // Search for unseen messages.
-        let search_results = session
-            .search("UNSEEN")
-            .await
-            .context("IMAP SEARCH UNSEEN failed")?;
-
-        if search_results.is_empty() {
-            let _ = session.logout().await;
-            return Ok(Vec::new());
-        }
-
-        let mut results = Vec::new();
-
-        // Build sequence set from message sequence numbers.
-        let seqs: Vec<String> = search_results.iter().map(|u| u.to_string()).collect();
-        let seq_set = seqs.join(",");
-
-        // Fetch full RFC822 message for each unseen message.
-        let mut fetch_stream = session
-            .fetch(&seq_set, "RFC822")
-            .await
-            .context("IMAP FETCH failed")?;
-
-        while let Some(fetch_result) = fetch_stream.next().await {
-            let fetch = match fetch_result {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!("IMAP fetch error: {}", e);
-                    continue;
+                let mut lines = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line)?;
+                    let done = line.starts_with(&format!("A{} ", t));
+                    lines.push(line);
+                    if done { break; }
                 }
+                Ok(lines)
             };
 
-            // async-imap Fetch::body() returns Option<&[u8]> for the RFC822 body.
-            let raw_bytes = match fetch.body() {
-                Some(b) => b,
-                None => continue,
-            };
-            let raw_str = String::from_utf8_lossy(raw_bytes);
+            // Read greeting
+            let mut greeting = String::new();
+            stream.read_line(&mut greeting)?;
 
-            // Simple header/body split on first blank line.
-            let (header_part, body_part) = match raw_str.find("\r\n\r\n") {
-                Some(pos) => (&raw_str[..pos], &raw_str[pos + 4..]),
-                None => match raw_str.find("\n\n") {
-                    Some(pos) => (&raw_str[..pos], &raw_str[pos + 2..]),
-                    None => continue,
-                },
-            };
-
-            let mut sender = String::new();
-            let mut subject = String::new();
-
-            for line in header_part.lines() {
-                let lower = line.to_lowercase();
-                if lower.starts_with("from:") {
-                    sender = Self::extract_sender_email(&line[5..]);
-                } else if lower.starts_with("subject:") {
-                    subject = line[8..].trim().to_string();
+            // LOGIN
+            let login_resp = send_cmd(&mut stream, &format!("LOGIN \"{}\" \"{}\"", user, password))?;
+            if let Some(last) = login_resp.last() {
+                if !last.contains("OK") {
+                    anyhow::bail!("IMAP login failed: {}", last.trim());
                 }
             }
 
-            let body = Self::extract_text_body(body_part);
+            // SELECT INBOX
+            send_cmd(&mut stream, "SELECT INBOX")?;
 
-            if !sender.is_empty() && !body.is_empty() {
-                results.push((sender, subject, body));
+            // SEARCH UNSEEN
+            let search_resp = send_cmd(&mut stream, "SEARCH UNSEEN")?;
+            let mut msg_nums: Vec<String> = Vec::new();
+            for line in &search_resp {
+                if line.starts_with("* SEARCH") {
+                    msg_nums = line.trim_start_matches("* SEARCH")
+                        .trim()
+                        .split_whitespace()
+                        .map(String::from)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
             }
-        }
-        drop(fetch_stream);
 
-        // Mark fetched messages as seen.
-        let _ = session
-            .store(&seq_set, "+FLAGS (\\Seen)")
-            .await;
+            if msg_nums.is_empty() {
+                let _ = send_cmd(&mut stream, "LOGOUT");
+                return Ok(Vec::new());
+            }
 
-        let _ = session.logout().await;
+            let mut results = Vec::new();
 
-        Ok(results)
+            for num in &msg_nums {
+                let fetch_resp = send_cmd(&mut stream, &format!("FETCH {} BODY[HEADER.FIELDS (FROM SUBJECT)]", num))?;
+                let header_text: String = fetch_resp.iter()
+                    .filter(|l| !l.starts_with("*") && !l.starts_with(&format!("A{}", tag.get() - 1)))
+                    .cloned()
+                    .collect();
+
+                let mut sender = String::new();
+                let mut subject = String::new();
+                for line in header_text.lines() {
+                    let lower = line.to_lowercase();
+                    if lower.starts_with("from:") {
+                        sender = Self::extract_sender_email(&line[5..]);
+                    } else if lower.starts_with("subject:") {
+                        subject = line[8..].trim().to_string();
+                    }
+                }
+
+                // Fetch body
+                let body_resp = send_cmd(&mut stream, &format!("FETCH {} BODY[TEXT]", num))?;
+                let body: String = body_resp.iter()
+                    .filter(|l| !l.starts_with("*") && !l.starts_with(&format!("A{}", tag.get() - 1)) && !l.starts_with(")"))
+                    .cloned()
+                    .collect();
+                let body = Self::extract_text_body(&body);
+
+                if !sender.is_empty() && !body.is_empty() {
+                    results.push((sender, subject, body));
+                }
+
+                // Mark as seen
+                let _ = send_cmd(&mut stream, &format!("STORE {} +FLAGS (\\Seen)", num));
+            }
+
+            let _ = send_cmd(&mut stream, "LOGOUT");
+            Ok(results)
+        }).await?
     }
 
     /// Send an email via SMTP using lettre.
