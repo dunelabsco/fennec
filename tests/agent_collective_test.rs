@@ -63,6 +63,10 @@ impl Provider for CapturingProvider {
     fn context_window(&self) -> usize {
         100_000
     }
+
+    async fn chat_stream(&self, request: ChatRequest<'_>) -> anyhow::Result<tokio::sync::mpsc::Receiver<fennec::providers::traits::StreamEvent>> {
+        fennec::providers::traits::default_chat_stream(self, request).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -123,8 +127,8 @@ async fn test_agent_works_without_collective() {
     let provider = CapturingProvider::new(vec![response]);
 
     let mut agent = AgentBuilder::new()
-        .provider(Box::new(provider))
-        .memory(Arc::new(StubMemory))
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
         .build()
         .expect("agent build should succeed");
 
@@ -157,8 +161,8 @@ async fn test_agent_collective_search_failure_graceful() {
     let search = CollectiveSearch::new(memory, cache, None, None);
 
     let mut agent = AgentBuilder::new()
-        .provider(Box::new(provider))
-        .memory(Arc::new(StubMemory))
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
         .collective(Arc::new(search))
         .build()
         .expect("agent build should succeed");
@@ -186,12 +190,12 @@ async fn test_agent_no_collective_injection_when_no_results() {
 
     // We test that the agent still returns correctly even with an empty collective.
     let mut agent = AgentBuilder::new()
-        .provider(Box::new(CapturingProvider::new(vec![ChatResponse {
+        .provider(Arc::new(CapturingProvider::new(vec![ChatResponse {
             content: Some("No context needed.".to_string()),
             tool_calls: vec![],
             usage: None,
-        }])))
-        .memory(Arc::new(StubMemory))
+        }])) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
         .collective(Arc::new(search))
         .build()
         .expect("agent build should succeed");

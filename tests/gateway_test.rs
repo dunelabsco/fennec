@@ -121,7 +121,7 @@ fn build_test_state(auth_token: Option<String>) -> AppState {
     let memory = Arc::new(StubMemory);
 
     let agent = AgentBuilder::new()
-        .provider(Box::new(provider))
+        .provider(Arc::new(provider) as Arc<dyn fennec::providers::traits::Provider>)
         .memory(memory)
         .build()
         .expect("build stub agent");
@@ -154,6 +154,13 @@ impl fennec::providers::traits::Provider for StubProvider {
 
     fn context_window(&self) -> usize {
         4096
+    }
+
+    async fn chat_stream(
+        &self,
+        request: fennec::providers::traits::ChatRequest<'_>,
+    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<fennec::providers::traits::StreamEvent>> {
+        fennec::providers::traits::default_chat_stream(self, request).await
     }
 }
 

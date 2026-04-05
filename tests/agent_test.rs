@@ -49,6 +49,10 @@ impl Provider for MockProvider {
     fn context_window(&self) -> usize {
         100_000
     }
+
+    async fn chat_stream(&self, request: ChatRequest<'_>) -> anyhow::Result<tokio::sync::mpsc::Receiver<fennec::providers::traits::StreamEvent>> {
+        fennec::providers::traits::default_chat_stream(self, request).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,8 +167,8 @@ async fn test_simple_chat_response() {
     let provider = MockProvider::new(vec![response]);
 
     let mut agent = AgentBuilder::new()
-        .provider(Box::new(provider))
-        .memory(Arc::new(StubMemory))
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
         .build()
         .expect("agent build should succeed");
 
@@ -195,8 +199,8 @@ async fn test_tool_call_and_response() {
     let provider = MockProvider::new(vec![tool_call_response, final_response]);
 
     let mut agent = AgentBuilder::new()
-        .provider(Box::new(provider))
-        .memory(Arc::new(StubMemory))
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
         .tool(Box::new(EchoTool))
         .build()
         .expect("agent build should succeed");
@@ -225,8 +229,8 @@ async fn test_max_iterations_exceeded() {
     let provider = MockProvider::new(responses);
 
     let mut agent = AgentBuilder::new()
-        .provider(Box::new(provider))
-        .memory(Arc::new(StubMemory))
+        .provider(Arc::new(provider) as Arc<dyn Provider>)
+        .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
         .tool(Box::new(EchoTool))
         .max_tool_iterations(max_iters)
         .build()

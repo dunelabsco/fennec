@@ -1,6 +1,5 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::json;
 use std::sync::Arc;
 
 use crate::mcp::client::McpClient;
@@ -83,6 +82,7 @@ pub fn register_mcp_tools(client: Arc<McpClient>) -> Vec<Box<dyn Tool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_mcp_tool_bridge_spec() {

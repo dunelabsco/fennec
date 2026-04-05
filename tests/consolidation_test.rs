@@ -54,6 +54,10 @@ impl Provider for MockProvider {
     fn context_window(&self) -> usize {
         8192
     }
+
+    async fn chat_stream(&self, request: ChatRequest<'_>) -> anyhow::Result<tokio::sync::mpsc::Receiver<fennec::providers::traits::StreamEvent>> {
+        fennec::providers::traits::default_chat_stream(self, request).await
+    }
 }
 
 // ---------------------------------------------------------------------------

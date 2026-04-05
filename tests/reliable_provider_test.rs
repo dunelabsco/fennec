@@ -52,6 +52,10 @@ impl Provider for SuccessProvider {
     fn context_window(&self) -> usize {
         100_000
     }
+
+    async fn chat_stream(&self, request: ChatRequest<'_>) -> anyhow::Result<tokio::sync::mpsc::Receiver<fennec::providers::traits::StreamEvent>> {
+        fennec::providers::traits::default_chat_stream(self, request).await
+    }
 }
 
 /// A mock provider that always fails with a specific error.
@@ -88,6 +92,10 @@ impl Provider for FailProvider {
 
     fn context_window(&self) -> usize {
         100_000
+    }
+
+    async fn chat_stream(&self, request: ChatRequest<'_>) -> anyhow::Result<tokio::sync::mpsc::Receiver<fennec::providers::traits::StreamEvent>> {
+        fennec::providers::traits::default_chat_stream(self, request).await
     }
 }
 
@@ -135,6 +143,10 @@ impl Provider for FlakeyProvider {
 
     fn context_window(&self) -> usize {
         50_000
+    }
+
+    async fn chat_stream(&self, request: ChatRequest<'_>) -> anyhow::Result<tokio::sync::mpsc::Receiver<fennec::providers::traits::StreamEvent>> {
+        fennec::providers::traits::default_chat_stream(self, request).await
     }
 }
 
