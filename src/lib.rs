@@ -9,3 +9,5 @@ pub mod bus;
 pub mod gateway;
 pub mod cron;
 pub mod collective;
+pub mod skills;
+pub mod mcp;

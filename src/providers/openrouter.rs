@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use super::openai::OpenAIProvider;
-use super::traits::{ChatRequest, ChatResponse, Provider};
+use super::traits::{ChatRequest, ChatResponse, Provider, StreamEvent};
 
 /// OpenRouter provider that wraps OpenAIProvider with OpenRouter-specific
 /// base URL and headers.
@@ -51,5 +51,16 @@ impl Provider for OpenRouterProvider {
 
     fn context_window(&self) -> usize {
         self.inner.context_window()
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.inner.supports_streaming()
+    }
+
+    async fn chat_stream(
+        &self,
+        request: ChatRequest<'_>,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        self.inner.chat_stream(request).await
     }
 }

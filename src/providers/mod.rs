@@ -5,7 +5,7 @@ pub mod openrouter;
 pub mod ollama;
 pub mod reliable;
 
-pub use traits::{Provider, ChatMessage, ChatRequest, ChatResponse, ToolCall};
+pub use traits::{Provider, ChatMessage, ChatRequest, ChatResponse, ToolCall, StreamEvent};
 pub use openai::OpenAIProvider;
 pub use openrouter::OpenRouterProvider;
 pub use ollama::OllamaProvider;

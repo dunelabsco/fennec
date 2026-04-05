@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::{json, Value};
 
-use super::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall, UsageInfo};
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent, ToolCall, UsageInfo,
+};
 
 /// OpenAI-compatible API provider.
 ///
@@ -120,6 +123,43 @@ impl OpenAIProvider {
             .collect()
     }
 
+    /// Build the common request body (shared by chat and chat_stream).
+    fn build_request_body(
+        &self,
+        request: &ChatRequest<'_>,
+        stream: bool,
+    ) -> (Vec<Value>, Value) {
+        let mut messages = Vec::new();
+
+        if let Some(system_text) = request.system {
+            messages.push(json!({
+                "role": "system",
+                "content": system_text
+            }));
+        }
+
+        messages.extend(Self::convert_messages(request.messages));
+
+        let mut body = json!({
+            "model": self.model,
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "messages": messages,
+        });
+
+        if stream {
+            body["stream"] = json!(true);
+        }
+
+        if let Some(tools) = request.tools {
+            if !tools.is_empty() {
+                body["tools"] = json!(Self::convert_tools(tools));
+            }
+        }
+
+        (messages, body)
+    }
+
     /// Parse the OpenAI response JSON into our ChatResponse.
     fn parse_response(body: &Value) -> Result<ChatResponse> {
         let choice = body
@@ -197,32 +237,7 @@ impl Provider for OpenAIProvider {
     }
 
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
-        let mut messages = Vec::new();
-
-        // System message as first message with role "system".
-        if let Some(system_text) = request.system {
-            messages.push(json!({
-                "role": "system",
-                "content": system_text
-            }));
-        }
-
-        // Append conversation messages.
-        messages.extend(Self::convert_messages(request.messages));
-
-        let mut body = json!({
-            "model": self.model,
-            "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
-            "messages": messages,
-        });
-
-        // Add tools if provided.
-        if let Some(tools) = request.tools {
-            if !tools.is_empty() {
-                body["tools"] = json!(Self::convert_tools(tools));
-            }
-        }
+        let (_messages, body) = self.build_request_body(&request, false);
 
         let mut req = self
             .client
@@ -230,7 +245,6 @@ impl Provider for OpenAIProvider {
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json");
 
-        // Add extra headers.
         for (key, value) in &self.extra_headers {
             req = req.header(key.as_str(), value.as_str());
         }
@@ -265,6 +279,155 @@ impl Provider for OpenAIProvider {
 
     fn context_window(&self) -> usize {
         self.ctx_window
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    async fn chat_stream(
+        &self,
+        request: ChatRequest<'_>,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        let (_messages, body) = self.build_request_body(&request, true);
+
+        let mut req = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json");
+
+        for (key, value) in &self.extra_headers {
+            req = req.header(key.as_str(), value.as_str());
+        }
+
+        let response = req
+            .json(&body)
+            .send()
+            .await
+            .context("sending streaming request to OpenAI-compatible API")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let response_body: Value = response
+                .json()
+                .await
+                .context("parsing OpenAI streaming error response")?;
+            let error_msg = response_body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("OpenAI API error ({}): {}", status, error_msg);
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut byte_stream = response.bytes_stream();
+
+        tokio::spawn(async move {
+            let mut buffer = String::new();
+
+            while let Some(chunk_result) = byte_stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                        return;
+                    }
+                };
+
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                // Process complete lines from the SSE stream.
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim_end().to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
+
+                    let data_str = match line.strip_prefix("data: ") {
+                        Some(s) => s,
+                        None => continue,
+                    };
+
+                    if data_str == "[DONE]" {
+                        let _ = tx.send(StreamEvent::Done).await;
+                        return;
+                    }
+
+                    let data: Value = match serde_json::from_str(data_str) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    // Extract the first choice's delta.
+                    let choice = match data
+                        .get("choices")
+                        .and_then(|c| c.as_array())
+                        .and_then(|arr| arr.first())
+                    {
+                        Some(c) => c,
+                        None => continue,
+                    };
+
+                    // Check finish_reason.
+                    if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+                        if reason == "stop" || reason == "tool_calls" {
+                            let _ = tx.send(StreamEvent::Done).await;
+                            return;
+                        }
+                    }
+
+                    if let Some(delta) = choice.get("delta") {
+                        // Text content delta.
+                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                            if !content.is_empty() {
+                                let _ = tx.send(StreamEvent::Delta(content.to_string())).await;
+                            }
+                        }
+
+                        // Tool call deltas.
+                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                            for tc in tcs {
+                                let id = tc
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let func = tc.get("function").unwrap_or(&Value::Null);
+
+                                // If function.name is present, this is the start.
+                                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                    let _ = tx
+                                        .send(StreamEvent::ToolCallStart {
+                                            id: id.clone(),
+                                            name: name.to_string(),
+                                        })
+                                        .await;
+                                }
+
+                                // If function.arguments is present, emit delta.
+                                if let Some(args) =
+                                    func.get("arguments").and_then(|a| a.as_str())
+                                {
+                                    if !args.is_empty() {
+                                        let _ = tx
+                                            .send(StreamEvent::ToolCallDelta {
+                                                id: id.clone(),
+                                                arguments_delta: args.to_string(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If we exit without [DONE], send Done anyway.
+            let _ = tx.send(StreamEvent::Done).await;
+        });
+
+        Ok(rx)
     }
 }
 

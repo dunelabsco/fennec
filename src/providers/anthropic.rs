@@ -114,6 +114,110 @@ impl AnthropicProvider {
             .collect()
     }
 
+    /// Build the request body for the Anthropic API (shared between chat and chat_stream).
+    fn build_request_body(
+        &self,
+        request: &ChatRequest<'_>,
+        stream: bool,
+    ) -> Value {
+        let messages = Self::convert_messages(request.messages);
+
+        let mut body = json!({
+            "model": self.default_model,
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "messages": messages,
+        });
+
+        if stream {
+            body["stream"] = json!(true);
+        }
+
+        if let Some(system_text) = request.system {
+            body["system"] = json!([{
+                "type": "text",
+                "text": system_text,
+                "cache_control": {"type": "ephemeral"}
+            }]);
+        }
+
+        if let Some(tools) = request.tools {
+            if !tools.is_empty() {
+                body["tools"] = json!(Self::convert_tools(tools));
+            }
+        }
+
+        body
+    }
+
+    /// Parse a single SSE line from Anthropic's streaming API and emit
+    /// [`StreamEvent`]s on the provided sender.
+    async fn handle_sse_event(
+        event_type: &str,
+        data: &Value,
+        tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    ) {
+        match event_type {
+            "content_block_start" => {
+                if let Some(block) = data.get("content_block") {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                        let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let _ = tx.send(StreamEvent::ToolCallStart { id, name }).await;
+                    }
+                }
+            }
+            "content_block_delta" => {
+                if let Some(delta) = data.get("delta") {
+                    match delta.get("type").and_then(|t| t.as_str()) {
+                        Some("text_delta") => {
+                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                let _ = tx.send(StreamEvent::Delta(text.to_string())).await;
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(partial) = delta.get("partial_json").and_then(|t| t.as_str()) {
+                                // We need the index to map to the tool call id.
+                                // The index comes from the content_block_start; for
+                                // simplicity we use the index as a stand-in id here.
+                                let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let _ = tx
+                                    .send(StreamEvent::ToolCallDelta {
+                                        id: idx.to_string(),
+                                        arguments_delta: partial.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_stop" => {
+                let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                // We emit ToolCallEnd for every block stop; consumers that
+                // track tool calls by id can use this.
+                let _ = tx
+                    .send(StreamEvent::ToolCallEnd {
+                        id: idx.to_string(),
+                    })
+                    .await;
+            }
+            "message_stop" => {
+                let _ = tx.send(StreamEvent::Done).await;
+            }
+            "error" => {
+                let msg = data
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown streaming error");
+                let _ = tx.send(StreamEvent::Error(msg.to_string())).await;
+            }
+            _ => { /* message_start, ping, etc. — ignore */ }
+        }
+    }
+
     /// Parse the Anthropic response JSON into our ChatResponse.
     fn parse_response(body: &Value) -> Result<ChatResponse> {
         let mut text_parts = Vec::new();
@@ -190,30 +294,7 @@ impl Provider for AnthropicProvider {
     }
 
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
-        let messages = Self::convert_messages(request.messages);
-
-        let mut body = json!({
-            "model": self.default_model,
-            "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
-            "messages": messages,
-        });
-
-        // Add system prompt with cache control for prompt caching.
-        if let Some(system_text) = request.system {
-            body["system"] = json!([{
-                "type": "text",
-                "text": system_text,
-                "cache_control": {"type": "ephemeral"}
-            }]);
-        }
-
-        // Add tools if provided.
-        if let Some(tools) = request.tools {
-            if !tools.is_empty() {
-                body["tools"] = json!(Self::convert_tools(tools));
-            }
-        }
+        let body = self.build_request_body(&request, false);
 
         let response = self
             .client
@@ -250,5 +331,86 @@ impl Provider for AnthropicProvider {
 
     fn context_window(&self) -> usize {
         200_000
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    async fn chat_stream(
+        &self,
+        request: ChatRequest<'_>,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        let body = self.build_request_body(&request, true);
+
+        let response = self
+            .client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("sending streaming request to Anthropic API")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let response_body: Value = response
+                .json()
+                .await
+                .context("parsing Anthropic streaming error response")?;
+            let error_msg = response_body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("Anthropic API error ({}): {}", status, error_msg);
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut byte_stream = response.bytes_stream();
+
+        tokio::spawn(async move {
+            let mut buffer = String::new();
+            let mut current_event_type = String::new();
+
+            while let Some(chunk_result) = byte_stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                        return;
+                    }
+                };
+
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                // Process complete lines from the SSE stream.
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim_end().to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
+
+                    if line.is_empty() {
+                        // Empty line = end of event.
+                        current_event_type.clear();
+                        continue;
+                    }
+
+                    if let Some(evt) = line.strip_prefix("event: ") {
+                        current_event_type = evt.to_string();
+                    } else if let Some(data_str) = line.strip_prefix("data: ") {
+                        if let Ok(data) = serde_json::from_str::<Value>(data_str) {
+                            Self::handle_sse_event(&current_event_type, &data, &tx).await;
+                        }
+                    }
+                }
+            }
+
+            // If we exit without a message_stop, send Done anyway.
+            let _ = tx.send(StreamEvent::Done).await;
+        });
+
+        Ok(rx)
     }
 }

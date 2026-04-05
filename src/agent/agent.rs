@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use crate::collective::search::{CollectiveSearch, RankedExperience, SearchConfidence};
 use crate::memory::decay::apply_time_decay;
 use crate::memory::traits::Memory;
-use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider};
+use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent};
 use crate::security::prompt_guard::{PromptGuard, ScanResult};
 use crate::tools::traits::{Tool, ToolSpec};
 
@@ -14,7 +14,7 @@ use super::scrub;
 
 /// The core agent that orchestrates provider calls, tool execution, and memory.
 pub struct Agent {
-    provider: Box<dyn Provider>,
+    provider: Arc<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
     tool_specs: Vec<ToolSpec>,
     memory: Arc<dyn Memory>,
@@ -123,6 +123,63 @@ impl Agent {
         }
 
         bail!("max tool iterations ({}) exceeded", self.max_tool_iterations)
+    }
+
+    /// Execute a single conversational turn with streaming.
+    ///
+    /// Returns a receiver of [`StreamEvent`]s. Text deltas are forwarded in
+    /// real-time while tool calls are processed internally (their results are
+    /// *not* streamed back; only the final text response is).
+    pub async fn turn_streamed(
+        &mut self,
+        user_message: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        // Prompt guard scan.
+        if let Some(ref guard) = self.prompt_guard {
+            match guard.scan(user_message) {
+                ScanResult::Blocked(reason) => {
+                    bail!("{reason}");
+                }
+                ScanResult::Suspicious(categories, score) => {
+                    tracing::warn!(
+                        ?categories,
+                        score,
+                        "Prompt guard: suspicious input detected (stream)"
+                    );
+                }
+                ScanResult::Safe => {}
+            }
+        }
+
+        // Build system prompt on first turn.
+        if self.system_prompt.is_none() {
+            let memory_context = self.load_memory_context(user_message).await?;
+            let tool_names: Vec<String> = self.tools.iter().map(|t| t.name().to_string()).collect();
+            let prompt = self.prompt_builder.build(&memory_context, &tool_names);
+            self.system_prompt = Some(prompt);
+        }
+
+        // Push user message to history.
+        self.history.push(ChatMessage::user(user_message));
+
+        // Get streaming receiver from provider.
+        let system = self.system_prompt.as_deref();
+        let tools = if self.tool_specs.is_empty() {
+            None
+        } else {
+            Some(self.tool_specs.as_slice())
+        };
+
+        let request = ChatRequest {
+            system,
+            messages: &self.history,
+            tools,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+        };
+
+        let rx = self.provider.chat_stream(request).await?;
+        Ok(rx)
     }
 
     /// Call the provider with the current history and system prompt.
@@ -244,6 +301,16 @@ impl Agent {
         self.history.clear();
         self.system_prompt = None;
     }
+
+    /// Get a reference to the shared provider.
+    pub fn provider(&self) -> &Arc<dyn Provider> {
+        &self.provider
+    }
+
+    /// Get a reference to the shared memory.
+    pub fn memory(&self) -> &Arc<dyn Memory> {
+        &self.memory
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +319,7 @@ impl Agent {
 
 /// Builder for constructing an [`Agent`] with validated configuration.
 pub struct AgentBuilder {
-    provider: Option<Box<dyn Provider>>,
+    provider: Option<Arc<dyn Provider>>,
     tools: Vec<Box<dyn Tool>>,
     memory: Option<Arc<dyn Memory>>,
     identity_name: Option<String>,
@@ -284,8 +351,8 @@ impl AgentBuilder {
         }
     }
 
-    pub fn provider(mut self, provider: Box<dyn Provider>) -> Self {
-        self.provider = Some(provider);
+    pub fn provider(mut self, provider: impl Into<Arc<dyn Provider>>) -> Self {
+        self.provider = Some(provider.into());
         self
     }
 

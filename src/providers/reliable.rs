@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use super::traits::{ChatRequest, ChatResponse, Provider};
+use super::traits::{ChatRequest, ChatResponse, Provider, StreamEvent};
 
 /// Default cooldown duration for rate-limited providers (60 seconds).
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
@@ -136,5 +136,44 @@ impl Provider for ReliableProvider {
             .first()
             .map(|p| p.context_window())
             .unwrap_or(0)
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|p| p.supports_streaming())
+    }
+
+    async fn chat_stream(
+        &self,
+        request: ChatRequest<'_>,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for (index, provider) in self.providers.iter().enumerate() {
+            if self.is_on_cooldown(index) {
+                continue;
+            }
+
+            let req = ChatRequest {
+                system: request.system,
+                messages: request.messages,
+                tools: request.tools,
+                max_tokens: request.max_tokens,
+                temperature: request.temperature,
+            };
+
+            match provider.chat_stream(req).await {
+                Ok(rx) => return Ok(rx),
+                Err(err) => {
+                    if Self::is_rate_limit_error(&err) {
+                        self.mark_rate_limited(index);
+                    }
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no providers available for streaming")))
     }
 }

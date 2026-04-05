@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall, UsageInfo};
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent, ToolCall, UsageInfo,
+    default_chat_stream,
+};
 
 /// Ollama local model provider.
 ///
@@ -239,6 +242,13 @@ impl Provider for OllamaProvider {
 
     fn context_window(&self) -> usize {
         self.ctx_window
+    }
+
+    async fn chat_stream(
+        &self,
+        request: ChatRequest<'_>,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        default_chat_stream(self, request).await
     }
 }
 
