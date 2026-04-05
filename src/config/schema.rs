@@ -191,6 +191,7 @@ pub struct ChannelsConfig {
     pub telegram: ChannelEntry,
     pub discord: ChannelEntry,
     pub slack: SlackChannelEntry,
+    pub whatsapp: WhatsAppChannelEntry,
 }
 
 impl Default for ChannelsConfig {
@@ -199,6 +200,7 @@ impl Default for ChannelsConfig {
             telegram: ChannelEntry::default(),
             discord: ChannelEntry::default(),
             slack: SlackChannelEntry::default(),
+            whatsapp: WhatsAppChannelEntry::default(),
         }
     }
 }
@@ -220,6 +222,31 @@ pub struct SlackChannelEntry {
     pub bot_token: String,
     pub app_token: String,
     pub allowed_users: Vec<String>,
+}
+
+/// WhatsApp Cloud API channel entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WhatsAppChannelEntry {
+    pub enabled: bool,
+    pub phone_number_id: String,
+    pub access_token: String,
+    pub verify_token: String,
+    pub webhook_port: u16,
+    pub allowed_users: Vec<String>,
+}
+
+impl Default for WhatsAppChannelEntry {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phone_number_id: String::new(),
+            access_token: String::new(),
+            verify_token: String::new(),
+            webhook_port: 9443,
+            allowed_users: Vec::new(),
+        }
+    }
 }
 
 /// HTTP gateway configuration.

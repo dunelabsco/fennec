@@ -477,6 +477,18 @@ async fn run_gateway(
         tracing::info!("Slack channel enabled");
     }
 
+    if ch_config.whatsapp.enabled && !ch_config.whatsapp.access_token.is_empty() {
+        let ch = fennec::channels::WhatsAppChannel::new(
+            ch_config.whatsapp.phone_number_id.clone(),
+            ch_config.whatsapp.access_token.clone(),
+            ch_config.whatsapp.verify_token.clone(),
+            ch_config.whatsapp.webhook_port,
+            ch_config.whatsapp.allowed_users.clone(),
+        );
+        channels.push(Arc::new(ch));
+        tracing::info!("WhatsApp channel enabled");
+    }
+
     // 4. Create ChannelManager, start all channels.
     let manager = ChannelManager::new(channels, bus.clone());
     let _listener_handles = manager.start_all();
