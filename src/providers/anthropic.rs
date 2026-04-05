@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::{json, Value};
 
-use super::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall, UsageInfo};
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent, ToolCall, UsageInfo,
+};
 
 /// Anthropic Claude API provider.
 pub struct AnthropicProvider {

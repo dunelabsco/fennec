@@ -2,6 +2,23 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Events emitted during a streaming response.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// A chunk of text content.
+    Delta(String),
+    /// A tool call has started.
+    ToolCallStart { id: String, name: String },
+    /// Incremental arguments JSON for a tool call.
+    ToolCallDelta { id: String, arguments_delta: String },
+    /// A tool call's arguments are complete.
+    ToolCallEnd { id: String },
+    /// The response is complete.
+    Done,
+    /// An error occurred during streaming.
+    Error(String),
+}
+
 /// A single tool invocation requested by the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -100,4 +117,55 @@ pub trait Provider: Send + Sync {
 
     /// The provider's context window size in tokens.
     fn context_window(&self) -> usize;
+
+    /// Whether this provider supports streaming responses.
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    /// Send a chat request and receive a stream of events.
+    ///
+    /// The default implementation falls back to [`Self::chat`] and emits the
+    /// full response as a single [`StreamEvent::Delta`] followed by
+    /// [`StreamEvent::Done`].
+    async fn chat_stream(
+        &self,
+        request: ChatRequest<'_>,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>>;
+}
+
+/// Default streaming implementation that delegates to [`Provider::chat`].
+///
+/// Providers that do not implement native streaming can call this from their
+/// `chat_stream` method.
+pub async fn default_chat_stream(
+    provider: &dyn Provider,
+    request: ChatRequest<'_>,
+) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+    let response = provider.chat(request).await?;
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(async move {
+        if let Some(content) = response.content {
+            let _ = tx.send(StreamEvent::Delta(content)).await;
+        }
+        for tc in &response.tool_calls {
+            let _ = tx
+                .send(StreamEvent::ToolCallStart {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                })
+                .await;
+            let _ = tx
+                .send(StreamEvent::ToolCallDelta {
+                    id: tc.id.clone(),
+                    arguments_delta: tc.arguments.to_string(),
+                })
+                .await;
+            let _ = tx
+                .send(StreamEvent::ToolCallEnd { id: tc.id.clone() })
+                .await;
+        }
+        let _ = tx.send(StreamEvent::Done).await;
+    });
+    Ok(rx)
 }
