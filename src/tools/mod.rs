@@ -6,6 +6,8 @@ pub mod collective_tools;
 pub mod delegate_tool;
 pub mod skills_tool;
 pub mod mcp_tools;
+pub mod git_tool;
+pub mod calc_tool;
 
 pub use traits::{Tool, ToolResult, ToolSpec};
 pub use web::{WebFetchTool, WebSearchTool};
@@ -13,3 +15,6 @@ pub use collective_tools::{CollectiveSearchTool, CollectiveReportTool};
 pub use delegate_tool::DelegateTool;
 pub use skills_tool::SkillsTool;
 pub use mcp_tools::{McpToolBridge, register_mcp_tools};
+pub use git_tool::GitTool;
+pub use calc_tool::CalculatorTool;
+pub use files::{EditFileTool, GlobTool, GrepTool};
