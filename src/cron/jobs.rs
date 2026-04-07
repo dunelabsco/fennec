@@ -13,6 +13,12 @@ pub struct CronJob {
     pub command: String,
     pub enabled: bool,
     pub last_run: Option<String>,
+    /// The channel this job originated from (e.g. "telegram", "discord").
+    #[serde(default)]
+    pub origin_channel: Option<String>,
+    /// The chat ID within the origin channel to deliver results to.
+    #[serde(default)]
+    pub origin_chat_id: Option<String>,
 }
 
 pub struct JobStore {
@@ -81,8 +87,12 @@ impl JobStore {
     }
 }
 
-/// Parse a schedule string like "every 30m", "every 1h", "every 7d" into
-/// the interval in seconds.
+/// Parse a schedule string like "every 30m", "every 1h", "every 7d", or a
+/// bare duration like "5m", "1h" into the interval in seconds.
+///
+/// Bare durations (without the "every " prefix) are treated as one-shot
+/// delays but still return the number of seconds, so that the scheduler
+/// can fire the job once after the given delay.
 ///
 /// Supported units:
 /// - `s` — seconds
@@ -93,8 +103,12 @@ impl JobStore {
 /// Returns `None` if the format is invalid.
 pub fn parse_schedule(schedule: &str) -> Option<u64> {
     let trimmed = schedule.trim();
-    let rest = trimmed.strip_prefix("every ")?;
-    let rest = rest.trim();
+
+    // Strip optional "every " prefix; bare durations are also accepted.
+    let rest = trimmed
+        .strip_prefix("every ")
+        .unwrap_or(trimmed)
+        .trim();
 
     if rest.is_empty() {
         return None;
@@ -142,11 +156,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_schedule_bare_duration() {
+        assert_eq!(parse_schedule("5m"), Some(300));
+        assert_eq!(parse_schedule("1h"), Some(3600));
+        assert_eq!(parse_schedule("30s"), Some(30));
+    }
+
+    #[test]
     fn test_parse_schedule_invalid() {
         assert_eq!(parse_schedule(""), None);
         assert_eq!(parse_schedule("every"), None);
         assert_eq!(parse_schedule("every abc"), None);
-        assert_eq!(parse_schedule("30m"), None);
         assert_eq!(parse_schedule("every 30x"), None);
+        assert_eq!(parse_schedule("abc"), None);
     }
 }

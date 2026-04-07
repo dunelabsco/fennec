@@ -29,12 +29,20 @@ fn test_parse_schedule_seconds() {
 }
 
 #[test]
+fn test_parse_schedule_bare_duration() {
+    // Bare durations (without "every " prefix) are now accepted.
+    assert_eq!(parse_schedule("30m"), Some(1800));
+    assert_eq!(parse_schedule("1h"), Some(3600));
+    assert_eq!(parse_schedule("10s"), Some(10));
+}
+
+#[test]
 fn test_parse_schedule_invalid() {
     assert_eq!(parse_schedule(""), None);
     assert_eq!(parse_schedule("every"), None);
     assert_eq!(parse_schedule("every abc"), None);
-    assert_eq!(parse_schedule("30m"), None);
     assert_eq!(parse_schedule("every 30x"), None);
+    assert_eq!(parse_schedule("abc"), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +57,8 @@ fn sample_job(id: &str, name: &str, schedule: &str) -> CronJob {
         command: format!("run {name}"),
         enabled: true,
         last_run: None,
+        origin_channel: None,
+        origin_chat_id: None,
     }
 }
 

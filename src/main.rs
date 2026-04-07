@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -27,6 +27,7 @@ use fennec::providers::traits::Provider;
 use fennec::security::prompt_guard::{GuardAction, PromptGuard};
 use fennec::security::SecretStore;
 use fennec::tools::collective_tools::{CollectiveReportTool, CollectiveSearchTool};
+use fennec::tools::cron_tool::{CronOrigin, CronTool};
 use fennec::tools::files::{ListDirTool, ReadFileTool, WriteFileTool};
 use fennec::tools::shell::ShellTool;
 use fennec::tools::web::{WebFetchTool, WebSearchTool};
@@ -164,11 +165,15 @@ fn parse_guard_action(action: &str) -> GuardAction {
 }
 
 /// Build an Agent from configuration. Shared by both `run_agent` and `run_gateway`.
+///
+/// Returns `(agent, memory, cron_origin_handle)`. The cron origin handle is
+/// an `Arc<Mutex<Option<CronOrigin>>>` that the gateway sets before each
+/// agent turn so the CronTool knows the originating channel/chat.
 async fn build_agent(
     config: &FennecConfig,
     home_dir: &std::path::Path,
     model_override: Option<String>,
-) -> Result<(fennec::agent::Agent, Arc<dyn Memory>)> {
+) -> Result<(fennec::agent::Agent, Arc<dyn Memory>, Arc<Mutex<Option<CronOrigin>>>)> {
     // Create SecretStore.
     let secret_store =
         SecretStore::new(home_dir.to_path_buf()).context("creating secret store")?;
@@ -244,6 +249,13 @@ async fn build_agent(
     let web_fetch_tool = WebFetchTool::new();
     let web_search_tool = WebSearchTool::new();
 
+    // Create CronTool with shared origin handle.
+    let cron_origin: Arc<Mutex<Option<CronOrigin>>> = Arc::new(Mutex::new(None));
+    let cron_tool = CronTool::new(
+        home_dir.join("cron_jobs.json"),
+        Arc::clone(&cron_origin),
+    );
+
     // Create prompt guard from config security settings.
     let guard_action = parse_guard_action(&config.security.prompt_guard_action);
     let prompt_guard = PromptGuard::new(guard_action, config.security.prompt_guard_sensitivity);
@@ -303,7 +315,8 @@ async fn build_agent(
         .tool(Box::new(write_file_tool))
         .tool(Box::new(list_dir_tool))
         .tool(Box::new(web_fetch_tool))
-        .tool(Box::new(web_search_tool));
+        .tool(Box::new(web_search_tool))
+        .tool(Box::new(cron_tool));
 
     // Add collective tools if enabled.
     if let Some(ref search) = collective_search {
@@ -350,7 +363,7 @@ async fn build_agent(
         .build()
         .context("building agent")?;
 
-    Ok((agent, memory))
+    Ok((agent, memory, cron_origin))
 }
 
 async fn run_agent(
@@ -359,7 +372,7 @@ async fn run_agent(
     message: Option<String>,
     model: Option<String>,
 ) -> Result<()> {
-    let (mut agent, memory) = build_agent(&config, &home_dir, model).await?;
+    let (mut agent, memory, _cron_origin) = build_agent(&config, &home_dir, model).await?;
 
     if let Some(msg) = message {
         // Single-shot mode.
@@ -435,7 +448,7 @@ async fn run_gateway(
     port_override: Option<u16>,
 ) -> Result<()> {
     // 1. Build Agent.
-    let (agent, _memory) = build_agent(&config, &home_dir, None).await?;
+    let (agent, _memory, cron_origin) = build_agent(&config, &home_dir, None).await?;
     let agent = Arc::new(tokio::sync::Mutex::new(agent));
 
     // 2. Create MessageBus.
@@ -555,15 +568,36 @@ async fn run_gateway(
         let agent = Arc::clone(&agent);
         let bus = bus.clone();
         let manager_ref = Arc::new(manager);
+        let cron_origin = Arc::clone(&cron_origin);
         tokio::spawn(async move {
             while let Some(msg) = receiver.inbound_rx.recv().await {
                 // Send typing indicator before processing
                 if let Some(ch) = manager_ref.get_channel(&msg.channel) {
                     let _ = ch.send_typing(&msg.chat_id).await;
                 }
+
+                // Set the CronTool's origin so any jobs created during this
+                // turn know which channel/chat to deliver results to.
+                {
+                    let mut origin = cron_origin.lock().unwrap();
+                    *origin = Some(CronOrigin {
+                        channel: msg.channel.clone(),
+                        chat_id: msg.chat_id.clone(),
+                    });
+                }
+
                 let mut agent_lock = agent.lock().await;
                 match agent_lock.turn(&msg.content).await {
                     Ok(response) => {
+                        // If the response starts with "[SILENT]", the agent
+                        // decided nothing needs to be said — skip outbound.
+                        if response.starts_with("[SILENT]") {
+                            tracing::debug!(
+                                "Agent response marked [SILENT], suppressing outbound"
+                            );
+                            continue;
+                        }
+
                         let outbound = fennec::bus::OutboundMessage {
                             content: response,
                             channel: msg.channel.clone(),

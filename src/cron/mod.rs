@@ -43,7 +43,7 @@ impl CronScheduler {
         let now = Utc::now();
         let mut fired = false;
 
-        let jobs: Vec<(String, String, String, Option<String>)> = self
+        let jobs: Vec<(String, String, String, Option<String>, Option<String>, Option<String>)> = self
             .store
             .list_jobs()
             .iter()
@@ -54,11 +54,13 @@ impl CronScheduler {
                     j.schedule.clone(),
                     j.command.clone(),
                     j.last_run.clone(),
+                    j.origin_channel.clone(),
+                    j.origin_chat_id.clone(),
                 )
             })
             .collect();
 
-        for (id, schedule, command, last_run) in jobs {
+        for (id, schedule, command, last_run, origin_channel, origin_chat_id) in jobs {
             let interval_secs = match parse_schedule(&schedule) {
                 Some(s) => s,
                 None => {
@@ -88,11 +90,16 @@ impl CronScheduler {
                     id: uuid::Uuid::new_v4().to_string(),
                     sender: format!("cron:{}", id),
                     content: command,
-                    channel: "cron".to_string(),
-                    chat_id: format!("cron:{}", id),
+                    channel: origin_channel.clone().unwrap_or_else(|| "cron".to_string()),
+                    chat_id: origin_chat_id.clone().unwrap_or_else(|| format!("cron:{}", id)),
                     timestamp: now.timestamp() as u64,
                     reply_to: None,
-                    metadata: HashMap::new(),
+                    metadata: {
+                        let mut m = HashMap::new();
+                        m.insert("source".to_string(), "cron".to_string());
+                        m.insert("cron_job_id".to_string(), id.clone());
+                        m
+                    },
                 };
 
                 if let Err(e) = self.bus.publish_inbound(msg).await {
