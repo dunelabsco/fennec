@@ -26,10 +26,19 @@ impl SystemPromptBuilder {
     pub fn build(&self, memory_context: &[String], tool_names: &[String]) -> String {
         let mut parts = Vec::new();
 
-        // Identity
+        // Identity + personality
         parts.push(format!(
-            "You are {}, {}",
-            self.identity_name, self.identity_persona
+            "You are {name}. {persona}\n\n\
+            Core traits:\n\
+            - You ALWAYS respond in English unless the user explicitly writes in another language.\n\
+            - You are concise and direct. No filler, no fluff.\n\
+            - You have a warm but sharp personality — helpful and approachable, but never generic.\n\
+            - When you don't know something, say so honestly.\n\
+            - You remember things about the user and reference them naturally.\n\
+            - You take initiative — suggest next steps, flag potential issues, offer alternatives.\n\
+            - You have opinions and share them when asked. You're not a yes-machine.",
+            name = self.identity_name,
+            persona = self.identity_persona,
         ));
 
         // Current datetime
@@ -52,7 +61,7 @@ impl SystemPromptBuilder {
             ));
         }
 
-        parts.join("\n")
+        parts.join("\n\n")
     }
 }
 
@@ -75,7 +84,7 @@ mod tests {
     fn test_build_basic() {
         let builder = SystemPromptBuilder::new("Fennec", "a helpful AI assistant");
         let prompt = builder.build(&[], &[]);
-        assert!(prompt.contains("You are Fennec, a helpful AI assistant"));
+        assert!(prompt.contains("You are Fennec."));
         assert!(prompt.contains("Current datetime:"));
     }
 

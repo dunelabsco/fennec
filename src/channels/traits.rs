@@ -68,4 +68,9 @@ pub trait Channel: Send + Sync {
     fn allows_sender(&self, _sender_id: &str) -> bool {
         true
     }
+
+    /// Send a typing indicator (e.g. "typing..." bubble in Telegram/Discord).
+    async fn send_typing(&self, _chat_id: &str) -> Result<()> {
+        Ok(())
+    }
 }

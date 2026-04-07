@@ -242,6 +242,20 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
+    async fn send_typing(&self, chat_id: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "action": "typing",
+        });
+        let _ = self
+            .client
+            .post(self.api_url("sendChatAction"))
+            .json(&body)
+            .send()
+            .await;
+        Ok(())
+    }
+
     fn allows_sender(&self, sender_id: &str) -> bool {
         // Empty list or wildcard "*" means allow all.
         if self.allowed_users.is_empty() {

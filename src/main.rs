@@ -554,8 +554,13 @@ async fn run_gateway(
     let agent_loop = {
         let agent = Arc::clone(&agent);
         let bus = bus.clone();
+        let manager_ref = Arc::new(manager);
         tokio::spawn(async move {
             while let Some(msg) = receiver.inbound_rx.recv().await {
+                // Send typing indicator before processing
+                if let Some(ch) = manager_ref.get_channel(&msg.channel) {
+                    let _ = ch.send_typing(&msg.chat_id).await;
+                }
                 let mut agent_lock = agent.lock().await;
                 match agent_lock.turn(&msg.content).await {
                     Ok(response) => {
