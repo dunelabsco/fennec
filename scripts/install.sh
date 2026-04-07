@@ -108,30 +108,74 @@ setup_config() {
 
 ensure_path() {
     if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-        warn "$INSTALL_DIR is not in your PATH."
-        echo ""
-        echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-        echo ""
-        echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
-        echo ""
+        export PATH="$INSTALL_DIR:$PATH"
+        # Add to shell profile
+        local shell_rc=""
+        if [ -f "$HOME/.zshrc" ]; then
+            shell_rc="$HOME/.zshrc"
+        elif [ -f "$HOME/.bashrc" ]; then
+            shell_rc="$HOME/.bashrc"
+        else
+            shell_rc="$HOME/.bashrc"
+        fi
+        if ! grep -q "$INSTALL_DIR" "$shell_rc" 2>/dev/null; then
+            echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$shell_rc"
+            log "Added $INSTALL_DIR to PATH in $shell_rc"
+        fi
     fi
+}
+
+setup_systemd() {
+    # Only set up systemd if running as root on Linux with systemctl
+    if [ "$(id -u)" != "0" ] || ! command -v systemctl &>/dev/null; then
+        return
+    fi
+
+    echo ""
+    echo "Start Fennec as a background service? (Y/n)"
+    read -rp "> " start_service < /dev/tty
+    if [[ "${start_service:-y}" =~ ^[Nn] ]]; then
+        return
+    fi
+
+    cat > /etc/systemd/system/fennec.service << SVCEOF
+[Unit]
+Description=Fennec AI Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$INSTALL_DIR/fennec gateway
+Restart=always
+RestartSec=5
+Environment=FENNEC_HOME=$FENNEC_HOME
+Environment=PATH=$INSTALL_DIR:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=$HOME
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    systemctl daemon-reload
+    systemctl enable fennec
+    systemctl start fennec
+    log "Fennec service started! It will survive reboots."
+    log "View logs: journalctl -u fennec -f"
 }
 
 print_done() {
     echo ""
-    echo -e "${GREEN}${BOLD}Fennec is installed!${NC}"
+    echo -e "${GREEN}${BOLD}Fennec is installed and running!${NC}"
     echo ""
-    echo "  Quick start:"
-    echo "    fennec status              # Check it's working"
+    echo "  Commands:"
+    echo "    fennec status              # Check status"
     echo "    fennec agent               # Interactive chat"
     echo "    fennec agent -m 'Hello'    # Single message"
-    echo "    fennec gateway             # Start all channels"
+    echo "    fennec gateway             # Start all channels (foreground)"
+    echo "    fennec onboard --force     # Re-run setup wizard"
     echo ""
-    echo "  Config: $FENNEC_HOME/config.toml"
-    echo "  Memory: $FENNEC_HOME/memory/brain.db"
-    echo ""
-    echo "  To add channels (Telegram, Discord, Slack):"
-    echo "    Edit $FENNEC_HOME/config.toml and set tokens"
+    echo "  Config:  $FENNEC_HOME/config.toml"
+    echo "  Logs:    journalctl -u fennec -f"
     echo ""
 }
 
@@ -141,6 +185,7 @@ main() {
     build_fennec
     setup_config
     ensure_path
+    setup_systemd
     print_done
 }
 
