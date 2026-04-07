@@ -7,7 +7,7 @@ fn test_default_identity() {
     assert_eq!(cfg.identity.name, "Fennec");
     assert_eq!(
         cfg.identity.persona,
-        "A fast, helpful AI assistant with collective intelligence."
+        "Your personal AI agent — sharp, resourceful, and always on."
     );
 }
 
@@ -116,7 +116,7 @@ name = "Partial"
     // Persona should be default since it wasn't specified
     assert_eq!(
         cfg.identity.persona,
-        "A fast, helpful AI assistant with collective intelligence."
+        "Your personal AI agent — sharp, resourceful, and always on."
     );
     // Provider should be fully default
     assert_eq!(cfg.provider.name, "anthropic");

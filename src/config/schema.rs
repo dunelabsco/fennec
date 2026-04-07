@@ -68,7 +68,7 @@ impl Default for IdentityConfig {
     fn default() -> Self {
         Self {
             name: "Fennec".to_string(),
-            persona: "A fast, helpful AI assistant with collective intelligence.".to_string(),
+            persona: "Your personal AI agent — sharp, resourceful, and always on.".to_string(),
         }
     }
 }
