@@ -71,16 +71,21 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         .default(false)
         .interact()?;
 
-    let telegram_token = if setup_telegram {
+    let (telegram_token, telegram_user_id) = if setup_telegram {
         println!(
             "  {}",
             style("Create a bot via @BotFather on Telegram").dim()
         );
-        Input::<String>::new()
+        let token: String = Input::new()
             .with_prompt("Telegram bot token")
-            .interact_text()?
+            .interact_text()?;
+        let user_id: String = Input::new()
+            .with_prompt("Your Telegram user ID (message @userinfobot on Telegram to find it)")
+            .allow_empty(true)
+            .interact_text()?;
+        (token, user_id)
     } else {
-        String::new()
+        (String::new(), String::new())
     };
 
     // Step 5: Discord setup
@@ -142,6 +147,7 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         default_model,
         &api_key,
         &telegram_token,
+        &telegram_user_id,
         &discord_token,
         &plurum_key,
     );
@@ -195,9 +201,16 @@ fn build_config_toml(
     model: &str,
     api_key: &str,
     telegram_token: &str,
+    telegram_user_id: &str,
     discord_token: &str,
     plurum_key: &str,
 ) -> String {
+    let allowed_users_line = if telegram_user_id.is_empty() {
+        "allowed_users = []".to_string()
+    } else {
+        format!("allowed_users = [\"{}\"]", telegram_user_id)
+    };
+
     format!(
         r#"[identity]
 name = "{name}"
@@ -230,6 +243,7 @@ context_window = 200000
 [channels.telegram]
 enabled = {telegram_enabled}
 token = "{telegram_token}"
+{allowed_users_line}
 
 [channels.discord]
 enabled = {discord_enabled}
@@ -259,6 +273,7 @@ search_enabled = true
         model = model,
         api_key = api_key,
         telegram_token = telegram_token,
+        allowed_users_line = allowed_users_line,
         telegram_enabled = if telegram_token.is_empty() {
             "false"
         } else {
@@ -293,6 +308,7 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(config.contains("name = \"TestBot\""));
         assert!(config.contains("name = \"anthropic\""));
@@ -310,11 +326,13 @@ mod tests {
             "gpt-4o",
             "sk-openai",
             "123:ABC",
+            "987654321",
             "discord-token",
             "plurum-key",
         );
         assert!(config.contains("[channels.telegram]\nenabled = true"));
         assert!(config.contains("token = \"123:ABC\""));
+        assert!(config.contains("allowed_users = [\"987654321\"]"));
         assert!(config.contains("[channels.discord]\nenabled = true"));
         assert!(config.contains("token = \"discord-token\""));
         assert!(config.contains("[collective]\nenabled = true"));

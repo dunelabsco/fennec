@@ -571,10 +571,34 @@ async fn run_gateway(
         let cron_origin = Arc::clone(&cron_origin);
         tokio::spawn(async move {
             while let Some(msg) = receiver.inbound_rx.recv().await {
-                // Send typing indicator before processing
-                if let Some(ch) = manager_ref.get_channel(&msg.channel) {
-                    let _ = ch.send_typing(&msg.chat_id).await;
+                // Handle /new and /reset commands: clear agent history and
+                // send a confirmation instead of running a full agent turn.
+                if msg.metadata.get("command").map(|s| s.as_str()) == Some("reset") {
+                    let mut agent_lock = agent.lock().await;
+                    agent_lock.clear_history();
+                    let outbound = fennec::bus::OutboundMessage {
+                        content: "Session reset! Starting fresh.".to_string(),
+                        channel: msg.channel.clone(),
+                        chat_id: msg.chat_id.clone(),
+                        reply_to: Some(msg.id.clone()),
+                        metadata: std::collections::HashMap::new(),
+                    };
+                    let _ = bus.publish_outbound(outbound).await;
+                    continue;
                 }
+
+                // Spawn continuous typing indicator that fires every 4 seconds
+                // until the agent finishes processing.
+                let typing_channel: Option<Arc<dyn Channel>> = manager_ref.get_channel(&msg.channel);
+                let typing_chat_id = msg.chat_id.clone();
+                let typing_handle = tokio::spawn(async move {
+                    if let Some(ch) = typing_channel {
+                        loop {
+                            let _ = ch.send_typing(&typing_chat_id).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                        }
+                    }
+                });
 
                 // Set the CronTool's origin so any jobs created during this
                 // turn know which channel/chat to deliver results to.
@@ -589,6 +613,9 @@ async fn run_gateway(
                 let mut agent_lock = agent.lock().await;
                 match agent_lock.turn(&msg.content).await {
                     Ok(response) => {
+                        // Stop typing indicator.
+                        typing_handle.abort();
+
                         // If the response starts with "[SILENT]", the agent
                         // decided nothing needs to be said — skip outbound.
                         if response.starts_with("[SILENT]") {
@@ -610,10 +637,27 @@ async fn run_gateway(
                         }
                     }
                     Err(e) => {
+                        // Stop typing indicator.
+                        typing_handle.abort();
+
                         tracing::error!(
                             "Agent turn failed for message from {}: {e}",
                             msg.channel
                         );
+
+                        // Send error message back to the user.
+                        let error_msg = format!(
+                            "Something went wrong: {}\n\nTry /new to start a fresh session.",
+                            e
+                        );
+                        let outbound = fennec::bus::OutboundMessage {
+                            content: error_msg,
+                            channel: msg.channel.clone(),
+                            chat_id: msg.chat_id.clone(),
+                            reply_to: Some(msg.id.clone()),
+                            metadata: std::collections::HashMap::new(),
+                        };
+                        let _ = bus.publish_outbound(outbound).await;
                     }
                 }
             }
