@@ -40,7 +40,7 @@ fn test_default_security() {
     assert!(cfg.security.encrypt_secrets);
     assert!(cfg.security.command_allowlist.contains(&"git".to_string()));
     assert!(cfg.security.command_allowlist.contains(&"cargo".to_string()));
-    assert_eq!(cfg.security.command_allowlist.len(), 20);
+    assert_eq!(cfg.security.command_allowlist.len(), 30);
     assert!(cfg.security.forbidden_paths.contains(&"/etc".to_string()));
     assert_eq!(cfg.security.command_timeout_secs, 60);
 }

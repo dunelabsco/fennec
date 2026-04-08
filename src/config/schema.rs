@@ -152,6 +152,7 @@ impl Default for SecurityConfig {
             command_allowlist: vec![
                 "git", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail", "date",
                 "df", "du", "uname", "cargo", "npm", "node", "python", "python3", "pip",
+                "curl", "wget", "which", "env", "sort", "uniq", "tr", "cut", "sed", "awk",
             ]
             .into_iter()
             .map(String::from)

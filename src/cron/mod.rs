@@ -22,7 +22,7 @@ impl CronScheduler {
         Self {
             store,
             bus,
-            check_interval_secs: check_interval_secs.unwrap_or(60),
+            check_interval_secs: check_interval_secs.unwrap_or(30),
         }
     }
 

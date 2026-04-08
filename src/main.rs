@@ -528,20 +528,20 @@ async fn run_gateway(
     let _listener_handles = manager.start_all();
     let _dispatch_handle = manager.spawn_outbound_dispatch(receiver.outbound_rx);
 
-    // 5. Start CronScheduler if enabled.
-    let _cron_handle = if config.cron.enabled {
+    // 5. Start CronScheduler — always runs in gateway mode so user-created
+    //    reminders/jobs are delivered. The config.cron.enabled flag is reserved
+    //    for future heartbeat/auto-task features.
+    let _cron_handle = {
         let cron_path = home_dir.join("cron_jobs.json");
         let mut store = JobStore::new(cron_path);
         if let Err(e) = store.load() {
             tracing::warn!("Failed to load cron jobs: {e}");
         }
         let mut scheduler = CronScheduler::new(store, bus.clone(), None);
-        tracing::info!("Cron scheduler enabled");
+        tracing::info!("Cron scheduler started");
         Some(tokio::spawn(async move {
             scheduler.run().await;
         }))
-    } else {
-        None
     };
 
     // 6. Start GatewayServer in a background task.
