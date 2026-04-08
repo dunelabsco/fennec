@@ -20,7 +20,7 @@ pub struct PlurumlClient {
 #[derive(Serialize)]
 struct SearchRequest {
     query: String,
-    match_count: usize,
+    limit: usize,
 }
 
 /// Wrapper for the search response envelope.
@@ -126,16 +126,17 @@ struct PlurumlAttempt {
 
 #[derive(Serialize)]
 struct PublishRequest {
-    id: String,
     goal: String,
-    context: PublishContext,
+    domain: String,
+    outcome: String,
+    context_structured: PublishContext,
     attempts: Vec<PublishAttempt>,
     solution: Option<String>,
     gotchas: Vec<String>,
     tags: Vec<String>,
     confidence: f32,
-    session_id: Option<String>,
-    created_at: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools_used: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -223,7 +224,7 @@ impl CollectiveLayer for PlurumlClient {
     ) -> anyhow::Result<Vec<CollectiveSearchResult>> {
         let body = SearchRequest {
             query: query.to_string(),
-            match_count: limit,
+            limit,
         };
 
         let resp = self
@@ -349,10 +350,16 @@ impl CollectiveLayer for PlurumlClient {
     }
 
     async fn publish(&self, experience: &Experience) -> anyhow::Result<String> {
+        // Infer domain from tags or default to "general".
+        let domain = experience.tags.first().cloned().unwrap_or_else(|| "general".to_string());
+        // Infer outcome from whether a solution exists.
+        let outcome = if experience.solution.is_some() { "success" } else { "partial" }.to_string();
+
         let body = PublishRequest {
-            id: experience.id.clone(),
             goal: experience.goal.clone(),
-            context: PublishContext {
+            domain,
+            outcome,
+            context_structured: PublishContext {
                 tools_used: experience.context.tools_used.clone(),
                 environment: experience.context.environment.clone(),
                 constraints: experience.context.constraints.clone(),
@@ -371,8 +378,7 @@ impl CollectiveLayer for PlurumlClient {
             gotchas: experience.gotchas.clone(),
             tags: experience.tags.clone(),
             confidence: experience.confidence,
-            session_id: experience.session_id.clone(),
-            created_at: experience.created_at.clone(),
+            tools_used: experience.context.tools_used.clone(),
         };
 
         let resp = self
