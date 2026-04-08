@@ -23,12 +23,19 @@ struct SearchRequest {
     match_count: usize,
 }
 
+/// Wrapper for the search response envelope.
+#[derive(Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    results: Vec<PlurumlSearchResult>,
+}
+
 #[derive(Deserialize)]
 struct PlurumlSearchResult {
     id: String,
     goal: String,
     solution: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_gotchas")]
     gotchas: Vec<String>,
     /// Plurum may send `trust_score` or the older `quality_score` name.
     trust_score: Option<f64>,
@@ -36,6 +43,25 @@ struct PlurumlSearchResult {
     relevance_score: Option<f64>,
     #[serde(default)]
     outcome_reports: Option<PlurumlOutcomeReports>,
+}
+
+/// Gotchas can be either plain strings or `{"warning": "...", "context": "..."}` objects.
+fn deserialize_gotchas<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<serde_json::Value> = Vec::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            serde_json::Value::Object(obj) => obj
+                .get("warning")
+                .and_then(|w| w.as_str())
+                .map(String::from),
+            _ => None,
+        })
+        .collect())
 }
 
 #[derive(Deserialize)]
@@ -59,7 +85,7 @@ struct PlurumlExperience {
     #[serde(default)]
     breakthroughs: Option<Vec<String>>,
     solution: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_gotchas")]
     gotchas: Vec<String>,
     #[serde(default)]
     tags: Vec<String>,
@@ -211,10 +237,11 @@ impl CollectiveLayer for PlurumlClient {
             return Err(Self::parse_error(resp).await);
         }
 
-        let results: Vec<PlurumlSearchResult> = resp
+        let envelope: SearchResponse = resp
             .json()
             .await
             .context("failed to parse Plurum search response")?;
+        let results = envelope.results;
 
         Ok(results
             .into_iter()
@@ -398,7 +425,7 @@ impl CollectiveLayer for PlurumlClient {
 
     async fn health_check(&self) -> bool {
         let resp = self
-            .request(reqwest::Method::GET, "/api/v1/health")
+            .request(reqwest::Method::GET, "/health")
             .send()
             .await;
 
