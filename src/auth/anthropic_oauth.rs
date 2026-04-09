@@ -86,57 +86,70 @@ pub fn run_oauth_login(fennec_home: &Path) -> Result<OAuthCredentials> {
     let challenge = compute_challenge(&verifier);
 
     // 2. Build authorization URL.
-    // Anthropic requires a `state` parameter. Use the verifier as state
-    // (same approach as Hermes).
-    let state = &verifier;
+    // Build authorization URL — matches Hermes's exact parameter set.
+    // The "code=true" param and "state=verifier" are required by Anthropic.
     let auth_url = format!(
-        "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={}&state={}",
+        "{}?code=true&client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}",
         AUTH_ENDPOINT,
         CLIENT_ID,
         urlencoded(REDIRECT_URI),
         urlencoded(SCOPE),
         challenge,
-        urlencoded(state),
+        urlencoded(&verifier),
     );
 
-    // 3. Open browser and prompt user.
-    println!("Opening browser for Anthropic authentication...");
-    println!("If the browser doesn't open, visit:\n{}\n", auth_url);
+    // 3. Show URL and prompt user.
+    println!();
+    println!("  Open this link in your browser:");
+    println!();
+    println!("  {}", auth_url);
+    println!();
     open_browser(&auth_url);
+    println!("After authorizing, you'll see a code. Paste it below.");
+    println!();
 
-    println!("Paste the authorization code here:");
-    let mut code = String::new();
-    // Read from /dev/tty to work when stdin is piped (curl | bash).
-    // Fall back to stdin if /dev/tty is unavailable (e.g. on Windows).
+    print!("Authorization code: ");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+
+    let mut raw_input = String::new();
     #[cfg(unix)]
     {
         use std::io::BufRead;
         if let Ok(tty) = std::fs::File::open("/dev/tty") {
             let mut reader = std::io::BufReader::new(tty);
-            reader.read_line(&mut code).context("reading authorization code from /dev/tty")?;
+            reader.read_line(&mut raw_input).context("reading authorization code")?;
         } else {
-            std::io::stdin().read_line(&mut code).context("reading authorization code from stdin")?;
+            std::io::stdin().read_line(&mut raw_input).context("reading authorization code")?;
         }
     }
     #[cfg(not(unix))]
     {
-        std::io::stdin().read_line(&mut code).context("reading authorization code from stdin")?;
+        std::io::stdin().read_line(&mut raw_input).context("reading authorization code")?;
     }
-    let code = code.trim();
-    if code.is_empty() {
+    let raw_input = raw_input.trim();
+    if raw_input.is_empty() {
         anyhow::bail!("Empty authorization code");
     }
 
-    // 4. Exchange code for tokens.
+    // The callback page may return "code#state" — split on '#'.
+    let parts: Vec<&str> = raw_input.splitn(2, '#').collect();
+    let code = parts[0];
+    let state = if parts.len() > 1 { parts[1] } else { "" };
+
+    // 4. Exchange code for tokens — must include User-Agent matching Claude CLI.
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(TOKEN_ENDPOINT)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "claude-cli/1.0 (external, cli)")
         .json(&serde_json::json!({
             "grant_type": "authorization_code",
+            "client_id": CLIENT_ID,
             "code": code,
+            "state": state,
             "redirect_uri": REDIRECT_URI,
             "code_verifier": verifier,
-            "client_id": CLIENT_ID,
         }))
         .send()
         .context("sending token exchange request")?;
