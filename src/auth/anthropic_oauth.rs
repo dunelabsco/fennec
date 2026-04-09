@@ -86,13 +86,17 @@ pub fn run_oauth_login(fennec_home: &Path) -> Result<OAuthCredentials> {
     let challenge = compute_challenge(&verifier);
 
     // 2. Build authorization URL.
+    // Anthropic requires a `state` parameter. Use the verifier as state
+    // (same approach as Hermes).
+    let state = &verifier;
     let auth_url = format!(
-        "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={}",
+        "{}?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={}&state={}",
         AUTH_ENDPOINT,
         CLIENT_ID,
         urlencoded(REDIRECT_URI),
         urlencoded(SCOPE),
         challenge,
+        urlencoded(state),
     );
 
     // 3. Open browser and prompt user.
