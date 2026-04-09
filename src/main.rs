@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use fennec::agent::AgentBuilder;
+use fennec::auth;
 use fennec::bus::MessageBus;
 use fennec::channels::cli::CliChannel;
 use fennec::channels::traits::{Channel, SendMessage};
@@ -29,8 +30,14 @@ use fennec::security::SecretStore;
 use fennec::tools::collective_tools::{CollectiveReportTool, CollectiveSearchTool};
 use fennec::tools::cron_tool::{CronOrigin, CronTool};
 use fennec::tools::files::{ListDirTool, ReadFileTool, WriteFileTool};
+use fennec::tools::memory_tools::{MemoryForgetTool, MemoryRecallTool, MemoryStoreTool};
+use fennec::tools::send_message_tool::SendMessageTool;
 use fennec::tools::shell::ShellTool;
+use fennec::tools::todo_tool::TodoTool;
+use fennec::tools::ask_user_tool::AskUserTool;
+use fennec::channels::{ChannelMapHandle, new_channel_map};
 use fennec::tools::web::{WebFetchTool, WebSearchTool};
+use fennec::tools::browser_tool::BrowserTool;
 
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
@@ -69,6 +76,8 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Authenticate with Anthropic via OAuth
+    Login,
 }
 
 /// Resolve the API key from config or provider-specific environment variable.
@@ -173,16 +182,26 @@ async fn build_agent(
     config: &FennecConfig,
     home_dir: &std::path::Path,
     model_override: Option<String>,
+    channel_map: Option<ChannelMapHandle>,
 ) -> Result<(fennec::agent::Agent, Arc<dyn Memory>, Arc<Mutex<Option<CronOrigin>>>)> {
     // Create SecretStore.
     let secret_store =
         SecretStore::new(home_dir.to_path_buf()).context("creating secret store")?;
 
-    // Resolve API key.
-    let api_key = resolve_api_key(config, &secret_store)?;
-
-    // Create LLM provider based on config.
-    let provider = build_provider(config, api_key, model_override);
+    // Resolve provider: for Anthropic, try OAuth token first, then fall back to API key.
+    let provider: Box<dyn Provider> = if config.provider.name == "anthropic" {
+        if let Ok(Some(oauth_token)) = auth::load_oauth_token(home_dir) {
+            tracing::info!("Using Anthropic OAuth token");
+            let model = model_override.unwrap_or_else(|| config.provider.model.clone());
+            Box::new(AnthropicProvider::new_with_oauth(oauth_token, Some(model)))
+        } else {
+            let api_key = resolve_api_key(config, &secret_store)?;
+            build_provider(config, api_key, model_override)
+        }
+    } else {
+        let api_key = resolve_api_key(config, &secret_store)?;
+        build_provider(config, api_key, model_override)
+    };
 
     // Create embedding provider based on config.
     let embedder: Arc<dyn fennec::memory::embedding::EmbeddingProvider> =
@@ -248,6 +267,7 @@ async fn build_agent(
     let list_dir_tool = ListDirTool::new();
     let web_fetch_tool = WebFetchTool::new();
     let web_search_tool = WebSearchTool::new();
+    let browser_tool = BrowserTool::new();
 
     // Create CronTool with shared origin handle.
     let cron_origin: Arc<Mutex<Option<CronOrigin>>> = Arc::new(Mutex::new(None));
@@ -316,7 +336,24 @@ async fn build_agent(
         .tool(Box::new(list_dir_tool))
         .tool(Box::new(web_fetch_tool))
         .tool(Box::new(web_search_tool))
-        .tool(Box::new(cron_tool));
+        .tool(Box::new(browser_tool))
+        .tool(Box::new(cron_tool))
+        .tool(Box::new(MemoryStoreTool::new(memory.clone())))
+        .tool(Box::new(MemoryRecallTool::new(memory.clone())))
+        .tool(Box::new(MemoryForgetTool::new(memory.clone())))
+        .tool(Box::new(TodoTool::new()));
+
+    // Add send_message tool when running in gateway mode (bus available via channel_map).
+    if let Some(ref ch_map) = channel_map {
+        builder = builder.tool(Box::new(SendMessageTool::new(Arc::clone(ch_map))));
+    }
+
+    // Add ask_user tool when running in gateway mode (channel map available).
+    if let Some(ref ch_map) = channel_map {
+        // Default to "telegram" — the most common gateway channel.
+        let default_ch = "telegram".to_string();
+        builder = builder.tool(Box::new(AskUserTool::new(Arc::clone(ch_map), default_ch)));
+    }
 
     // Add collective tools if enabled.
     if let Some(ref search) = collective_search {
@@ -372,7 +409,7 @@ async fn run_agent(
     message: Option<String>,
     model: Option<String>,
 ) -> Result<()> {
-    let (mut agent, memory, _cron_origin) = build_agent(&config, &home_dir, model).await?;
+    let (mut agent, memory, _cron_origin) = build_agent(&config, &home_dir, model, None).await?;
 
     if let Some(msg) = message {
         // Single-shot mode.
@@ -447,12 +484,13 @@ async fn run_gateway(
     host_override: Option<String>,
     port_override: Option<u16>,
 ) -> Result<()> {
-    // 1. Build Agent.
-    let (agent, _memory, cron_origin) = build_agent(&config, &home_dir, None).await?;
-    let agent = Arc::new(tokio::sync::Mutex::new(agent));
-
-    // 2. Create MessageBus.
+    // 1. Create MessageBus and channel map handle.
     let (bus, mut receiver) = MessageBus::new(256);
+    let channel_map = new_channel_map();
+
+    // 2. Build Agent (pass channel map so ask_user tool can reach channels).
+    let (agent, _memory, cron_origin) = build_agent(&config, &home_dir, None, Some(channel_map.clone())).await?;
+    let agent = Arc::new(tokio::sync::Mutex::new(agent));
 
     // 3. Build channel list from config.
     let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
@@ -521,6 +559,14 @@ async fn run_gateway(
         );
         channels.push(Arc::new(ch));
         tracing::info!("Email channel enabled");
+    }
+
+    // 3a. Populate the channel map so tools (e.g. ask_user) can reach channels.
+    {
+        let mut map = channel_map.write();
+        for ch in &channels {
+            map.insert(ch.name().to_string(), Arc::clone(ch));
+        }
     }
 
     // 4. Create ChannelManager, start all channels.
@@ -625,6 +671,60 @@ async fn run_gateway(
                             continue;
                         }
 
+                        // Check if the channel supports streaming and use
+                        // streaming delivery for a progressive typing effect.
+                        let streaming_channel = manager_ref.get_channel(&msg.channel)
+                            .filter(|ch| ch.supports_streaming());
+
+                        if let Some(ch) = streaming_channel {
+                            // Drop agent lock before streaming delivery.
+                            drop(agent_lock);
+
+                            match ch.send_streaming_start(&msg.chat_id).await {
+                                Ok(Some(mid)) => {
+                                    // Deliver the response in chunks to simulate
+                                    // streaming on the channel side.
+                                    let mut accumulated = String::new();
+                                    let chunk_size = 80;
+                                    let mut chars = response.chars().peekable();
+
+                                    while chars.peek().is_some() {
+                                        let chunk: String = chars.by_ref().take(chunk_size).collect();
+                                        accumulated.push_str(&chunk);
+                                        let _ = ch
+                                            .send_streaming_delta(
+                                                &msg.chat_id,
+                                                &mid,
+                                                &accumulated,
+                                            )
+                                            .await;
+                                        // Small delay between chunks for visual effect;
+                                        // the channel's own rate limiter handles throttling.
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(50))
+                                            .await;
+                                    }
+
+                                    let _ = ch
+                                        .send_streaming_end(
+                                            &msg.chat_id,
+                                            &mid,
+                                            &accumulated,
+                                        )
+                                        .await;
+                                    // Streaming already delivered — skip outbound bus.
+                                    continue;
+                                }
+                                Ok(None) | Err(_) => {
+                                    // Streaming start failed; fall through to
+                                    // normal outbound delivery below.
+                                    tracing::warn!(
+                                        "Streaming start failed for channel '{}', falling back",
+                                        msg.channel
+                                    );
+                                }
+                            }
+                        }
+
                         let outbound = fennec::bus::OutboundMessage {
                             content: response,
                             channel: msg.channel.clone(),
@@ -717,6 +817,9 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
             fennec::onboard::run_wizard(&home_dir)?;
+        }
+        Commands::Login => {
+            auth::run_oauth_login(&home_dir)?;
         }
     }
 

@@ -7,23 +7,51 @@ use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent, ToolCall, UsageInfo,
 };
 
+/// How the Anthropic provider authenticates its requests.
+#[derive(Debug, Clone)]
+pub enum AnthropicAuthMode {
+    /// Traditional API key sent as `x-api-key` header.
+    ApiKey(String),
+    /// OAuth Bearer token sent as `Authorization: Bearer <token>`.
+    OAuthBearer(String),
+}
+
 /// Anthropic Claude API provider.
 pub struct AnthropicProvider {
-    api_key: String,
+    auth: AnthropicAuthMode,
     client: reqwest::Client,
     default_model: String,
 }
 
 impl AnthropicProvider {
-    /// Create a new Anthropic provider.
+    /// Create a new Anthropic provider using an API key.
     ///
     /// - `api_key`: Anthropic API key.
     /// - `model`: Override the default model. Defaults to `claude-sonnet-4-20250514`.
     pub fn new(api_key: String, model: Option<String>) -> Self {
         Self {
-            api_key,
+            auth: AnthropicAuthMode::ApiKey(api_key),
             client: reqwest::Client::new(),
             default_model: model.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string()),
+        }
+    }
+
+    /// Create a new Anthropic provider using an OAuth Bearer token.
+    pub fn new_with_oauth(token: String, model: Option<String>) -> Self {
+        Self {
+            auth: AnthropicAuthMode::OAuthBearer(token),
+            client: reqwest::Client::new(),
+            default_model: model.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string()),
+        }
+    }
+
+    /// Apply the appropriate authentication header to a request builder.
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            AnthropicAuthMode::ApiKey(key) => builder.header("x-api-key", key),
+            AnthropicAuthMode::OAuthBearer(token) => {
+                builder.header("Authorization", format!("Bearer {}", token))
+            }
         }
     }
 
@@ -296,13 +324,15 @@ impl Provider for AnthropicProvider {
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
         let body = self.build_request_body(&request, false);
 
-        let response = self
+        let req = self
             .client
             .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .json(&body);
+        let req = self.apply_auth(req);
+
+        let response = req
             .send()
             .await
             .context("sending request to Anthropic API")?;
@@ -343,13 +373,15 @@ impl Provider for AnthropicProvider {
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
         let body = self.build_request_body(&request, true);
 
-        let response = self
+        let req = self
             .client
             .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
+            .json(&body);
+        let req = self.apply_auth(req);
+
+        let response = req
             .send()
             .await
             .context("sending streaming request to Anthropic API")?;

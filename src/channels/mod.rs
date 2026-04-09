@@ -15,3 +15,15 @@ pub use discord::DiscordChannel;
 pub use slack::SlackChannel;
 pub use whatsapp::WhatsAppChannel;
 pub use email::EmailChannel;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Shared handle to a map of channels by name, used by tools that need to
+/// interact with channels (e.g. `AskUserTool`).
+pub type ChannelMapHandle = Arc<parking_lot::RwLock<HashMap<String, Arc<dyn Channel>>>>;
+
+/// Create a new empty [`ChannelMapHandle`].
+pub fn new_channel_map() -> ChannelMapHandle {
+    Arc::new(parking_lot::RwLock::new(HashMap::new()))
+}
