@@ -50,7 +50,11 @@ impl AnthropicProvider {
         match &self.auth {
             AnthropicAuthMode::ApiKey(key) => builder.header("x-api-key", key),
             AnthropicAuthMode::OAuthBearer(token) => {
-                builder.header("Authorization", format!("Bearer {}", token))
+                builder
+                    .header("Authorization", format!("Bearer {}", token))
+                    // OAuth requires beta headers to work with the Messages API
+                    .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+                    .header("User-Agent", "claude-cli/1.0 (external, cli)")
             }
         }
     }
