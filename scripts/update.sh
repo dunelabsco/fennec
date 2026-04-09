@@ -12,6 +12,10 @@ if command -v systemctl &>/dev/null && systemctl is-active fennec &>/dev/null 2>
     log "Stopping fennec service..."
     systemctl stop fennec
 fi
+# Also kill any stray fennec processes
+pkill -f "fennec gateway" 2>/dev/null || true
+pkill -f "fennec agent" 2>/dev/null || true
+sleep 1
 
 # Build
 log "Pulling latest code..."
