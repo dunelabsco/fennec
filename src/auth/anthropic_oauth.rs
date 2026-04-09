@@ -102,9 +102,22 @@ pub fn run_oauth_login(fennec_home: &Path) -> Result<OAuthCredentials> {
 
     println!("Paste the authorization code here:");
     let mut code = String::new();
-    std::io::stdin()
-        .read_line(&mut code)
-        .context("reading authorization code from stdin")?;
+    // Read from /dev/tty to work when stdin is piped (curl | bash).
+    // Fall back to stdin if /dev/tty is unavailable (e.g. on Windows).
+    #[cfg(unix)]
+    {
+        use std::io::BufRead;
+        if let Ok(tty) = std::fs::File::open("/dev/tty") {
+            let mut reader = std::io::BufReader::new(tty);
+            reader.read_line(&mut code).context("reading authorization code from /dev/tty")?;
+        } else {
+            std::io::stdin().read_line(&mut code).context("reading authorization code from stdin")?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::io::stdin().read_line(&mut code).context("reading authorization code from stdin")?;
+    }
     let code = code.trim();
     if code.is_empty() {
         anyhow::bail!("Empty authorization code");
