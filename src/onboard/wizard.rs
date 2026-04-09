@@ -39,15 +39,53 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         _ => ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
     };
 
-    // Step 2: API key (skip for ollama)
-    let api_key = if !env_var.is_empty() {
-        // Check env var first
+    // Step 2: Authentication
+    let api_key = if provider_name == "anthropic" {
+        // Anthropic: offer OAuth or API key
+        let auth_methods = vec![
+            "OAuth (sign in with your Claude account — free with subscription)",
+            "API key (from console.anthropic.com — pay per use)",
+        ];
+        let auth_idx = Select::new()
+            .with_prompt("How do you want to authenticate")
+            .items(&auth_methods)
+            .default(0)
+            .interact()?;
+
+        if auth_idx == 0 {
+            // OAuth flow
+            println!();
+            println!("  {}", style("Starting OAuth login...").dim());
+            match crate::auth::run_oauth_login(fennec_home) {
+                Ok(_creds) => {
+                    println!("  {} Authenticated with Claude!", style("✓").green());
+                    String::new() // No API key needed — OAuth token stored separately
+                }
+                Err(e) => {
+                    println!("  {} OAuth failed: {}", style("✗").red(), e);
+                    println!("  {}", style("Falling back to API key...").dim());
+                    Input::<String>::new()
+                        .with_prompt("Enter your Anthropic API key")
+                        .allow_empty(true)
+                        .interact_text()?
+                }
+            }
+        } else {
+            // API key
+            if let Ok(key) = std::env::var(env_var) {
+                println!("  {} Using {} from environment", style("✓").green(), env_var);
+                key
+            } else {
+                Input::<String>::new()
+                    .with_prompt("Enter your Anthropic API key")
+                    .allow_empty(true)
+                    .interact_text()?
+            }
+        }
+    } else if !env_var.is_empty() {
+        // Non-Anthropic providers: API key only
         if let Ok(key) = std::env::var(env_var) {
-            println!(
-                "  {} Using {} from environment",
-                style("✓").green(),
-                env_var
-            );
+            println!("  {} Using {} from environment", style("✓").green(), env_var);
             key
         } else {
             Input::<String>::new()
@@ -56,7 +94,7 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
                 .interact_text()?
         }
     } else {
-        String::new()
+        String::new() // Ollama — no key needed
     };
 
     // Step 3: Agent name
