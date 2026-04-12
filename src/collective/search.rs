@@ -179,8 +179,8 @@ impl CollectiveSearch {
 
         // Determine confidence
         let confidence = match all_results.first() {
-            Some(r) if r.final_score > 0.85 => SearchConfidence::High,
-            Some(r) if r.final_score > 0.5 => SearchConfidence::Partial,
+            Some(r) if r.final_score > 0.7 => SearchConfidence::High,
+            Some(r) if r.final_score > 0.3 => SearchConfidence::Partial,
             _ => SearchConfidence::None,
         };
 
