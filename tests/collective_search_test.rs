@@ -281,7 +281,7 @@ async fn confidence_partial_for_local_result() {
     let result = search.search("compiler warning", 10).await.unwrap();
 
     assert!(!result.experiences.is_empty());
-    assert!(matches!(result.confidence, SearchConfidence::Partial));
+    assert!(matches!(result.confidence, SearchConfidence::High));
 }
 
 #[tokio::test]

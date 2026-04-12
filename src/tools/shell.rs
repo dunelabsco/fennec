@@ -41,6 +41,29 @@ impl ShellTool {
         None
     }
 
+    /// Check if a command contains what looks like an API key or secret.
+    fn contains_secret(command: &str) -> bool {
+        // Common API key patterns that should never appear in shell commands
+        let patterns = [
+            "sk-ant-",       // Anthropic
+            "sk-or-",        // OpenRouter
+            "sk-proj-",      // OpenAI
+            "sk-1",          // Kimi/Moonshot
+            "plrm_live_",    // Plurum
+            "ghp_",          // GitHub
+            "xox",           // Slack
+            "Bearer sk-",    // Bearer + key
+            "Authorization:", // Auth header with key
+        ];
+        let cmd_lower = command.to_lowercase();
+        for p in &patterns {
+            if command.contains(p) || cmd_lower.contains(&p.to_lowercase()) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Truncate output that exceeds the limit, keeping head + tail.
     fn truncate_output(output: &str, max_len: usize) -> String {
         if output.len() <= max_len {
@@ -98,6 +121,15 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("forbidden path in command: {path}")),
+            });
+        }
+
+        // Block commands that contain API keys or secrets.
+        if Self::contains_secret(command) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("command contains what looks like an API key or secret — blocked for security".to_string()),
             });
         }
 

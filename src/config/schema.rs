@@ -157,7 +157,11 @@ impl Default for SecurityConfig {
             .into_iter()
             .map(String::from)
             .collect(),
-            forbidden_paths: vec!["/etc", "/root", "/boot", "/dev", "/proc", "/sys"]
+            forbidden_paths: vec![
+                "/etc", "/root", "/boot", "/dev", "/proc", "/sys",
+                ".fennec/config.toml", ".fennec/.secret_key", ".fennec/.anthropic_oauth.json",
+                ".ssh", ".gnupg", ".aws", ".config/gcloud",
+            ]
                 .into_iter()
                 .map(String::from)
                 .collect(),
