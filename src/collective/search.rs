@@ -108,7 +108,8 @@ impl CollectiveSearch {
             if let Some(ref remote) = self.remote {
                 match remote.search(query, limit).await {
                     Ok(remote_results) => {
-                        for result in remote_results {
+                        let result_count = remote_results.len();
+                        for (idx, result) in remote_results.into_iter().enumerate() {
                             // Scan for injection if prompt guard is set
                             if let Some(ref guard) = self.prompt_guard {
                                 let text = format!(
@@ -128,13 +129,20 @@ impl CollectiveSearch {
                             let _ = self.cache.cache_result(&result, "plurum").await;
 
                             // quality_score=0 means "no reports yet", not "bad".
-                            // Treat unrated experiences as neutral (0.5).
                             let trust = if result.trust_score <= 0.0 {
                                 0.5
                             } else {
                                 result.trust_score.max(0.3)
                             };
-                            let score = result.relevance_score * trust;
+                            // Plurum doesn't return relevance_score — results are
+                            // ranked by internal RRF. Use position-based relevance:
+                            // first result = 0.9, decaying by position.
+                            let relevance = if result.relevance_score > 0.0 {
+                                result.relevance_score
+                            } else {
+                                0.9 - (idx as f64 * 0.15).min(0.7)
+                            };
+                            let score = relevance * trust;
 
                             tracing::info!(
                                 goal = %result.goal,
