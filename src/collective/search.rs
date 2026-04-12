@@ -134,14 +134,11 @@ impl CollectiveSearch {
                             } else {
                                 result.trust_score.max(0.3)
                             };
-                            // Plurum doesn't return relevance_score — results are
-                            // ranked by internal RRF. Use position-based relevance:
-                            // first result = 0.9, decaying by position.
-                            let relevance = if result.relevance_score > 0.0 {
-                                result.relevance_score
-                            } else {
-                                0.9 - (idx as f64 * 0.15).min(0.7)
-                            };
+                            // Plurum returns results ranked by relevance but doesn't
+                            // expose the score. Since results ARE relevant (Plurum's
+                            // RRF already filtered), assign high relevance to all
+                            // returned results — position 1 = 0.9, decaying.
+                            let relevance = 0.9 - (idx as f64 * 0.15).min(0.6);
                             let score = relevance * trust;
 
                             tracing::info!(
