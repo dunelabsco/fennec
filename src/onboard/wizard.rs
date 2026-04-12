@@ -29,7 +29,7 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
     let (provider_name, default_model, env_var) = match provider_idx {
         0 => ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
         1 => ("openai", "gpt-4o", "OPENAI_API_KEY"),
-        2 => ("kimi", "moonshot-v1-128k", "KIMI_API_KEY"),
+        2 => ("kimi", "kimi-k2.5", "KIMI_API_KEY"),
         3 => (
             "openrouter",
             "anthropic/claude-sonnet-4",

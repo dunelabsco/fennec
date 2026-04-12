@@ -133,8 +133,8 @@ fn build_provider(
                     "https://api.moonshot.ai/v1".to_string()
                 }
             });
-            let kimi_model = if model.is_empty() || model == "claude-sonnet-4-20250514" {
-                "moonshot-v1-128k".to_string()
+            let kimi_model = if model.is_empty() || model == "claude-sonnet-4-20250514" || model == "moonshot-v1-128k" {
+                "kimi-k2.5".to_string()
             } else {
                 model
             };
