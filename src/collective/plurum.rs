@@ -227,6 +227,8 @@ impl CollectiveLayer for PlurumlClient {
             limit,
         };
 
+        tracing::debug!(query = %query, limit = limit, "Plurum search request");
+
         let resp = self
             .request(reqwest::Method::POST, "/api/v1/experiences/search")
             .json(&body)
