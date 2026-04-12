@@ -30,6 +30,11 @@ pub struct Agent {
     prompt_guard: Option<PromptGuard>,
     collective: Option<Arc<CollectiveSearch>>,
     thinking_level: ThinkingLevel,
+    // Token usage tracking
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_cache_read_tokens: u64,
+    turn_count: u64,
 }
 
 impl Agent {
@@ -106,14 +111,46 @@ impl Agent {
         // Push user message to history.
         self.history.push(ChatMessage::user(&effective_message));
 
+        self.turn_count += 1;
+        let turn_start = std::time::Instant::now();
+        let tokens_before_input = self.total_input_tokens;
+        let tokens_before_output = self.total_output_tokens;
+
         // Tool call loop.
         for _iteration in 0..self.max_tool_iterations {
             let response = self.call_provider().await?;
+
+            // Track token usage from this API call.
+            if let Some(ref usage) = response.usage {
+                self.total_input_tokens += usage.input_tokens;
+                self.total_output_tokens += usage.output_tokens;
+                if let Some(cache) = usage.cache_read_tokens {
+                    self.total_cache_read_tokens += cache;
+                }
+            }
 
             if response.tool_calls.is_empty() {
                 // No tool calls — final assistant response.
                 let text = response.content.unwrap_or_default();
                 self.history.push(ChatMessage::assistant(&text));
+
+                // Log token usage for this turn.
+                let turn_input = self.total_input_tokens - tokens_before_input;
+                let turn_output = self.total_output_tokens - tokens_before_output;
+                let elapsed = turn_start.elapsed();
+                tracing::info!(
+                    turn = self.turn_count,
+                    turn_input_tokens = turn_input,
+                    turn_output_tokens = turn_output,
+                    turn_total_tokens = turn_input + turn_output,
+                    turn_time_ms = elapsed.as_millis() as u64,
+                    session_total_input = self.total_input_tokens,
+                    session_total_output = self.total_output_tokens,
+                    session_total_tokens = self.total_input_tokens + self.total_output_tokens,
+                    session_cache_read = self.total_cache_read_tokens,
+                    "Turn complete"
+                );
+
                 return Ok(text);
             }
 
@@ -469,6 +506,10 @@ impl AgentBuilder {
             prompt_guard: self.prompt_guard,
             collective: self.collective,
             thinking_level: ThinkingLevel::Off,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read_tokens: 0,
+            turn_count: 0,
         })
     }
 }
