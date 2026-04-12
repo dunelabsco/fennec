@@ -127,9 +127,23 @@ impl CollectiveSearch {
                             // Cache the result locally
                             let _ = self.cache.cache_result(&result, "plurum").await;
 
-                            // Use 0.3 as base trust for fresh remote
-                            let trust = 0.3_f64.max(result.trust_score * 0.5);
+                            // quality_score=0 means "no reports yet", not "bad".
+                            // Treat unrated experiences as neutral (0.5).
+                            let trust = if result.trust_score <= 0.0 {
+                                0.5
+                            } else {
+                                result.trust_score.max(0.3)
+                            };
                             let score = result.relevance_score * trust;
+
+                            tracing::info!(
+                                goal = %result.goal,
+                                trust_score = result.trust_score,
+                                relevance_score = result.relevance_score,
+                                computed_trust = trust,
+                                final_score = score,
+                                "Collective remote result"
+                            );
 
                             if !all_results.iter().any(|r| r.result.goal == result.goal) {
                                 all_results.push(RankedExperience {
