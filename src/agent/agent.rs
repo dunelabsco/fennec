@@ -163,7 +163,9 @@ impl Agent {
 
             // Execute each tool call and push results.
             for tc in &response.tool_calls {
+                tracing::info!(tool = %tc.name, "Executing tool call");
                 let result = self.execute_tool(&tc.name, &tc.arguments).await;
+                tracing::info!(tool = %tc.name, success = %!result.contains("error"), "Tool call complete");
                 self.history
                     .push(ChatMessage::tool_result(&tc.id, &result));
             }
