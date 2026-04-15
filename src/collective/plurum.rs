@@ -137,6 +137,7 @@ struct PublishRequest {
     confidence: f32,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools_used: Vec<String>,
+    status: String,
 }
 
 #[derive(Serialize)]
@@ -381,6 +382,7 @@ impl CollectiveLayer for PlurumlClient {
             tags: experience.tags.clone(),
             confidence: experience.confidence,
             tools_used: experience.context.tools_used.clone(),
+            status: "published".to_string(),
         };
 
         let resp = self
