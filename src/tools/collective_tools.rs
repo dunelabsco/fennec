@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::collective::search::CollectiveSearch;
+use crate::collective::search::{CollectiveSearch, SearchConfidence};
 use crate::collective::scrub;
 use crate::collective::traits::{CollectiveLayer, OutcomeReport};
 use crate::memory::experience::{Attempt, Experience, ExperienceContext};
@@ -210,13 +210,18 @@ impl Tool for CollectiveReportTool {
 
 /// Tool that lets the agent publish an experience to the collective
 /// intelligence network so other agents can benefit from it.
+///
+/// Before publishing, searches the collective for similar experiences.
+/// If a high-confidence match exists, the publish is skipped to avoid
+/// duplicating knowledge.
 pub struct CollectivePublishTool {
     collective: Arc<dyn CollectiveLayer>,
+    search: Arc<CollectiveSearch>,
 }
 
 impl CollectivePublishTool {
-    pub fn new(collective: Arc<dyn CollectiveLayer>) -> Self {
-        Self { collective }
+    pub fn new(collective: Arc<dyn CollectiveLayer>, search: Arc<CollectiveSearch>) -> Self {
+        Self { collective, search }
     }
 }
 
@@ -289,6 +294,34 @@ impl Tool for CollectivePublishTool {
             });
         }
 
+        // Dedup check: search collective for similar experiences before publishing.
+        match self.search.search(&goal, 3).await {
+            Ok(result) => {
+                if matches!(result.confidence, SearchConfidence::High) {
+                    if let Some(top) = result.experiences.first() {
+                        tracing::info!(
+                            existing_goal = %top.result.goal,
+                            score = top.final_score,
+                            "Skipping publish — similar experience already exists"
+                        );
+                        return Ok(ToolResult {
+                            success: true,
+                            output: format!(
+                                "Skipped publishing — the collective already has a similar experience: \
+                                 \"{}\" (score: {:.2}). No need to duplicate.",
+                                top.result.goal, top.final_score
+                            ),
+                            error: None,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                // Don't block publishing if search fails — just log and continue.
+                tracing::warn!("Dedup search failed, publishing anyway: {}", e);
+            }
+        }
+
         let domain = args["domain"].as_str().unwrap_or("general").to_string();
 
         let dead_ends: Vec<String> = args["dead_ends"]
@@ -343,17 +376,25 @@ impl Tool for CollectivePublishTool {
         // Scrub secrets before publishing
         let scrubbed = scrub::scrub_experience(&experience);
 
+        tracing::info!(goal = %goal, domain = %domain, "collective_publish: sending to Plurum");
+
         match self.collective.publish(&scrubbed).await {
-            Ok(id) => Ok(ToolResult {
-                success: true,
-                output: format!("Experience published to collective! ID: {}. Other agents can now benefit from your knowledge about: {}", id, goal),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Publish failed: {}", e)),
-            }),
+            Ok(id) => {
+                tracing::info!(id = %id, goal = %goal, "collective_publish: SUCCESS — experience published");
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Experience published to collective! ID: {}. Other agents can now benefit from your knowledge about: {}", id, goal),
+                    error: None,
+                })
+            }
+            Err(e) => {
+                tracing::error!(goal = %goal, error = %e, "collective_publish: FAILED");
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Publish failed: {}", e)),
+                })
+            }
         }
     }
 }

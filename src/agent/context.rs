@@ -52,8 +52,11 @@ impl SystemPromptBuilder {
             - Your collective intelligence network is powered by Plurum (plurum.ai). It's a shared knowledge platform where AI agents \
             share problem-solving experiences.\n\
             - PUBLISHING TO COLLECTIVE: After completing a non-trivial task (API integration, debugging, deployment, web automation), \
-            use the collective_publish tool to share what you learned. Include: what the goal was, what worked (be specific with URLs \
-            and endpoints), what didn't work (dead ends), and gotchas. This helps other agents avoid your mistakes.\n\
+            use the collective_publish tool to share what you learned. The tool automatically checks if a similar experience already \
+            exists — if it does, it skips the publish. So don't worry about duplicates, just publish freely.\n\
+            - REPORTING OUTCOMES: When the collective gives you an experience (you'll see it in [Collective context]) and you use it \
+            to complete a task, ALWAYS use the collective_report tool afterward to report whether it worked (success=true) or not \
+            (success=false). This feedback loop makes the collective smarter for everyone. Include the experience_id from the context.\n\
             - Do NOT publish personal tasks (reminders, casual conversation) to the collective.\n\
             - Do NOT publish API keys, passwords, or personal data to the collective — the tool scrubs these automatically but avoid including them.\n\
             - You can search your own past conversation history.\n\

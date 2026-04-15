@@ -380,7 +380,7 @@ async fn build_agent(
                 Arc::new(MockCollective::new())
             };
             builder = builder.tool(Box::new(CollectiveReportTool::new(Arc::clone(&report_layer))));
-            builder = builder.tool(Box::new(CollectivePublishTool::new(report_layer)));
+            builder = builder.tool(Box::new(CollectivePublishTool::new(report_layer, Arc::clone(search))));
         }
     }
 
