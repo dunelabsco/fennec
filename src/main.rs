@@ -27,7 +27,7 @@ use fennec::providers::ollama::OllamaProvider;
 use fennec::providers::traits::Provider;
 use fennec::security::prompt_guard::{GuardAction, PromptGuard};
 use fennec::security::SecretStore;
-use fennec::tools::collective_tools::{CollectiveReportTool, CollectiveSearchTool};
+use fennec::tools::collective_tools::{CollectivePublishTool, CollectiveReportTool, CollectiveSearchTool};
 use fennec::tools::cron_tool::{CronOrigin, CronTool};
 use fennec::tools::files::{ListDirTool, ReadFileTool, WriteFileTool};
 use fennec::tools::memory_tools::{MemoryForgetTool, MemoryRecallTool, MemoryStoreTool};
@@ -379,7 +379,8 @@ async fn build_agent(
             } else {
                 Arc::new(MockCollective::new())
             };
-            builder = builder.tool(Box::new(CollectiveReportTool::new(report_layer)));
+            builder = builder.tool(Box::new(CollectiveReportTool::new(Arc::clone(&report_layer))));
+            builder = builder.tool(Box::new(CollectivePublishTool::new(report_layer)));
         }
     }
 

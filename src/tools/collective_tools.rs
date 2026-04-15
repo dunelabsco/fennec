@@ -3,7 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::collective::search::CollectiveSearch;
+use crate::collective::scrub;
 use crate::collective::traits::{CollectiveLayer, OutcomeReport};
+use crate::memory::experience::{Attempt, Experience, ExperienceContext};
 use crate::tools::traits::{Tool, ToolResult};
 
 // ---------------------------------------------------------------------------
@@ -197,6 +199,160 @@ impl Tool for CollectiveReportTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Report failed: {}", e)),
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CollectivePublishTool
+// ---------------------------------------------------------------------------
+
+/// Tool that lets the agent publish an experience to the collective
+/// intelligence network so other agents can benefit from it.
+pub struct CollectivePublishTool {
+    collective: Arc<dyn CollectiveLayer>,
+}
+
+impl CollectivePublishTool {
+    pub fn new(collective: Arc<dyn CollectiveLayer>) -> Self {
+        Self { collective }
+    }
+}
+
+#[async_trait]
+impl Tool for CollectivePublishTool {
+    fn name(&self) -> &str {
+        "collective_publish"
+    }
+
+    fn description(&self) -> &str {
+        "Publish an experience to the collective intelligence network (Plurum). Use this after completing a non-trivial task to help other agents. Include what you tried, what worked, what didn't, and any gotchas."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "What was the task? e.g. 'Sign up on shipz.ai'"
+                },
+                "domain": {
+                    "type": "string",
+                    "description": "Category: web-automation, coding, devops, debugging, etc."
+                },
+                "what_worked": {
+                    "type": "string",
+                    "description": "The solution that worked. Be specific — include URLs, endpoints, commands."
+                },
+                "dead_ends": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Things you tried that did NOT work. e.g. 'Tried POST to /api/register — got 405'"
+                },
+                "gotchas": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Non-obvious things other agents should know. e.g. 'Must include Content-Type header'"
+                },
+                "tools_used": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Which tools you used: web_fetch, shell, browser, etc."
+                }
+            },
+            "required": ["goal", "what_worked"]
+        })
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let goal = args["goal"].as_str().unwrap_or("").to_string();
+        if goal.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("goal is required".into()),
+            });
+        }
+
+        let what_worked = args["what_worked"].as_str().unwrap_or("").to_string();
+        if what_worked.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("what_worked is required".into()),
+            });
+        }
+
+        let domain = args["domain"].as_str().unwrap_or("general").to_string();
+
+        let dead_ends: Vec<String> = args["dead_ends"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let gotchas: Vec<String> = args["gotchas"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let tools_used: Vec<String> = args["tools_used"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        // Build attempts from dead_ends + what_worked
+        let mut attempts = Vec::new();
+        for de in &dead_ends {
+            attempts.push(Attempt {
+                action: de.clone(),
+                outcome: "Failed".to_string(),
+                dead_end: true,
+                insight: de.clone(),
+            });
+        }
+        attempts.push(Attempt {
+            action: what_worked.clone(),
+            outcome: "Success".to_string(),
+            dead_end: false,
+            insight: what_worked.clone(),
+        });
+
+        let experience = Experience {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal: goal.clone(),
+            context: ExperienceContext {
+                tools_used,
+                environment: String::new(),
+                constraints: String::new(),
+            },
+            attempts,
+            solution: Some(what_worked),
+            gotchas,
+            tags: vec![domain.clone()],
+            confidence: 0.8,
+            session_id: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        // Scrub secrets before publishing
+        let scrubbed = scrub::scrub_experience(&experience);
+
+        match self.collective.publish(&scrubbed).await {
+            Ok(id) => Ok(ToolResult {
+                success: true,
+                output: format!("Experience published to collective! ID: {}. Other agents can now benefit from your knowledge about: {}", id, goal),
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Publish failed: {}", e)),
             }),
         }
     }
