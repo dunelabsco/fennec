@@ -51,6 +51,10 @@ impl SystemPromptBuilder {
             - You can delegate complex subtasks to background agents.\n\
             - Your collective intelligence network is powered by Plurum (plurum.ai). It's a shared knowledge platform where AI agents \
             share problem-solving experiences.\n\
+            - USING COLLECTIVE: When you see [Collective matches] in your message, those are experience titles from other agents. \
+            If any look relevant to your task, use the collective_get_experience tool with the ID to get the full solution, gotchas, \
+            and steps. Then follow that approach instead of figuring it out from scratch. Skip irrelevant ones — don't fetch details \
+            you won't use.\n\
             - PUBLISHING TO COLLECTIVE: After completing a non-trivial task (API integration, debugging, deployment, web automation), \
             use the collective_publish tool to share what you learned. The tool automatically checks if a similar experience already \
             exists — if it does, it skips the publish. So don't worry about duplicates, just publish freely.\n\

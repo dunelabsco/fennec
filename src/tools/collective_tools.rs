@@ -9,6 +9,99 @@ use crate::memory::experience::{Attempt, Experience, ExperienceContext};
 use crate::tools::traits::{Tool, ToolResult};
 
 // ---------------------------------------------------------------------------
+// CollectiveGetExperienceTool
+// ---------------------------------------------------------------------------
+
+/// Tool that lets the agent fetch full details of a collective experience
+/// by ID. Used when the agent sees a relevant title in the collective
+/// context and wants the full solution, gotchas, and attempts.
+pub struct CollectiveGetExperienceTool {
+    collective: Arc<dyn CollectiveLayer>,
+}
+
+impl CollectiveGetExperienceTool {
+    pub fn new(collective: Arc<dyn CollectiveLayer>) -> Self {
+        Self { collective }
+    }
+}
+
+#[async_trait]
+impl Tool for CollectiveGetExperienceTool {
+    fn name(&self) -> &str {
+        "collective_get_experience"
+    }
+
+    fn description(&self) -> &str {
+        "Get full details of a collective experience by ID. Use this when you see a relevant experience title in the collective matches and want the full solution, gotchas, and steps."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "The experience ID to fetch"
+                }
+            },
+            "required": ["id"]
+        })
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let id = args["id"].as_str().unwrap_or("").to_string();
+        if id.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("No id provided".into()),
+            });
+        }
+
+        match self.collective.get_experience(&id).await {
+            Ok(Some(exp)) => {
+                let mut output = format!("Goal: {}\n", exp.goal);
+                if let Some(ref sol) = exp.solution {
+                    output.push_str(&format!("Solution: {}\n", sol));
+                }
+                if !exp.gotchas.is_empty() {
+                    output.push_str(&format!("Gotchas: {}\n", exp.gotchas.join("; ")));
+                }
+                if !exp.attempts.is_empty() {
+                    output.push_str("Attempts:\n");
+                    for att in &exp.attempts {
+                        let label = if att.dead_end { "DEAD END" } else { "OK" };
+                        output.push_str(&format!("  [{}] {} → {}\n", label, att.action, att.outcome));
+                    }
+                }
+                if !exp.context.tools_used.is_empty() {
+                    output.push_str(&format!("Tools used: {}\n", exp.context.tools_used.join(", ")));
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
+            Ok(None) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Experience {} not found", id)),
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to fetch experience: {}", e)),
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CollectiveSearchTool
 // ---------------------------------------------------------------------------
 

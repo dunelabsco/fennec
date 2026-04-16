@@ -103,7 +103,7 @@ impl Agent {
 
         // Inject collective context into user message if available.
         let effective_message = if let Some(ref ctx) = collective_context {
-            format!("[Collective context]\n{ctx}\n[User message]\n{user_message}")
+            format!("[Collective matches]\n{ctx}\n[User message]\n{user_message}")
         } else {
             user_message.to_string()
         };
@@ -298,28 +298,28 @@ impl Agent {
     }
 
     /// Format collective search results for injection into the user message.
+    ///
+    /// Only includes goal titles and IDs — the agent can use the
+    /// `collective_get_experience` tool to fetch full details for any
+    /// experience it finds relevant.
     fn format_collective_results(
         &self,
         results: &[RankedExperience],
         high_confidence: bool,
     ) -> String {
         let mut output = if high_confidence {
-            "The collective has high-confidence experience with this:\n\n".to_string()
+            "The collective has relevant experiences. Use collective_get_experience to get details if useful:\n\n".to_string()
         } else {
-            "Related experiences from the collective:\n\n".to_string()
+            "Possibly related experiences from the collective. Use collective_get_experience to get details if useful:\n\n".to_string()
         };
         for (i, ranked) in results.iter().enumerate() {
-            output.push_str(&format!("{}. Goal: {}\n", i + 1, ranked.result.goal));
-            if let Some(ref solution) = ranked.result.solution {
-                output.push_str(&format!("   Solution: {}\n", solution));
-            }
-            if !ranked.result.gotchas.is_empty() {
-                output.push_str(&format!(
-                    "   Gotchas: {}\n",
-                    ranked.result.gotchas.join("; ")
-                ));
-            }
-            output.push('\n');
+            output.push_str(&format!(
+                "{}. \"{}\" (id: {}, score: {:.2})\n",
+                i + 1,
+                ranked.result.goal,
+                ranked.result.id,
+                ranked.final_score
+            ));
         }
         output
     }
