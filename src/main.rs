@@ -38,6 +38,7 @@ use fennec::tools::ask_user_tool::AskUserTool;
 use fennec::channels::{ChannelMapHandle, new_channel_map};
 use fennec::tools::web::{WebFetchTool, WebSearchTool};
 use fennec::tools::browser_tool::BrowserTool;
+use fennec::tools::vision_tool::VisionTool;
 
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
@@ -269,6 +270,25 @@ async fn build_agent(
     let web_search_tool = WebSearchTool::new();
     let browser_tool = BrowserTool::new();
 
+    // Vision tool: only wired when the configured provider supports vision
+    // (anthropic, openai) AND we can resolve an API key. OAuth-only users and
+    // non-vision providers silently skip it.
+    let vision_api_key = resolve_api_key(config, &secret_store)
+        .ok()
+        .unwrap_or_default();
+    let vision_tool = VisionTool::from_provider(
+        &config.provider.name,
+        vision_api_key,
+        Some(config.provider.model.clone()),
+    );
+    match &vision_tool {
+        Some(_) => tracing::info!("Vision tool enabled ({})", config.provider.name),
+        None => tracing::debug!(
+            "Vision tool disabled: provider '{}' unsupported or no API key",
+            config.provider.name
+        ),
+    }
+
     // Create CronTool with shared origin handle.
     let cron_origin: Arc<Mutex<Option<CronOrigin>>> = Arc::new(Mutex::new(None));
     let cron_tool = CronTool::new(
@@ -342,6 +362,10 @@ async fn build_agent(
         .tool(Box::new(MemoryRecallTool::new(memory.clone())))
         .tool(Box::new(MemoryForgetTool::new(memory.clone())))
         .tool(Box::new(TodoTool::new()));
+
+    if let Some(vt) = vision_tool {
+        builder = builder.tool(Box::new(vt));
+    }
 
     // Add send_message tool when running in gateway mode (bus available via channel_map).
     if let Some(ref ch_map) = channel_map {
