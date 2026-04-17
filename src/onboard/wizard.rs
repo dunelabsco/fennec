@@ -1,9 +1,297 @@
-use dialoguer::{Confirm, Input, Select};
+use crate::onboard::frame::{existing_config_at, FinalSummary, StepSummary, WizardFrame};
 use console::style;
+use dialoguer::{Confirm, Input, Select};
 
 /// Run the interactive setup wizard that creates `~/.fennec/config.toml`.
+///
+/// The framed flow renders each question on an alternate terminal screen,
+/// collapsing completed steps to dim summary lines. Set
+/// `FENNEC_CLASSIC_WIZARD=1` to restore the original unframed behavior
+/// (rollback escape hatch).
 pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
-    // Banner
+    let classic = std::env::var("FENNEC_CLASSIC_WIZARD")
+        .ok()
+        .is_some_and(|v| !v.is_empty());
+    if classic {
+        return run_wizard_classic(fennec_home);
+    }
+
+    // Pre-wizard: prompt before overwriting an existing config.
+    if existing_config_at(fennec_home) {
+        println!();
+        println!("  {}", style("Fennec Setup").cyan().bold());
+        println!("  {}", style("─".repeat(40)).dim());
+        println!(
+            "  Config already exists at {}",
+            fennec_home.join("config.toml").display()
+        );
+        println!();
+        let choices = vec!["Cancel (keep existing)", "Replace it"];
+        let idx = Select::new().items(&choices).default(0).interact()?;
+        if idx == 0 {
+            println!("  {} Kept existing config.", style("✓").green());
+            return Ok(());
+        }
+    }
+
+    let mut frame = WizardFrame::new(6);
+    frame.start()?;
+
+    // Step 1: Provider
+    frame.begin_step(1, "Provider");
+    frame.redraw()?;
+    let providers = vec![
+        "Anthropic (Claude)",
+        "OpenAI (GPT-4o)",
+        "Kimi (Moonshot)",
+        "OpenRouter (any model)",
+        "Ollama (local)",
+    ];
+    let provider_idx = Select::new()
+        .with_prompt("Choose your LLM provider")
+        .items(&providers)
+        .default(0)
+        .interact()?;
+
+    let (provider_name, default_model, env_var) = match provider_idx {
+        0 => ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
+        1 => ("openai", "gpt-4o", "OPENAI_API_KEY"),
+        2 => ("kimi", "kimi-k2.5", "KIMI_API_KEY"),
+        3 => (
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            "OPENROUTER_API_KEY",
+        ),
+        4 => ("ollama", "llama3.1", ""),
+        _ => ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
+    };
+    frame.complete_step(StepSummary::done(
+        "Provider",
+        providers[provider_idx].to_string(),
+    ));
+
+    // Step 2: Authentication
+    frame.begin_step(2, "Authentication");
+    frame.redraw()?;
+    let (api_key, auth_summary) = if provider_name == "anthropic" {
+        let auth_methods = vec![
+            "OAuth (sign in with your Claude account — free with subscription)",
+            "API key (from console.anthropic.com — pay per use)",
+        ];
+        let auth_idx = Select::new()
+            .with_prompt("How do you want to authenticate")
+            .items(&auth_methods)
+            .default(0)
+            .interact()?;
+        if auth_idx == 0 {
+            println!();
+            println!("  {}", style("Starting OAuth login...").dim());
+            match crate::auth::run_oauth_login(fennec_home) {
+                Ok(_creds) => {
+                    println!("  {} Authenticated with Claude!", style("✓").green());
+                    (String::new(), "OAuth".to_string())
+                }
+                Err(e) => {
+                    println!("  {} OAuth failed: {}", style("✗").yellow(), e);
+                    println!("  {}", style("Falling back to API key...").dim());
+                    let key = Input::<String>::new()
+                        .with_prompt("Enter your Anthropic API key")
+                        .allow_empty(true)
+                        .interact_text()?;
+                    let summary = if key.is_empty() {
+                        "skipped".to_string()
+                    } else {
+                        "API key".to_string()
+                    };
+                    (key, summary)
+                }
+            }
+        } else {
+            let key = if let Ok(k) = std::env::var(env_var) {
+                println!("  {} Using {} from environment", style("✓").green(), env_var);
+                k
+            } else {
+                Input::<String>::new()
+                    .with_prompt("Enter your Anthropic API key")
+                    .allow_empty(true)
+                    .interact_text()?
+            };
+            let summary = if key.is_empty() {
+                "skipped".to_string()
+            } else {
+                "API key".to_string()
+            };
+            (key, summary)
+        }
+    } else if !env_var.is_empty() {
+        let key = if let Ok(k) = std::env::var(env_var) {
+            println!("  {} Using {} from environment", style("✓").green(), env_var);
+            k
+        } else {
+            Input::<String>::new()
+                .with_prompt("Enter your API key")
+                .allow_empty(true)
+                .interact_text()?
+        };
+        let summary = if key.is_empty() {
+            "skipped".to_string()
+        } else {
+            "API key".to_string()
+        };
+        (key, summary)
+    } else {
+        (String::new(), "Ollama (no key)".to_string())
+    };
+    frame.complete_step(StepSummary::done("Authentication", auth_summary));
+
+    // Step 3: Agent name
+    frame.begin_step(3, "Agent name");
+    frame.redraw()?;
+    let agent_name: String = Input::new()
+        .with_prompt("Agent name")
+        .default("Fennec".to_string())
+        .interact_text()?;
+    frame.complete_step(StepSummary::done("Agent name", agent_name.clone()));
+
+    // Step 4: Telegram
+    frame.begin_step(4, "Telegram");
+    frame.redraw()?;
+    let setup_telegram = Confirm::new()
+        .with_prompt("Set up Telegram?")
+        .default(false)
+        .interact()?;
+
+    let (telegram_token, telegram_user_id, telegram_configured) = if setup_telegram {
+        println!(
+            "  {}",
+            style("Create a bot via @BotFather on Telegram").dim()
+        );
+        let token: String = Input::new()
+            .with_prompt("Telegram bot token")
+            .interact_text()?;
+        let user_id: String = Input::new()
+            .with_prompt("Your Telegram user ID (message @userinfobot on Telegram to find it)")
+            .allow_empty(true)
+            .interact_text()?;
+        (token, user_id, true)
+    } else {
+        (String::new(), String::new(), false)
+    };
+    if telegram_configured {
+        frame.complete_step(StepSummary::done("Telegram", "Configured"));
+    } else {
+        frame.complete_step(StepSummary::skipped("Telegram"));
+    }
+
+    // Step 5: Discord
+    frame.begin_step(5, "Discord");
+    frame.redraw()?;
+    let setup_discord = Confirm::new()
+        .with_prompt("Set up Discord?")
+        .default(false)
+        .interact()?;
+
+    let (discord_token, discord_configured) = if setup_discord {
+        let token = Input::<String>::new()
+            .with_prompt("Discord bot token")
+            .interact_text()?;
+        (token, true)
+    } else {
+        (String::new(), false)
+    };
+    if discord_configured {
+        frame.complete_step(StepSummary::done("Discord", "Configured"));
+    } else {
+        frame.complete_step(StepSummary::skipped("Discord"));
+    }
+
+    // Step 6: Collective (Plurum)
+    frame.begin_step(6, "Collective");
+    frame.redraw()?;
+    let enable_collective = Confirm::new()
+        .with_prompt("Enable collective intelligence (Plurum)?")
+        .default(true)
+        .interact()?;
+
+    let (plurum_key, collective_summary) = if enable_collective {
+        println!(
+            "  {} Registering with Plurum...",
+            style("\u{27F3}").yellow()
+        );
+        match auto_register_plurum(&agent_name) {
+            Ok(key) => {
+                println!(
+                    "  {} Registered! Key: {}...{}",
+                    style("✓").green(),
+                    &key[..key.len().min(16)],
+                    &key[key.len().saturating_sub(4)..]
+                );
+                (key, "Registered with Plurum".to_string())
+            }
+            Err(e) => {
+                println!("  {} Auto-register failed: {}", style("✗").yellow(), e);
+                let key = Input::<String>::new()
+                    .with_prompt("Plurum API key (or Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                let summary = if key.is_empty() {
+                    String::new()
+                } else {
+                    "Manual key".to_string()
+                };
+                (key, summary)
+            }
+        }
+    } else {
+        (String::new(), String::new())
+    };
+    if collective_summary.is_empty() {
+        frame.complete_step(StepSummary::skipped("Collective"));
+    } else {
+        frame.complete_step(StepSummary::done("Collective", collective_summary));
+    }
+
+    // Write config (byte-identical output to the classic path).
+    let config = build_config_toml(
+        &agent_name,
+        provider_name,
+        default_model,
+        &api_key,
+        &telegram_token,
+        &telegram_user_id,
+        &discord_token,
+        &plurum_key,
+    );
+
+    std::fs::create_dir_all(fennec_home)?;
+    std::fs::create_dir_all(fennec_home.join("memory"))?;
+    std::fs::create_dir_all(fennec_home.join("skills"))?;
+    std::fs::create_dir_all(fennec_home.join("pairing"))?;
+
+    let config_path = fennec_home.join("config.toml");
+    std::fs::write(&config_path, &config)?;
+
+    frame.finish(FinalSummary {
+        config_path,
+        quick_start: vec![
+            ("fennec agent".to_string(), "Interactive chat".to_string()),
+            (
+                "fennec agent -m 'Hello'".to_string(),
+                "Single message".to_string(),
+            ),
+            (
+                "fennec gateway".to_string(),
+                "Start all channels".to_string(),
+            ),
+        ],
+    })?;
+
+    Ok(())
+}
+
+/// Classic unframed wizard — byte-identical behavior to pre-frame main.
+/// Invoked via `FENNEC_CLASSIC_WIZARD=1` as an instant rollback.
+fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
     println!();
     println!("  {}", style("Welcome to Fennec").bold().cyan());
     println!(
@@ -39,9 +327,7 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         _ => ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
     };
 
-    // Step 2: Authentication
     let api_key = if provider_name == "anthropic" {
-        // Anthropic: offer OAuth or API key
         let auth_methods = vec![
             "OAuth (sign in with your Claude account — free with subscription)",
             "API key (from console.anthropic.com — pay per use)",
@@ -53,13 +339,12 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
             .interact()?;
 
         if auth_idx == 0 {
-            // OAuth flow
             println!();
             println!("  {}", style("Starting OAuth login...").dim());
             match crate::auth::run_oauth_login(fennec_home) {
                 Ok(_creds) => {
                     println!("  {} Authenticated with Claude!", style("✓").green());
-                    String::new() // No API key needed — OAuth token stored separately
+                    String::new()
                 }
                 Err(e) => {
                     println!("  {} OAuth failed: {}", style("✗").red(), e);
@@ -70,20 +355,16 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
                         .interact_text()?
                 }
             }
+        } else if let Ok(key) = std::env::var(env_var) {
+            println!("  {} Using {} from environment", style("✓").green(), env_var);
+            key
         } else {
-            // API key
-            if let Ok(key) = std::env::var(env_var) {
-                println!("  {} Using {} from environment", style("✓").green(), env_var);
-                key
-            } else {
-                Input::<String>::new()
-                    .with_prompt("Enter your Anthropic API key")
-                    .allow_empty(true)
-                    .interact_text()?
-            }
+            Input::<String>::new()
+                .with_prompt("Enter your Anthropic API key")
+                .allow_empty(true)
+                .interact_text()?
         }
     } else if !env_var.is_empty() {
-        // Non-Anthropic providers: API key only
         if let Ok(key) = std::env::var(env_var) {
             println!("  {} Using {} from environment", style("✓").green(), env_var);
             key
@@ -94,16 +375,14 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
                 .interact_text()?
         }
     } else {
-        String::new() // Ollama — no key needed
+        String::new()
     };
 
-    // Step 3: Agent name
     let agent_name: String = Input::new()
         .with_prompt("Agent name")
         .default("Fennec".to_string())
         .interact_text()?;
 
-    // Step 4: Telegram setup
     let setup_telegram = Confirm::new()
         .with_prompt("Set up Telegram?")
         .default(false)
@@ -126,7 +405,6 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         (String::new(), String::new())
     };
 
-    // Step 5: Discord setup
     let setup_discord = Confirm::new()
         .with_prompt("Set up Discord?")
         .default(false)
@@ -140,14 +418,12 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         String::new()
     };
 
-    // Step 6: Collective (Plurum)
     let enable_collective = Confirm::new()
         .with_prompt("Enable collective intelligence (Plurum)?")
         .default(true)
         .interact()?;
 
     let plurum_key = if enable_collective {
-        // Try auto-register
         println!(
             "  {} Registering with Plurum...",
             style("\u{27F3}").yellow()
@@ -163,11 +439,7 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
                 key
             }
             Err(e) => {
-                println!(
-                    "  {} Auto-register failed: {}",
-                    style("✗").red(),
-                    e
-                );
+                println!("  {} Auto-register failed: {}", style("✗").red(), e);
                 Input::<String>::new()
                     .with_prompt("Plurum API key (or Enter to skip)")
                     .allow_empty(true)
@@ -178,7 +450,6 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         String::new()
     };
 
-    // Write config
     let config = build_config_toml(
         &agent_name,
         provider_name,
