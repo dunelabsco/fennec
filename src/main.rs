@@ -39,6 +39,7 @@ use fennec::channels::{ChannelMapHandle, new_channel_map};
 use fennec::tools::web::{WebFetchTool, WebSearchTool};
 use fennec::tools::browser_tool::BrowserTool;
 use fennec::tools::vision_tool::VisionTool;
+use fennec::tools::image_gen_tool::{default_output_dir as image_output_dir, ImageGenTool};
 
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
@@ -289,6 +290,24 @@ async fn build_agent(
         ),
     }
 
+    // Image generation tool: independent of the primary provider. Pulls an
+    // OpenAI key from config (when provider is openai) or OPENAI_API_KEY env.
+    // Users with Anthropic as primary can still generate images via their
+    // OpenAI key.
+    let img_config_key = resolve_api_key(config, &secret_store)
+        .ok()
+        .unwrap_or_default();
+    let openai_key = ImageGenTool::resolve_openai_key(&config.provider.name, &img_config_key);
+    let image_gen_tool = ImageGenTool::new_with_key(
+        openai_key,
+        image_output_dir(home_dir),
+        None,
+    );
+    match &image_gen_tool {
+        Some(_) => tracing::info!("Image generation tool enabled (OpenAI DALL-E 3)"),
+        None => tracing::debug!("Image generation tool disabled: no OpenAI API key"),
+    }
+
     // Create CronTool with shared origin handle.
     let cron_origin: Arc<Mutex<Option<CronOrigin>>> = Arc::new(Mutex::new(None));
     let cron_tool = CronTool::new(
@@ -365,6 +384,9 @@ async fn build_agent(
 
     if let Some(vt) = vision_tool {
         builder = builder.tool(Box::new(vt));
+    }
+    if let Some(igt) = image_gen_tool {
+        builder = builder.tool(Box::new(igt));
     }
 
     // Add send_message tool when running in gateway mode (bus available via channel_map).
