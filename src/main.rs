@@ -40,6 +40,7 @@ use fennec::tools::web::{WebFetchTool, WebSearchTool};
 use fennec::tools::browser_tool::BrowserTool;
 use fennec::tools::vision_tool::VisionTool;
 use fennec::tools::image_gen_tool::{default_output_dir as image_output_dir, ImageGenTool};
+use fennec::tools::code_exec_tool::CodeExecTool;
 
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
@@ -308,6 +309,14 @@ async fn build_agent(
         None => tracing::debug!("Image generation tool disabled: no OpenAI API key"),
     }
 
+    // Code execution tool (python/node/bash subprocess, no sandbox). Always
+    // wired — runners are checked at call time, not startup.
+    let code_exec_tool = CodeExecTool::new(
+        config.security.command_timeout_secs,
+        home_dir.join("codeexec"),
+    );
+    tracing::info!("Code execution tool enabled (python/node/bash)");
+
     // Create CronTool with shared origin handle.
     let cron_origin: Arc<Mutex<Option<CronOrigin>>> = Arc::new(Mutex::new(None));
     let cron_tool = CronTool::new(
@@ -388,6 +397,7 @@ async fn build_agent(
     if let Some(igt) = image_gen_tool {
         builder = builder.tool(Box::new(igt));
     }
+    builder = builder.tool(Box::new(code_exec_tool));
 
     // Add send_message tool when running in gateway mode (bus available via channel_map).
     if let Some(ref ch_map) = channel_map {
