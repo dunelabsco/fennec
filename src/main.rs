@@ -41,6 +41,10 @@ use fennec::tools::browser_tool::BrowserTool;
 use fennec::tools::vision_tool::VisionTool;
 use fennec::tools::image_gen_tool::{default_output_dir as image_output_dir, ImageGenTool};
 use fennec::tools::code_exec_tool::CodeExecTool;
+use fennec::tools::voice_tool::{
+    default_tts_output_dir, resolve_openai_key as voice_resolve_openai_key,
+    TextToSpeechTool, TranscribeAudioTool,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
@@ -317,6 +321,21 @@ async fn build_agent(
     );
     tracing::info!("Code execution tool enabled (python/node/bash)");
 
+    // Voice tools (transcription + TTS). Both use OpenAI; shared key
+    // resolution with the image gen tool.
+    let voice_key = voice_resolve_openai_key(&config.provider.name, &img_config_key);
+    let transcribe_tool = TranscribeAudioTool::new_with_key(voice_key.clone(), None);
+    let tts_tool = TextToSpeechTool::new_with_key(
+        voice_key,
+        default_tts_output_dir(home_dir),
+        None,
+        None,
+    );
+    match (&transcribe_tool, &tts_tool) {
+        (Some(_), Some(_)) => tracing::info!("Voice tools enabled (Whisper + OpenAI TTS)"),
+        _ => tracing::debug!("Voice tools disabled: no OpenAI API key"),
+    }
+
     // Create CronTool with shared origin handle.
     let cron_origin: Arc<Mutex<Option<CronOrigin>>> = Arc::new(Mutex::new(None));
     let cron_tool = CronTool::new(
@@ -398,6 +417,12 @@ async fn build_agent(
         builder = builder.tool(Box::new(igt));
     }
     builder = builder.tool(Box::new(code_exec_tool));
+    if let Some(t) = transcribe_tool {
+        builder = builder.tool(Box::new(t));
+    }
+    if let Some(t) = tts_tool {
+        builder = builder.tool(Box::new(t));
+    }
 
     // Add send_message tool when running in gateway mode (bus available via channel_map).
     if let Some(ref ch_map) = channel_map {
