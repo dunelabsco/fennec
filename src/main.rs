@@ -47,6 +47,10 @@ use fennec::tools::voice_tool::{
 };
 use fennec::tools::pdf_read_tool::PdfReadTool;
 use fennec::tools::screenshot_tool::{default_screenshot_dir, ScreenshotTool};
+use fennec::tools::http_request_tool::HttpRequestTool;
+use fennec::tools::weather_tool::WeatherTool;
+use fennec::tools::image_info_tool::ImageInfoTool;
+use fennec::tools::claude_code_cli_tool::ClaudeCodeCliTool;
 
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
@@ -423,6 +427,15 @@ async fn build_agent(
     builder = builder.tool(Box::new(code_exec_tool));
     builder = builder.tool(Box::new(PdfReadTool::new(home_dir.join("pdf_cache"))));
     builder = builder.tool(Box::new(ScreenshotTool::new(default_screenshot_dir(home_dir))));
+    builder = builder.tool(Box::new(HttpRequestTool::new()));
+    builder = builder.tool(Box::new(WeatherTool::new()));
+    builder = builder.tool(Box::new(ImageInfoTool::new(home_dir.join("image_cache"))));
+    if let Some(claude_tool) = ClaudeCodeCliTool::detect() {
+        tracing::info!("Claude Code CLI tool enabled");
+        builder = builder.tool(Box::new(claude_tool));
+    } else {
+        tracing::debug!("Claude Code CLI tool disabled: `claude` binary not on PATH");
+    }
     if let Some(t) = transcribe_tool {
         builder = builder.tool(Box::new(t));
     }
