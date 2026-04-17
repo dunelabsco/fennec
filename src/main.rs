@@ -45,6 +45,8 @@ use fennec::tools::voice_tool::{
     default_tts_output_dir, resolve_openai_key as voice_resolve_openai_key,
     TextToSpeechTool, TranscribeAudioTool,
 };
+use fennec::tools::pdf_read_tool::PdfReadTool;
+use fennec::tools::screenshot_tool::{default_screenshot_dir, ScreenshotTool};
 
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
@@ -85,6 +87,8 @@ enum Commands {
     },
     /// Authenticate with Anthropic via OAuth
     Login,
+    /// Run diagnostic checks — provider reachability, API key, memory DB, Plurum, config.
+    Doctor,
 }
 
 /// Resolve the API key from config or provider-specific environment variable.
@@ -417,6 +421,8 @@ async fn build_agent(
         builder = builder.tool(Box::new(igt));
     }
     builder = builder.tool(Box::new(code_exec_tool));
+    builder = builder.tool(Box::new(PdfReadTool::new(home_dir.join("pdf_cache"))));
+    builder = builder.tool(Box::new(ScreenshotTool::new(default_screenshot_dir(home_dir))));
     if let Some(t) = transcribe_tool {
         builder = builder.tool(Box::new(t));
     }
@@ -904,7 +910,46 @@ async fn main() -> Result<()> {
         Commands::Login => {
             auth::run_oauth_login(&home_dir)?;
         }
+        Commands::Doctor => {
+            run_doctor(&config, &home_dir).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn run_doctor(config: &FennecConfig, home_dir: &std::path::Path) -> Result<()> {
+    use fennec::doctor;
+    let secret_store = SecretStore::new(home_dir.to_path_buf()).context("creating secret store")?;
+    let use_color = console::Term::stdout().is_term()
+        && std::env::var("NO_COLOR").is_err();
+
+    let heading = if use_color {
+        console::style("Fennec Doctor").cyan().bold().to_string()
+    } else {
+        "Fennec Doctor".to_string()
+    };
+    println!();
+    println!("  {}", heading);
+    let rule = "─".repeat(40);
+    let rule_styled = if use_color {
+        console::style(rule).dim().to_string()
+    } else {
+        rule
+    };
+    println!("  {}", rule_styled);
+    println!();
+
+    let results = doctor::run_all(config, home_dir, &secret_store).await;
+    for r in &results {
+        println!("  {}", doctor::render_result(r, use_color));
+    }
+    println!();
+    let (summary, any_failed) = doctor::render_summary(&results, use_color);
+    println!("  {}", summary);
+    println!();
+    if any_failed {
+        std::process::exit(1);
+    }
     Ok(())
 }

@@ -15,3 +15,4 @@ pub mod skills;
 pub mod mcp;
 pub mod sessions;
 pub mod onboard;
+pub mod doctor;
