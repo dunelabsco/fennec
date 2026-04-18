@@ -85,12 +85,22 @@ Inspect a few existing daily notes first to match the user's format. Some vaults
 
 **Search by tag**
 
+YAML tags come in two shapes — match whichever the vault uses:
+
 ```
-grep -rl '^tags:.*project-x' <vault>     # frontmatter tags
-grep -rl '#project-x' <vault>            # inline hashtags
+# inline array form:  tags: [project-x, other]
+grep -rl '^tags:.*\bproject-x\b' <vault>
+
+# nested list form:
+#   tags:
+#     - project-x
+grep -rlPz '(?s)^tags:\s*\n(\s*-\s*\S+\n)*?\s*-\s*project-x\b' <vault>
+
+# inline body hashtags
+grep -rl '#project-x\b' <vault>
 ```
 
-Or `find <vault> -name '*.md' -newer /tmp/since` piped into a loop that `read_file`s each match — useful when the filter is more complex than a regex.
+For anything more complex than a single regex, use `find <vault> -name '*.md'` to enumerate files and `read_file` each one, filtering in code.
 
 ## Rules
 
