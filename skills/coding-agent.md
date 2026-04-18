@@ -1,64 +1,76 @@
 ---
 name: coding-agent
-description: Delegate heavy coding tasks to the `claude_code` tool (external Claude Code CLI). Use for multi-file refactors, feature implementation, or iterative test-driven work.
+description: Delegate heavy coding tasks to an external coding CLI (Claude Code, Codex, Aider, OpenCode, or similar). Use for multi-file refactors, feature implementation, or iterative test-driven work.
 always: false
 ---
 
 # coding-agent
 
-Fennec ships a `claude_code` tool that hands a prompt to a locally installed Claude Code CLI. Claude Code has its own tools, context window, and loop — use it when the work is a big enough coding task that Fennec doing it directly would bloat its context or exceed its iteration cap.
+For large coding work, delegate to a dedicated coding CLI rather than doing it directly. The CLI has its own tools, context window, and loop — use it when the work would otherwise bloat Fennec's context or exceed its iteration cap.
 
-## When to reach for claude_code
+## When to delegate
 
 - Multi-file refactors whose diff will be dozens of edits.
 - "Build this feature" scale work, not "fix this typo".
 - Iterative work: read → edit → run tests → edit again.
 - Tasks the user has already decided belong to a coding agent.
 
-## When NOT to reach for it
+## When NOT to delegate
 
 - Single-file reads or one-shot edits — Fennec's own file tools are faster.
-- Questions about the code that don't require editing — read it and answer.
+- Questions about the code that don't require editing — read it and answer directly.
 - Work that requires the caller's live conversation context.
-- Research-only work — use the `delegate` sub-agent, which is cheaper and read-only.
+- Research-only work — use the `delegate` sub-agent (cheaper, read-only).
 
-## Calling the tool
+## Which tool to invoke
 
-```
-claude_code(
-  prompt: "Refactor src/auth.rs to use the new Provider trait. Keep the public API shape. Run `cargo test -p fennec auth` after the edit.",
-  working_dir: "/optional/path/to/clone"
-)
-```
+Pick the first option that applies:
 
-Rules:
+1. **`claude_code` tool, if available.** Fennec ships a built-in `claude_code` tool that wraps the `claude` CLI. It handles non-interactive mode, working directory, and error surfacing for you.
 
-- `prompt` is everything Claude Code gets. Put exact paths, "done" criteria, non-obvious constraints, and paths to NOT touch.
-- `working_dir` defaults to Fennec's current working directory. Set it when the task lives in a specific clone.
-- The tool runs `claude --print <prompt>` non-interactively. Long tasks may appear to hang — that's Claude Code working, not a failure.
-- The `claude` binary must be installed and authenticated on the host. If it is not present the tool self-skips or errors cleanly rather than crashing the agent.
+   ```
+   claude_code(prompt: "<task>", working_dir: "/optional/path")
+   ```
+
+2. **Another coding CLI via the shell tool.** If the user has a different CLI installed (Codex, Aider, OpenCode, etc.), invoke it through shell. Confirm the binary exists first:
+
+   ```
+   command -v <cli>
+   ```
+
+   Then run it non-interactively. Flag shapes differ — do NOT guess. Check `<cli> --help` or the project's docs. Rough patterns seen in the wild:
+
+   ```
+   <cli> --print "<task>"
+   <cli> exec "<task>"
+   echo "<task>" | <cli>
+   ```
+
+   Redirect stdout to a file if the task is long, then read it back.
+
+3. **Nothing installed.** Tell the user there is no coding CLI on the host. Do not fall back to doing the large task inline — Fennec's context and iteration cap are the reason you were delegating in the first place.
 
 ## Passing context
 
-Claude Code does NOT inherit Fennec's conversation. Put everything it needs into the `prompt`:
+External coding CLIs do NOT inherit Fennec's conversation. Put everything they need into the task prompt:
 
 - Exact file paths.
 - What "done" looks like — "tests passing", "lint clean", "function signatures unchanged", whatever applies.
-- The project's conventions: commit style, test framework, type-check command.
-- Paths it must leave alone.
+- Project conventions: commit style, test framework, type-check command.
+- Paths the CLI must leave alone.
 
 ## After it runs
 
-Verify — do not trust the agent's self-report:
+Verify — do not trust any agent's self-report:
 
 - `git diff` to see what actually changed.
-- Run the project's tests yourself via the shell tool; don't rely on Claude Code's "I ran the tests" claim.
+- Run the project's tests yourself via the shell tool; don't rely on the CLI's "I ran the tests" claim.
 - Skim the diff for out-of-scope edits.
-- If something looks wrong, don't re-prompt blindly — first read what changed and why.
+- If something looks wrong, read the diff before re-prompting.
 
 ## Anti-patterns
 
-- Using `claude_code` to answer a question you could answer by reading the file.
-- Sending it the whole conversation history in the prompt — it is one-shot, not a chat replacement.
+- Delegating to a coding CLI to answer a question you could answer by reading the file.
+- Sending the whole conversation history in the prompt — these CLIs are one-shot, not chat replacements.
 - Chaining external agents (one calling another) without a strong reason.
 - Reporting the task done to the user without reading the diff yourself.
