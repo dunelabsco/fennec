@@ -51,6 +51,8 @@ use fennec::tools::http_request_tool::HttpRequestTool;
 use fennec::tools::weather_tool::WeatherTool;
 use fennec::tools::image_info_tool::ImageInfoTool;
 use fennec::tools::claude_code_cli_tool::ClaudeCodeCliTool;
+use fennec::tools::delegate_tool::DelegateTool;
+use fennec::tools::traits::Tool;
 
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
@@ -217,6 +219,11 @@ async fn build_agent(
         let api_key = resolve_api_key(config, &secret_store)?;
         build_provider(config, api_key, model_override)
     };
+
+    // Promote the provider to `Arc` so it can be shared with DelegateTool
+    // (which needs its own handle for sub-agent runs) while still being
+    // passed into the AgentBuilder.
+    let provider: Arc<dyn Provider> = Arc::from(provider);
 
     // Create embedding provider based on config.
     let embedder: Arc<dyn fennec::memory::embedding::EmbeddingProvider> =
@@ -403,7 +410,7 @@ async fn build_agent(
 
     // Build Agent.
     let mut builder = AgentBuilder::new()
-        .provider(provider)
+        .provider(Arc::clone(&provider))
         .memory(memory.clone())
         .tool(Box::new(shell_tool))
         .tool(Box::new(read_file_tool))
@@ -489,6 +496,23 @@ async fn build_agent(
     if let Some(search) = collective_search {
         builder = builder.collective(search);
     }
+
+    // Wire DelegateTool so the agent can spawn read-only sub-agents for
+    // bounded research / investigation tasks. The sub-agent runs
+    // synchronously, capped at 10 tool iterations, with a fresh history.
+    // Toolkit is intentionally read-only: anything that writes files,
+    // spends money, or touches live systems stays with the main agent.
+    let delegate_subagent_tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(ReadFileTool::new()),
+        Arc::new(ListDirTool::new()),
+        Arc::new(WebFetchTool::new()),
+        Arc::new(WebSearchTool::new()),
+    ];
+    builder = builder.tool(Box::new(DelegateTool::new(
+        Arc::clone(&provider),
+        memory.clone(),
+        delegate_subagent_tools,
+    )));
 
     let agent = builder
         .identity_name(&config.identity.name)
