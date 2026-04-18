@@ -29,10 +29,12 @@ If they are not logged in, ask them to run `gh auth login` themselves. `gh auth 
 Open a PR from the current branch:
 
 ```
-gh pr create --title "..." --body "..." --base main
+gh pr create --title "..." --body "..."
 ```
 
 Always pass `--title` and `--body` explicitly. `gh pr create` without them drops into an interactive editor and blocks the agent.
+
+`--base` defaults to the repo's default branch. Pass `--base <branch>` only when targeting a non-default branch.
 
 Inspect a PR:
 
@@ -80,9 +82,9 @@ gh api repos/OWNER/REPO/commits/HEAD/check-runs
 
 Prefer this over cobbling together `curl` with a token — `gh` handles auth and rate limits for you.
 
-## Outside a git working tree
+## Which repo `gh` targets
 
-Pass `--repo owner/name` on every command, or `cd` into a clone first. Otherwise `gh` silently assumes `origin` and will error confusingly.
+Inside a clone, `gh` uses the clone's `origin` remote. If multiple remotes are configured it may prompt to pick one. Outside a clone, every command needs `--repo owner/name` or it errors. To avoid ambiguity, pass `--repo owner/name` explicitly when the target is not the current clone.
 
 ## Rate limits
 
