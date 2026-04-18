@@ -20,10 +20,18 @@ impl SystemPromptBuilder {
     ///
     /// - `memory_context`: recent memory entries formatted as strings.
     /// - `tool_names`: names of the tools available to the agent.
+    /// - `skills_prompt`: pre-rendered skills section (always-on bodies +
+    ///   on-demand menu) from [`crate::skills::SkillsLoader::build_skills_prompt`].
+    ///   Pass `""` when no skills are loaded.
     ///
     /// Note: collective context is injected into the user message, NOT
     /// into the frozen system prompt.
-    pub fn build(&self, memory_context: &[String], tool_names: &[String]) -> String {
+    pub fn build(
+        &self,
+        memory_context: &[String],
+        tool_names: &[String],
+        skills_prompt: &str,
+    ) -> String {
         let mut parts = Vec::new();
 
         // Identity + personality + capabilities
@@ -96,6 +104,11 @@ impl SystemPromptBuilder {
             ));
         }
 
+        // Skills: always-on bodies + on-demand menu
+        if !skills_prompt.is_empty() {
+            parts.push(skills_prompt.to_string());
+        }
+
         parts.join("\n\n")
     }
 }
@@ -118,7 +131,7 @@ mod tests {
     #[test]
     fn test_build_basic() {
         let builder = SystemPromptBuilder::new("Fennec", "a helpful AI assistant");
-        let prompt = builder.build(&[], &[]);
+        let prompt = builder.build(&[], &[], "");
         assert!(prompt.contains("You are Fennec"));
         assert!(prompt.contains("Current datetime:"));
     }
@@ -128,10 +141,29 @@ mod tests {
         let builder = SystemPromptBuilder::new("Fennec", "a helpful AI assistant");
         let memory = vec!["[user_name] Alice".to_string()];
         let tools = vec!["shell".to_string(), "read_file".to_string()];
-        let prompt = builder.build(&memory, &tools);
+        let prompt = builder.build(&memory, &tools, "");
 
         assert!(prompt.contains("Relevant memories:"));
         assert!(prompt.contains("[user_name] Alice"));
         assert!(prompt.contains("Available tools: shell, read_file"));
+    }
+
+    #[test]
+    fn test_build_with_skills_prompt() {
+        let builder = SystemPromptBuilder::new("Fennec", "a helpful AI assistant");
+        let skills = "## Active Skills\n### writing-plans\nPlan before acting.\n";
+        let prompt = builder.build(&[], &[], skills);
+
+        assert!(prompt.contains("## Active Skills"));
+        assert!(prompt.contains("writing-plans"));
+        assert!(prompt.contains("Plan before acting."));
+    }
+
+    #[test]
+    fn test_build_empty_skills_prompt_not_injected() {
+        let builder = SystemPromptBuilder::new("Fennec", "a helpful AI assistant");
+        let prompt = builder.build(&[], &[], "");
+        assert!(!prompt.contains("## Active Skills"));
+        assert!(!prompt.contains("## Available Skills"));
     }
 }

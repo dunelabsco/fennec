@@ -29,6 +29,10 @@ pub struct Agent {
     half_life_days: f64,
     prompt_guard: Option<PromptGuard>,
     collective: Option<Arc<CollectiveSearch>>,
+    /// Pre-rendered skills prompt fragment injected into the system prompt
+    /// (see [`crate::skills::SkillsLoader::build_skills_prompt`]). Empty when
+    /// no skills are loaded.
+    skills_prompt: String,
     thinking_level: ThinkingLevel,
     // Token usage tracking
     total_input_tokens: u64,
@@ -97,7 +101,11 @@ impl Agent {
         if self.system_prompt.is_none() {
             let memory_context = self.load_memory_context(user_message).await?;
             let tool_names: Vec<String> = self.tools.iter().map(|t| t.name().to_string()).collect();
-            let prompt = self.prompt_builder.build(&memory_context, &tool_names);
+            let prompt = self.prompt_builder.build(
+                &memory_context,
+                &tool_names,
+                &self.skills_prompt,
+            );
             self.system_prompt = Some(prompt);
         }
 
@@ -204,7 +212,11 @@ impl Agent {
         if self.system_prompt.is_none() {
             let memory_context = self.load_memory_context(user_message).await?;
             let tool_names: Vec<String> = self.tools.iter().map(|t| t.name().to_string()).collect();
-            let prompt = self.prompt_builder.build(&memory_context, &tool_names);
+            let prompt = self.prompt_builder.build(
+                &memory_context,
+                &tool_names,
+                &self.skills_prompt,
+            );
             self.system_prompt = Some(prompt);
         }
 
@@ -390,6 +402,7 @@ pub struct AgentBuilder {
     half_life_days: Option<f64>,
     prompt_guard: Option<PromptGuard>,
     collective: Option<Arc<CollectiveSearch>>,
+    skills_prompt: Option<String>,
 }
 
 impl AgentBuilder {
@@ -407,6 +420,7 @@ impl AgentBuilder {
             half_life_days: None,
             prompt_guard: None,
             collective: None,
+            skills_prompt: None,
         }
     }
 
@@ -475,6 +489,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the pre-rendered skills prompt fragment. Typically the output of
+    /// [`crate::skills::SkillsLoader::build_skills_prompt`]. Empty string (or
+    /// never calling this) means no skills are injected.
+    pub fn skills_prompt(mut self, prompt: String) -> Self {
+        self.skills_prompt = Some(prompt);
+        self
+    }
+
     /// Build the [`Agent`], validating that required fields are set.
     pub fn build(self) -> Result<Agent> {
         let provider = self
@@ -507,6 +529,7 @@ impl AgentBuilder {
             half_life_days: self.half_life_days.unwrap_or(7.0),
             prompt_guard: self.prompt_guard,
             collective: self.collective,
+            skills_prompt: self.skills_prompt.unwrap_or_default(),
             thinking_level: ThinkingLevel::Off,
             total_input_tokens: 0,
             total_output_tokens: 0,

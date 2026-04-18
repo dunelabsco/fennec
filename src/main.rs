@@ -51,6 +51,8 @@ use fennec::tools::http_request_tool::HttpRequestTool;
 use fennec::tools::weather_tool::WeatherTool;
 use fennec::tools::image_info_tool::ImageInfoTool;
 use fennec::tools::claude_code_cli_tool::ClaudeCodeCliTool;
+use fennec::skills::{Skill, SkillsLoader};
+use fennec::tools::skills_tool::SkillsTool;
 
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
@@ -489,6 +491,26 @@ async fn build_agent(
     if let Some(search) = collective_search {
         builder = builder.collective(search);
     }
+
+    // Load skills from ~/.fennec/skills/, filter by PATH requirements, and
+    // inject. Returns empty Vec if the directory doesn't exist yet.
+    let skills_dir = home_dir.join("skills");
+    let loaded_skills = SkillsLoader::load_from_directory(&skills_dir)
+        .context("loading skills directory")?;
+    let available_skills: Vec<Skill> = SkillsLoader::filter_available(&loaded_skills)
+        .into_iter()
+        .cloned()
+        .collect();
+    tracing::info!(
+        total = loaded_skills.len(),
+        available = available_skills.len(),
+        dir = %skills_dir.display(),
+        "skills loaded",
+    );
+    let skills_prompt = SkillsLoader::build_skills_prompt(&available_skills);
+    builder = builder
+        .skills_prompt(skills_prompt)
+        .tool(Box::new(SkillsTool::new(available_skills)));
 
     let agent = builder
         .identity_name(&config.identity.name)
