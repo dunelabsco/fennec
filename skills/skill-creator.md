@@ -27,15 +27,16 @@ Every skill is one `.md` file whose name matches the `name` field. Frontmatter k
 | `always` | no | `true` = full body injected every turn. `false` (default) = only the description is surfaced; body loads on demand via the `load_skill` tool |
 | `requirements` | no | YAML list of CLI commands that must exist in PATH, or the skill is silently hidden |
 
-Example frontmatter:
+Example frontmatter (hypothetical skill; illustration only):
 
 ```
 ---
-name: weather
-description: Look up current weather and short-term forecast for a named place.
+name: ip-lookup
+description: Resolve an IP address to geolocation and ASN details via a public API.
 always: false
 requirements:
   - curl
+  - jq
 ---
 ```
 
