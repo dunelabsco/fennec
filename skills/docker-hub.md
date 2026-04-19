@@ -113,7 +113,7 @@ Docker Hub official images live under the `library/` namespace — those are the
 
 ## Failure modes
 
-- `401 Unauthorized` on a private repo → token missing, wrong user, or the JWT expired (JWTs last ~5 hours).
+- `401 Unauthorized` on a private repo → token missing, wrong user, or the JWT expired. Hub JWTs are short-lived; on 401, re-mint via `POST /v2/users/login/` rather than reusing an old token.
 - `404 Not Found` → repo doesn't exist or is private without auth. Double-check the namespace / repo name.
 - `429 Too Many Requests` → rate-limited. Add auth, or space requests.
 - Response `results: []` on search → term matched nothing. Docker Hub search is not full-text on README; mostly searches name + short description.

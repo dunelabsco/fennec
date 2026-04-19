@@ -36,10 +36,13 @@ ffmpeg -i input.mp3 -ss 00:01:00 -to 00:02:30 -c:a libmp3lame -b:a 192k clip.mp3
 ```
 `-ss` after `-i` is sample-accurate but slower.
 
-Use `-t <duration>` instead of `-to` if you prefer duration-based trimming:
+Use `-t <duration>` instead of `-to` if you prefer duration-based trimming. `-t` accepts raw seconds or `HH:MM:SS`:
 ```
-ffmpeg -ss 00:01:00 -i input.mp3 -t 00:00:90 -c copy clip.mp3   # 90 seconds from 1:00
+ffmpeg -ss 00:01:00 -i input.mp3 -t 90 -c copy clip.mp3           # 90 seconds from 1:00
+ffmpeg -ss 00:01:00 -i input.mp3 -t 00:01:30 -c copy clip.mp3     # equivalent
 ```
+
+Each `HH:MM:SS` component should stay in its normal range (seconds 0–59); use raw seconds for anything longer than 60s when in doubt.
 
 ## Concatenate (merge)
 
