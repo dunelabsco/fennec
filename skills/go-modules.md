@@ -26,7 +26,7 @@ Mirrors exist (goproxy.io, goproxy.cn) but proxy.golang.org is the official defa
 | `github.com/GoRoute/foo` | `github.com/!go!route/foo` |
 | `github.com/BurntSushi/toml` | `github.com/!burnt!sushi/toml` |
 
-Forget this and you get `410 Gone`.
+Forget this and you get `404 Not Found` (different from `410 Gone`, which is reserved for retracted versions — see Failure modes below).
 
 ## Common operations
 

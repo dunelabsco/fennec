@@ -107,7 +107,7 @@ Then on B, set `CurrentURI` to `x-rincon:<RINCON_UUID>`:
 ```xml
 <u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
   <InstanceID>0</InstanceID>
-  <CurrentURI>x-rincon:RINCON_XXXXXXXXXXXX1400</CurrentURI>
+  <CurrentURI>x-rincon:RINCON_XXXXXXXXXXXX01400</CurrentURI>
   <CurrentURIMetaData></CurrentURIMetaData>
 </u:SetAVTransportURI>
 ```
