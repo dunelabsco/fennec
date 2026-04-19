@@ -50,8 +50,23 @@ GET /rest/api/3/myself
 ```
 
 **Search issues (JQL — Jira Query Language)**
+
+Atlassian is removing the old `/rest/api/3/search` endpoint. Use the current enhanced-search path:
+
+Small / simple queries — GET with params:
 ```
-GET /rest/api/3/search?jql=<url-encoded-jql>&fields=summary,status,assignee&maxResults=20
+GET /rest/api/3/search/jql?jql=<url-encoded-jql>&fields=summary,status,assignee&maxResults=50
+```
+
+Larger or complex queries — POST with JSON body:
+```
+POST /rest/api/3/search/jql
+Body:
+{
+  "jql": "project = \"ENG\" AND status in (\"In Progress\", \"To Do\")",
+  "fields": ["summary", "status", "assignee"],
+  "maxResults": 50
+}
 ```
 
 Example JQL strings:
@@ -61,7 +76,9 @@ Example JQL strings:
 - `labels = backend AND sprint in openSprints()`
 - `key in (ENG-123, ENG-456)`
 
-URL-encode the JQL when passing as a query string.
+URL-encode the JQL when passing via GET.
+
+**Pagination** on the enhanced search uses `nextPageToken` (not `startAt`). Pass the token from the previous response as a query param / body field to fetch the next page; an empty or missing token means the last page.
 
 **Get one issue**
 ```
