@@ -22,11 +22,11 @@ If `NOTION_API_KEY` is missing at runtime, ask the user to complete setup. Do no
 
 ```
 Authorization: Bearer <NOTION_API_KEY>
-Notion-Version: 2025-09-03
+Notion-Version: 2026-03-11
 Content-Type: application/json
 ```
 
-`Notion-Version` is mandatory. Pin it to a known version so Notion can't change behaviour under you.
+`Notion-Version` is mandatory. Pin it to a known version so Notion can't change behaviour under you. `2026-03-11` is the current API version as of this skill's writing — check https://developers.notion.com/reference/versioning before bumping.
 
 ## Common operations
 

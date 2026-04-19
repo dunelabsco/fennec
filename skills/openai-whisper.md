@@ -55,17 +55,20 @@ curl https://api.openai.com/v1/audio/transcriptions \
   -F model="whisper-1"
 ```
 
-Models:
-- `whisper-1` — stable, cheapest.
-- `gpt-4o-transcribe` — higher accuracy, pricier.
-- `gpt-4o-mini-transcribe` — cost-tuned.
-- `gpt-4o-transcribe-diarize` — speaker labels.
+Models and their supported `response_format` values (these differ per model — check before setting):
+
+| Model | Supported `response_format` | Notes |
+|---|---|---|
+| `whisper-1` | `json`, `text`, `srt`, `verbose_json`, `vtt` | Cheapest, most flexible output |
+| `gpt-4o-transcribe` | `json`, `text` | More accurate, pricier |
+| `gpt-4o-mini-transcribe` | `json`, `text` | Cost-tuned |
+| `gpt-4o-transcribe-diarize` | `json`, `text`, `diarized_json` | Adds speaker segments |
 
 Accepted formats: `flac`, `mp3`, `mp4`, `mpeg`, `mpga`, `m4a`, `ogg`, `wav`, `webm`. Maximum file size is 25 MB — split larger files with `ffmpeg` before upload.
 
 Optional params:
-- `response_format` — `json` (default), `text`, `srt`, `verbose_json`, `vtt`.
-- `timestamp_granularities[]` — `segment`, `word`. Requires `response_format=verbose_json`.
+- `response_format` — see the table above. Default is `json`.
+- `timestamp_granularities[]` — `segment`, `word`. Requires `response_format=verbose_json`, so only works with `whisper-1`.
 - `language` — ISO-639-1 code; omit for auto-detect.
 - `prompt` — bias the transcription toward names / domain terms.
 
