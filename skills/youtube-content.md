@@ -28,18 +28,18 @@ curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
 
 **Manual (human-written) subtitles first, fall back to auto-generated:**
 ```
-yt-dlp --write-sub --write-auto-sub --sub-lang en --skip-download \
+yt-dlp --write-subs --write-auto-subs --sub-langs en --skip-download \
        -o "%(id)s.%(ext)s" "<URL>"
 ```
 
 - Output: a `.vtt` file named after the video ID (e.g. `dQw4w9WgXcQ.en.vtt`).
-- `--sub-lang en` — English; change for other languages (`de`, `es`, `ja`, etc.).
+- `--sub-langs en` — English; change for other languages (`de`, `es`, `ja`, etc.).
 - `--sub-format vtt` — VTT is default and easiest to read.
 - `--skip-download` — we want only subtitles, not the video bytes.
 
 **Auto-generated only** (for videos without manual captions):
 ```
-yt-dlp --write-auto-sub --sub-lang en --skip-download -o "%(id)s.%(ext)s" "<URL>"
+yt-dlp --write-auto-subs --sub-langs en --skip-download -o "%(id)s.%(ext)s" "<URL>"
 ```
 
 **Reading the .vtt**
@@ -54,10 +54,13 @@ yt-dlp --dump-json --skip-download "<URL>"
 
 Returns a single JSON blob with `title`, `uploader`, `duration`, `description`, `view_count`, `upload_date`, `thumbnail`, and much more. Parse with `jq`.
 
-Lightweight alternative when you only want the title:
+Lightweight alternative when you only want the title (or any single field):
 ```
-yt-dlp --get-title "<URL>"
+yt-dlp --print title "<URL>"
+yt-dlp --print "%(duration_string)s — %(title)s" "<URL>"
 ```
+
+(Older docs show `--get-title`; that form is deprecated in current yt-dlp. Use `--print <field>` instead.)
 
 ## Playlists
 
@@ -84,6 +87,6 @@ yt-dlp --flat-playlist --dump-single-json --playlist-end 10 \
 ## Failure modes
 
 - `ERROR: ... Video unavailable` → video is private, age-restricted, deleted, or geo-blocked. Confirm with the user.
-- `WARNING: There are no automatic captions for requested language` → try another `--sub-lang`, or combine `--write-auto-sub` with `--convert-subs srt` and `--sub-lang en` to trigger YouTube's auto-translation (works for many but not all videos).
+- `WARNING: There are no automatic captions for requested language` → try another `--sub-langs` value, or combine `--write-auto-subs` with `--convert-subs srt` and `--sub-langs en` to trigger YouTube's auto-translation (works for many but not all videos).
 - `HTTP Error 429 Too Many Requests` → throttled. Back off for a few minutes; don't retry immediately.
 - Empty `.vtt` file → subtitles exist but contain only music markers or chapter labels. There's no text to work with.
