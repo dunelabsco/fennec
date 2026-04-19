@@ -30,7 +30,10 @@ Prefix each term with the field you want to search:
 | `au:` | Author |
 | `abs:` | Abstract |
 | `cat:` | Category (`cs.LG`, `math.AG`, `physics.hep-ph`, etc.) |
-| `id:` | arxiv id |
+| `co:` | Comment |
+| `jr:` | Journal reference |
+| `rn:` | Report number |
+| `id:` | arxiv id (prefer the dedicated `id_list` parameter instead) |
 | `all:` | Any field |
 
 Combine with `AND`, `OR`, `ANDNOT`. Quote multi-word phrases: `ti:"attention is all you need"`.
