@@ -122,12 +122,14 @@ Thing prefixes:
 - `t5_` — subreddit
 - `t2_` — account
 
-**Vote** (irreversible if already voted that direction)
+**Vote**
 ```
 POST https://oauth.reddit.com/api/vote
 id=t3_<post_id>
 dir=1                            # 1 up, -1 down, 0 remove vote
 ```
+
+Votes are reversible — send `0` to clear or the opposite direction to flip. Re-sending the same direction is a no-op (Reddit doesn't stack votes from the same account).
 
 **Save / unsave for later**
 ```

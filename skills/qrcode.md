@@ -47,12 +47,13 @@ Default: PNG, 256×256-ish, medium error correction.
 
 Print a scannable QR code in the terminal:
 ```
-qrencode -t ANSIUTF8 "https://example.com"
-qrencode -t UTF8 "https://example.com"              # same, plain UTF-8
-qrencode -t ANSI "https://example.com"              # smaller, ANSI colour blocks
+qrencode -t ANSIUTF8 "https://example.com"          # UTF-8 half-blocks + ANSI colour (densest, most scannable)
+qrencode -t UTF8 "https://example.com"              # plain UTF-8 block characters, no colour (larger)
+qrencode -t ANSI "https://example.com"              # ANSI colour with space characters (no UTF-8 needed)
+qrencode -t ANSI256UTF8 "https://example.com"       # 256-colour variant of ANSIUTF8
 ```
 
-Works in any terminal that supports colour and UTF-8 box characters.
+`ANSIUTF8` is usually the smallest readable option in a modern terminal. `UTF8` is the most compatible when colour isn't available.
 
 ## Common content patterns
 
