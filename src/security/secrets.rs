@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
 
+use super::fs::write_secure;
+
 const NONCE_LEN: usize = 12;
 const PREFIX: &str = "enc2:";
 
@@ -37,20 +39,14 @@ impl SecretStore {
             }
             *Key::from_slice(&bytes)
         } else {
-            // Generate a new key.
+            // Generate a new key and write it via write_secure so the file
+            // never exists on disk with umask-default (0644) permissions,
+            // even for the brief window between create-and-chmod.
             let key = ChaCha20Poly1305::generate_key(&mut OsRng);
 
             let hex_str = hex::encode(key.as_slice());
-            std::fs::write(&key_path, &hex_str)
+            write_secure(&key_path, hex_str.as_bytes())
                 .with_context(|| format!("writing key file {}", key_path.display()))?;
-
-            // Set file permissions to 0600 on Unix.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-                    .context("setting key file permissions")?;
-            }
 
             key
         };
@@ -80,10 +76,22 @@ impl SecretStore {
     /// Decrypt a value previously encrypted with [`encrypt`](Self::encrypt).
     ///
     /// If the value does not start with the `enc2:` prefix it is returned
-    /// as-is (plaintext passthrough).
+    /// as-is (plaintext passthrough). This is a backwards-compat convenience
+    /// for configs where the user pasted a raw secret without running it
+    /// through `encrypt` first — but it also means an attacker able to
+    /// overwrite stored ciphertext with arbitrary plaintext makes
+    /// decryption "succeed" with their payload. A warning is logged on the
+    /// passthrough path so operators can notice and migrate the config.
     pub fn decrypt(&self, value: &str) -> Result<String> {
         if !value.starts_with(PREFIX) {
-            // Plaintext passthrough.
+            tracing::warn!(
+                "SecretStore::decrypt: value lacks '{}' prefix — returning as \
+                 plaintext. This is fine for legacy configs where the secret \
+                 was pasted directly, but a stored value that SHOULD be \
+                 ciphertext is now unauthenticated. Run encrypt() over these \
+                 values.",
+                PREFIX
+            );
             return Ok(value.to_string());
         }
 

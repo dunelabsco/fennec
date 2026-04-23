@@ -304,20 +304,17 @@ pub fn refresh_oauth_token(
 }
 
 /// Persist credentials to the token file.
+///
+/// Uses `security::fs::write_secure` so the file is created with 0600 from
+/// the start — the old write-then-chmod sequence had a race where the file
+/// existed with umask-default (typically 0644) perms for a brief window.
 fn save_credentials(fennec_home: &Path, creds: &OAuthCredentials) -> Result<()> {
     std::fs::create_dir_all(fennec_home)
         .context("creating fennec home directory")?;
     let path = fennec_home.join(TOKEN_FILE);
     let json = serde_json::to_string_pretty(creds).context("serializing credentials")?;
-    std::fs::write(&path, json).context("writing credentials file")?;
-
-    // Best-effort: restrict file permissions on Unix.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-
+    crate::security::fs::write_secure(&path, json.as_bytes())
+        .context("writing credentials file")?;
     Ok(())
 }
 

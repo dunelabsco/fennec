@@ -1,4 +1,5 @@
 use crate::onboard::frame::{existing_config_at, FinalSummary, StepSummary, WizardFrame};
+use crate::security::fs::{create_dir_private, write_secure};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
 
@@ -264,12 +265,16 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
     );
 
     std::fs::create_dir_all(fennec_home)?;
-    std::fs::create_dir_all(fennec_home.join("memory"))?;
-    std::fs::create_dir_all(fennec_home.join("skills"))?;
-    std::fs::create_dir_all(fennec_home.join("pairing"))?;
+    // memory/, skills/, pairing/ hold secrets or secret-adjacent state;
+    // create them with 0700 on Unix so other local users can't enumerate.
+    create_dir_private(&fennec_home.join("memory"))?;
+    create_dir_private(&fennec_home.join("skills"))?;
+    create_dir_private(&fennec_home.join("pairing"))?;
 
+    // config.toml contains API keys / bot tokens; write atomically with 0600
+    // from the start so there is no readable-for-a-moment window.
     let config_path = fennec_home.join("config.toml");
-    std::fs::write(&config_path, &config)?;
+    write_secure(&config_path, config.as_bytes())?;
 
     frame.finish(FinalSummary {
         config_path,
@@ -462,12 +467,12 @@ fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
     );
 
     std::fs::create_dir_all(fennec_home)?;
-    std::fs::create_dir_all(fennec_home.join("memory"))?;
-    std::fs::create_dir_all(fennec_home.join("skills"))?;
-    std::fs::create_dir_all(fennec_home.join("pairing"))?;
+    create_dir_private(&fennec_home.join("memory"))?;
+    create_dir_private(&fennec_home.join("skills"))?;
+    create_dir_private(&fennec_home.join("pairing"))?;
 
     let config_path = fennec_home.join("config.toml");
-    std::fs::write(&config_path, &config)?;
+    write_secure(&config_path, config.as_bytes())?;
 
     println!();
     println!(
@@ -504,6 +509,34 @@ fn auto_register_plurum(agent_name: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("No api_key in response"))
 }
 
+/// Serialize a string as a TOML basic string (quoted, with proper escapes).
+///
+/// Hand-rolled rather than pulling in a full `toml::Value::to_string` because
+/// we want to control the exact quoting (basic strings, not literal strings)
+/// and avoid the top-level-table requirement of `toml::to_string`. Matches
+/// TOML v1.0 basic-string rules.
+fn toml_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7F => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn build_config_toml(
     name: &str,
     provider: &str,
@@ -514,21 +547,32 @@ fn build_config_toml(
     discord_token: &str,
     plurum_key: &str,
 ) -> String {
+    // User-typed values get escaped via toml_str so stray quotes, backslashes,
+    // or newlines can't break out of their field and inject arbitrary TOML
+    // sections.
+    let name_lit = toml_str(name);
+    let provider_lit = toml_str(provider);
+    let model_lit = toml_str(model);
+    let api_key_lit = toml_str(api_key);
+    let telegram_token_lit = toml_str(telegram_token);
+    let discord_token_lit = toml_str(discord_token);
+    let plurum_key_lit = toml_str(plurum_key);
+
     let allowed_users_line = if telegram_user_id.is_empty() {
         "allowed_users = []".to_string()
     } else {
-        format!("allowed_users = [\"{}\"]", telegram_user_id)
+        format!("allowed_users = [{}]", toml_str(telegram_user_id))
     };
 
     format!(
         r#"[identity]
-name = "{name}"
+name = {name_lit}
 persona = "A fast, helpful AI assistant with collective intelligence."
 
 [provider]
-name = "{provider}"
-model = "{model}"
-api_key = "{api_key}"
+name = {provider_lit}
+model = {model_lit}
+api_key = {api_key_lit}
 base_url = ""
 temperature = 0.7
 max_tokens = 8192
@@ -551,12 +595,12 @@ context_window = 200000
 
 [channels.telegram]
 enabled = {telegram_enabled}
-token = "{telegram_token}"
+token = {telegram_token_lit}
 {allowed_users_line}
 
 [channels.discord]
 enabled = {discord_enabled}
-token = "{discord_token}"
+token = {discord_token_lit}
 
 [channels.slack]
 enabled = false
@@ -572,29 +616,29 @@ enabled = false
 
 [collective]
 enabled = {collective_enabled}
-api_key = "{plurum_key}"
+api_key = {plurum_key_lit}
 base_url = "https://api.plurum.ai"
 publish_enabled = true
 search_enabled = true
 "#,
-        name = name,
-        provider = provider,
-        model = model,
-        api_key = api_key,
-        telegram_token = telegram_token,
+        name_lit = name_lit,
+        provider_lit = provider_lit,
+        model_lit = model_lit,
+        api_key_lit = api_key_lit,
+        telegram_token_lit = telegram_token_lit,
         allowed_users_line = allowed_users_line,
         telegram_enabled = if telegram_token.is_empty() {
             "false"
         } else {
             "true"
         },
-        discord_token = discord_token,
+        discord_token_lit = discord_token_lit,
         discord_enabled = if discord_token.is_empty() {
             "false"
         } else {
             "true"
         },
-        plurum_key = plurum_key,
+        plurum_key_lit = plurum_key_lit,
         collective_enabled = if plurum_key.is_empty() {
             "false"
         } else {
@@ -646,5 +690,115 @@ mod tests {
         assert!(config.contains("token = \"discord-token\""));
         assert!(config.contains("[collective]\nenabled = true"));
         assert!(config.contains("api_key = \"plurum-key\""));
+    }
+
+    #[test]
+    fn toml_str_quotes_plain_ascii() {
+        assert_eq!(toml_str("hello"), "\"hello\"");
+        assert_eq!(toml_str(""), "\"\"");
+    }
+
+    #[test]
+    fn toml_str_escapes_quote_and_backslash() {
+        assert_eq!(toml_str("a\"b"), "\"a\\\"b\"");
+        assert_eq!(toml_str("a\\b"), "\"a\\\\b\"");
+    }
+
+    #[test]
+    fn toml_str_escapes_control_chars() {
+        assert_eq!(toml_str("a\nb"), "\"a\\nb\"");
+        assert_eq!(toml_str("a\tb"), "\"a\\tb\"");
+        assert_eq!(toml_str("a\rb"), "\"a\\rb\"");
+        assert_eq!(toml_str("a\x00b"), "\"a\\u0000b\"");
+    }
+
+    #[test]
+    fn build_config_toml_escapes_injection_in_agent_name() {
+        // An attacker-controlled or accidentally-pasted agent_name containing
+        // a closing quote and a fake TOML section MUST NOT inject a new
+        // section. Re-parsing the produced TOML must preserve the name
+        // verbatim.
+        let hostile = r#"x"]
+[provider]
+api_key = "stolen"
+[identity]
+name = "gotcha"#;
+        let config = build_config_toml(
+            hostile,
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            "sk-real",
+            "",
+            "",
+            "",
+            "",
+        );
+        let parsed: toml::Value =
+            toml::from_str(&config).expect("escaped config must be valid TOML");
+        let parsed_name = parsed
+            .get("identity")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+            .expect("identity.name must be present");
+        assert_eq!(
+            parsed_name, hostile,
+            "agent_name must round-trip verbatim — injection attempt was not escaped"
+        );
+        // Provider key must still be the one we passed, not the injected one.
+        let parsed_api_key = parsed
+            .get("provider")
+            .and_then(|v| v.get("api_key"))
+            .and_then(|v| v.as_str())
+            .expect("provider.api_key must be present");
+        assert_eq!(parsed_api_key, "sk-real");
+    }
+
+    #[test]
+    fn build_config_toml_escapes_injection_in_telegram_user_id() {
+        // telegram_user_id lands inside allowed_users = [...] — same escape
+        // path, different call site.
+        let hostile = r#"1"], other = [1#;
+        let config = build_config_toml(
+            "Fennec",
+            "anthropic",
+            "m",
+            "",
+            "tok",
+            hostile,
+            "",
+            "",
+        );
+        let parsed: toml::Value =
+            toml::from_str(&config).expect("escaped config must be valid TOML");
+        let users = parsed
+            .get("channels")
+            .and_then(|v| v.get("telegram"))
+            .and_then(|v| v.get("allowed_users"))
+            .and_then(|v| v.as_array())
+            .expect("allowed_users must be an array");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].as_str(), Some(hostile));
+    }
+
+    #[test]
+    fn build_config_toml_roundtrips_to_schema() {
+        // End-to-end: the wizard's output must parse as a FennecConfig.
+        let config = build_config_toml(
+            "Fennec",
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            "sk-test",
+            "123:ABC",
+            "987654321",
+            "dc-token",
+            "plrm_test",
+        );
+        let cfg: crate::config::FennecConfig =
+            toml::from_str(&config).expect("must parse as FennecConfig");
+        assert_eq!(cfg.identity.name, "Fennec");
+        assert_eq!(cfg.provider.api_key, "sk-test");
+        assert_eq!(cfg.channels.telegram.token, "123:ABC");
+        assert_eq!(cfg.channels.telegram.allowed_users, vec!["987654321"]);
+        assert_eq!(cfg.collective.api_key, "plrm_test");
     }
 }
