@@ -637,6 +637,7 @@ async fn run_gateway(
             ch_config.whatsapp.verify_token.clone(),
             ch_config.whatsapp.webhook_port,
             ch_config.whatsapp.allowed_users.clone(),
+            ch_config.whatsapp.app_secret.clone(),
         );
         channels.push(Arc::new(ch));
         tracing::info!("WhatsApp channel enabled");

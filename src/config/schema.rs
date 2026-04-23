@@ -232,6 +232,11 @@ pub struct SlackChannelEntry {
 }
 
 /// WhatsApp Cloud API channel entry.
+///
+/// `app_secret` is the Meta App Secret used to verify the
+/// `X-Hub-Signature-256` HMAC on incoming webhook POSTs. If empty, signature
+/// verification is skipped (for dev / not yet configured) and a warning is
+/// logged at startup — do not leave it empty for internet-reachable deploys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WhatsAppChannelEntry {
@@ -239,6 +244,7 @@ pub struct WhatsAppChannelEntry {
     pub phone_number_id: String,
     pub access_token: String,
     pub verify_token: String,
+    pub app_secret: String,
     pub webhook_port: u16,
     pub allowed_users: Vec<String>,
 }
@@ -250,6 +256,7 @@ impl Default for WhatsAppChannelEntry {
             phone_number_id: String::new(),
             access_token: String::new(),
             verify_token: String::new(),
+            app_secret: String::new(),
             webhook_port: 9443,
             allowed_users: Vec::new(),
         }
