@@ -47,6 +47,7 @@ native-tls = "0.2"
 base64 = "0.22"
 pdf-extract = "0.7"
 imagesize = "0.14"
+url = "2.5"
 
 [dev-dependencies]
 tempfile = "3.15"

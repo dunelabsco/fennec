@@ -12,7 +12,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str};
+
 use super::traits::{Tool, ToolResult};
+
+/// Hard cap on bytes fetched for an image — large enough for any reasonable
+/// photo (20 MB) but bounded so a hostile URL can't OOM us.
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 pub struct ImageInfoTool {
     client: reqwest::Client,
@@ -21,17 +27,25 @@ pub struct ImageInfoTool {
 
 impl ImageInfoTool {
     pub fn new(temp_dir: PathBuf) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("build reqwest client for image_info");
+        let client = build_guarded_client(Duration::from_secs(30));
         Self { client, temp_dir }
     }
 
     async fn load_bytes(&self, source: &str) -> Result<(Vec<u8>, Option<PathBuf>)> {
         if source.starts_with("http://") || source.starts_with("https://") {
+            validate_url_str(source)?;
             tokio::fs::create_dir_all(&self.temp_dir).await?;
-            let bytes = self.client.get(source).send().await?.bytes().await?.to_vec();
+            let resp = self.client.get(source).send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("HTTP {} fetching image", resp.status());
+            }
+            let (bytes, truncated) = read_body_capped(resp, MAX_IMAGE_BYTES).await?;
+            if truncated {
+                anyhow::bail!(
+                    "image too large: exceeds max {} bytes",
+                    MAX_IMAGE_BYTES
+                );
+            }
             let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
             let path = self.temp_dir.join(format!("imginfo_{}", ts));
             tokio::fs::write(&path, &bytes).await?;
