@@ -51,9 +51,9 @@ curl -X POST https://www.reddit.com/api/v1/access_token \
   -d "grant_type=password&username=$REDDIT_USERNAME&password=$REDDIT_PASSWORD"
 ```
 
-Response: `{"access_token": "...", "token_type": "bearer", "expires_in": 86400, "scope": "*"}`.
+Response: `{"access_token": "...", "token_type": "bearer", "expires_in": 3600, "scope": "*"}`.
 
-Token lasts 24 hours for script apps. On 401, mint a new one.
+Token lasts **1 hour** (3600 s) — Reddit's OAuth2 wiki states "All bearer tokens expire after 1 hour." Refresh by re-running the password grant (script-type apps don't get a `refresh_token`). On 401, mint a new one.
 
 ## API base URL
 
