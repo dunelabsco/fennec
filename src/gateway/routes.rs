@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     middleware,
     routing, Json, Router,
@@ -8,6 +8,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::auth;
+
+/// Max inbound request body size. A /chat message is conversation text;
+/// anything past 1 MiB is abuse, not a legitimate prompt. Without a cap,
+/// a client could POST an arbitrarily large JSON body and axum would
+/// buffer it before the handler ever ran — trivially DoS-able.
+const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -31,6 +37,10 @@ pub fn build_router(state: AppState) -> Router {
 
     public
         .merge(protected)
+        // DefaultBodyLimit applies to every route in the merged router,
+        // overriding axum's 2 MiB per-extractor default with a tighter,
+        // explicit cap.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
