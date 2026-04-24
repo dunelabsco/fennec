@@ -13,6 +13,8 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 
+use crate::providers::openai::is_reasoning_model as openai_is_reasoning_model;
+
 use super::traits::{Tool, ToolResult};
 
 /// Which vision backend to use (dispatched by provider name).
@@ -138,9 +140,17 @@ impl VisionTool {
 
     async fn analyze_openai(&self, image_b64: &str, mime: &str, question: &str) -> Result<String> {
         let data_url = format!("data:{};base64,{}", mime, image_b64);
+        // Reasoning-family models (o1/o3/o4-*, gpt-5*) REJECT `max_tokens`
+        // and require `max_completion_tokens` at the Chat Completions
+        // endpoint. See src/providers/openai.rs::is_reasoning_model.
+        let token_field = if openai_is_reasoning_model(&self.model) {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
         let body = json!({
             "model": self.model,
-            "max_tokens": 1024,
+            token_field: 1024,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -416,5 +426,16 @@ mod tests {
     fn tool_is_read_only() {
         let t = VisionTool::from_provider("anthropic", "sk-test".to_string(), None).unwrap();
         assert!(t.is_read_only());
+    }
+
+    #[test]
+    fn openai_reasoning_model_helper_matches_reasoning_families() {
+        // Sanity that the cross-module import works and classifies the
+        // families the vision tool actually cares about.
+        assert!(openai_is_reasoning_model("o1"));
+        assert!(openai_is_reasoning_model("o3-mini"));
+        assert!(openai_is_reasoning_model("gpt-5.1"));
+        assert!(!openai_is_reasoning_model("gpt-4o"));
+        assert!(!openai_is_reasoning_model("gpt-4o-mini"));
     }
 }

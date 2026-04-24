@@ -140,12 +140,28 @@ impl OpenAIProvider {
 
         messages.extend(Self::convert_messages(request.messages));
 
+        // Reasoning-family models (o1, o3, o4-*, gpt-5*) REJECT `max_tokens`
+        // at the Chat Completions endpoint and require `max_completion_tokens`
+        // instead. They also reject `temperature`. See Azure/OpenAI reasoning
+        // docs: "Reasoning models will only work with the
+        // max_completion_tokens parameter when using the Chat Completions API."
+        let token_field = if is_reasoning_model(&self.model) {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+
         let mut body = json!({
             "model": self.model,
-            "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
+            token_field: request.max_tokens,
             "messages": messages,
         });
+
+        // Only non-reasoning models accept `temperature` — reasoning models
+        // reject it at the API level.
+        if !is_reasoning_model(&self.model) {
+            body["temperature"] = json!(request.temperature);
+        }
 
         if stream {
             body["stream"] = json!(true);
@@ -228,6 +244,41 @@ impl OpenAIProvider {
             usage,
         })
     }
+}
+
+/// Return `true` for OpenAI model names that belong to the "reasoning"
+/// family — these models reject `max_tokens` (and `temperature`) at the
+/// Chat Completions endpoint and require `max_completion_tokens` instead.
+///
+/// Covered families (per Azure / OpenAI reasoning docs):
+///   - `o1`, `o1-mini`, `o1-preview`, `o1-pro`
+///   - `o3`, `o3-mini`, `o3-pro`
+///   - `o4-mini`
+///   - `gpt-5*` (gpt-5, gpt-5-mini, gpt-5.1, gpt-5.1-codex, gpt-5.2, ...)
+///
+/// Matching is on lowercase prefix, so dated snapshots
+/// (e.g. `o3-mini-2025-01-31`) and future variants are caught
+/// automatically. Non-reasoning models (`gpt-4o`, `gpt-4.1`, `gpt-3.5-*`,
+/// `chatgpt-4o-*`) return `false`.
+pub(crate) fn is_reasoning_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    // gpt-5* is always reasoning. (gpt-4* and gpt-3.5* are not.)
+    if m.starts_with("gpt-5") {
+        return true;
+    }
+    // o<N> families: match `oN` where the next char (if any) is `-` or a
+    // digit. This catches `o1`, `o1-mini`, `o3`, `o3-mini`, `o3-pro`,
+    // `o4-mini`, `o1-2024-12-17`, etc. — without false-matching unrelated
+    // model names that happen to start with `o` (e.g. some OpenRouter
+    // aliases).
+    for prefix in ["o1", "o3", "o4"] {
+        if let Some(rest) = m.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with('-') || rest.starts_with(char::is_numeric) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[async_trait]
@@ -543,5 +594,104 @@ mod tests {
         assert_eq!(converted[0]["type"], "function");
         assert_eq!(converted[0]["function"]["name"], "my_tool");
         assert_eq!(converted[0]["function"]["description"], "Does stuff");
+    }
+
+    #[test]
+    fn is_reasoning_model_o_series() {
+        assert!(is_reasoning_model("o1"));
+        assert!(is_reasoning_model("o1-mini"));
+        assert!(is_reasoning_model("o1-preview"));
+        assert!(is_reasoning_model("o1-pro"));
+        assert!(is_reasoning_model("o1-2024-12-17"));
+        assert!(is_reasoning_model("o3"));
+        assert!(is_reasoning_model("o3-mini"));
+        assert!(is_reasoning_model("o3-mini-2025-01-31"));
+        assert!(is_reasoning_model("o3-pro"));
+        assert!(is_reasoning_model("o4-mini"));
+    }
+
+    #[test]
+    fn is_reasoning_model_gpt5_family() {
+        assert!(is_reasoning_model("gpt-5"));
+        assert!(is_reasoning_model("gpt-5-mini"));
+        assert!(is_reasoning_model("gpt-5.1"));
+        assert!(is_reasoning_model("gpt-5.1-codex"));
+        assert!(is_reasoning_model("gpt-5.1-codex-max"));
+        assert!(is_reasoning_model("gpt-5.2"));
+    }
+
+    #[test]
+    fn is_reasoning_model_case_insensitive() {
+        assert!(is_reasoning_model("O1"));
+        assert!(is_reasoning_model("O3-Mini"));
+        assert!(is_reasoning_model("GPT-5.1"));
+    }
+
+    #[test]
+    fn is_reasoning_model_rejects_non_reasoning() {
+        // Chat / non-reasoning OpenAI models.
+        assert!(!is_reasoning_model("gpt-4o"));
+        assert!(!is_reasoning_model("gpt-4o-mini"));
+        assert!(!is_reasoning_model("gpt-4-turbo"));
+        assert!(!is_reasoning_model("gpt-4.1"));
+        assert!(!is_reasoning_model("gpt-3.5-turbo"));
+        assert!(!is_reasoning_model("chatgpt-4o-latest"));
+        // Unrelated OpenRouter / vendor aliases that happen to start with o.
+        assert!(!is_reasoning_model("ollama"));
+        assert!(!is_reasoning_model("openrouter/foo"));
+        assert!(!is_reasoning_model("oss-model"));
+        // Empty / garbage.
+        assert!(!is_reasoning_model(""));
+        assert!(!is_reasoning_model("claude-sonnet-4"));
+        assert!(!is_reasoning_model("llama3.1"));
+    }
+
+    #[test]
+    fn build_request_body_non_reasoning_uses_max_tokens() {
+        let p = OpenAIProvider::new("k".to_string(), Some("gpt-4o".to_string()), None, None);
+        let req = ChatRequest {
+            messages: &[],
+            system: None,
+            tools: None,
+            max_tokens: 1234,
+            temperature: 0.42,
+        };
+        let (_, body) = p.build_request_body(&req, false);
+        assert_eq!(body["max_tokens"], 1234);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert_eq!(body["temperature"], 0.42);
+    }
+
+    #[test]
+    fn build_request_body_reasoning_uses_max_completion_tokens_and_drops_temperature() {
+        let p = OpenAIProvider::new("k".to_string(), Some("o3-mini".to_string()), None, None);
+        let req = ChatRequest {
+            messages: &[],
+            system: None,
+            tools: None,
+            max_tokens: 1234,
+            temperature: 0.42,
+        };
+        let (_, body) = p.build_request_body(&req, false);
+        assert_eq!(body["max_completion_tokens"], 1234);
+        assert!(body.get("max_tokens").is_none());
+        // Reasoning models reject `temperature`; we must not send it.
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn build_request_body_gpt5_treated_as_reasoning() {
+        let p = OpenAIProvider::new("k".to_string(), Some("gpt-5.1".to_string()), None, None);
+        let req = ChatRequest {
+            messages: &[],
+            system: None,
+            tools: None,
+            max_tokens: 100,
+            temperature: 0.7,
+        };
+        let (_, body) = p.build_request_body(&req, false);
+        assert_eq!(body["max_completion_tokens"], 100);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none());
     }
 }
