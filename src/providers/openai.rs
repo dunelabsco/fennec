@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
+use super::sse::SseBuffer;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent, ToolCall, UsageInfo,
 };
@@ -230,6 +231,76 @@ impl OpenAIProvider {
     }
 }
 
+/// Dispatch one OpenAI streaming chunk payload.
+///
+/// Emits `Delta` / `ToolCallStart` / `ToolCallDelta` events for anything in
+/// `choice.delta`, then reports `true` if `choice.finish_reason` indicates
+/// the stream should terminate.
+///
+/// **Order matters**: the old implementation checked `finish_reason` first
+/// and `return`ed on `"stop"` / `"tool_calls"`, which dropped any tool-call
+/// arguments delta present in the *same* chunk. Processing the delta
+/// unconditionally before the terminator check means we never lose
+/// a tail.
+async fn dispatch_openai_chunk(
+    data: &Value,
+    tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+) -> bool {
+    let Some(choice) = data
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+    else {
+        return false;
+    };
+
+    if let Some(delta) = choice.get("delta") {
+        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+            if !content.is_empty() {
+                let _ = tx.send(StreamEvent::Delta(content.to_string())).await;
+            }
+        }
+
+        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+            for tc in tcs {
+                let id = tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let func = tc.get("function").unwrap_or(&Value::Null);
+
+                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                    let _ = tx
+                        .send(StreamEvent::ToolCallStart {
+                            id: id.clone(),
+                            name: name.to_string(),
+                        })
+                        .await;
+                }
+
+                if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                    if !args.is_empty() {
+                        let _ = tx
+                            .send(StreamEvent::ToolCallDelta {
+                                id: id.clone(),
+                                arguments_delta: args.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+        if matches!(reason, "stop" | "tool_calls" | "length" | "content_filter") {
+            return true;
+        }
+    }
+    false
+}
+
 #[async_trait]
 impl Provider for OpenAIProvider {
     fn name(&self) -> &str {
@@ -255,21 +326,34 @@ impl Provider for OpenAIProvider {
             .await
             .context("sending request to OpenAI-compatible API")?;
 
+        // Read raw bytes first so a non-JSON error body (proxy/gateway HTML
+        // 502, rate-limit plaintext, etc.) preserves HTTP status context.
         let status = response.status();
-        let response_body: Value = response
-            .json()
+        let raw_body = response
+            .bytes()
             .await
-            .context("parsing OpenAI API response")?;
+            .context("reading OpenAI API response body")?;
 
         if !status.is_success() {
-            let error_msg = response_body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
+            let error_msg = serde_json::from_slice::<Value>(&raw_body)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| {
+                    String::from_utf8_lossy(&raw_body)
+                        .chars()
+                        .take(200)
+                        .collect()
+                });
             anyhow::bail!("OpenAI API error ({}): {}", status, error_msg);
         }
 
+        let response_body: Value = serde_json::from_slice(&raw_body)
+            .context("parsing OpenAI API response as JSON")?;
         Self::parse_response(&response_body)
     }
 
@@ -309,15 +393,24 @@ impl Provider for OpenAIProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let response_body: Value = response
-                .json()
+            let raw_body = response
+                .bytes()
                 .await
-                .context("parsing OpenAI streaming error response")?;
-            let error_msg = response_body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
+                .context("reading OpenAI streaming error body")?;
+            let error_msg = serde_json::from_slice::<Value>(&raw_body)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| {
+                    String::from_utf8_lossy(&raw_body)
+                        .chars()
+                        .take(200)
+                        .collect()
+                });
             anyhow::bail!("OpenAI API error ({}): {}", status, error_msg);
         }
 
@@ -325,7 +418,7 @@ impl Provider for OpenAIProvider {
         let mut byte_stream = response.bytes_stream();
 
         tokio::spawn(async move {
-            let mut buffer = String::new();
+            let mut sse = SseBuffer::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -335,13 +428,13 @@ impl Provider for OpenAIProvider {
                         return;
                     }
                 };
+                sse.extend(&chunk);
 
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                // Process complete lines from the SSE stream.
-                while let Some(newline_pos) = buffer.find('\n') {
-                    let line = buffer[..newline_pos].trim_end().to_string();
-                    buffer = buffer[newline_pos + 1..].to_string();
+                while let Some(line_bytes) = sse.next_line() {
+                    let line = match std::str::from_utf8(&line_bytes) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
 
                     let data_str = match line.strip_prefix("data: ") {
                         Some(s) => s,
@@ -358,72 +451,17 @@ impl Provider for OpenAIProvider {
                         Err(_) => continue,
                     };
 
-                    // Extract the first choice's delta.
-                    let choice = match data
-                        .get("choices")
-                        .and_then(|c| c.as_array())
-                        .and_then(|arr| arr.first())
-                    {
-                        Some(c) => c,
-                        None => continue,
-                    };
-
-                    // Check finish_reason.
-                    if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                        if reason == "stop" || reason == "tool_calls" {
-                            let _ = tx.send(StreamEvent::Done).await;
-                            return;
-                        }
-                    }
-
-                    if let Some(delta) = choice.get("delta") {
-                        // Text content delta.
-                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                            if !content.is_empty() {
-                                let _ = tx.send(StreamEvent::Delta(content.to_string())).await;
-                            }
-                        }
-
-                        // Tool call deltas.
-                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                            for tc in tcs {
-                                let id = tc
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let func = tc.get("function").unwrap_or(&Value::Null);
-
-                                // If function.name is present, this is the start.
-                                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                    let _ = tx
-                                        .send(StreamEvent::ToolCallStart {
-                                            id: id.clone(),
-                                            name: name.to_string(),
-                                        })
-                                        .await;
-                                }
-
-                                // If function.arguments is present, emit delta.
-                                if let Some(args) =
-                                    func.get("arguments").and_then(|a| a.as_str())
-                                {
-                                    if !args.is_empty() {
-                                        let _ = tx
-                                            .send(StreamEvent::ToolCallDelta {
-                                                id: id.clone(),
-                                                arguments_delta: args.to_string(),
-                                            })
-                                            .await;
-                                    }
-                                }
-                            }
-                        }
+                    if dispatch_openai_chunk(&data, &tx).await {
+                        // finish_reason observed — still prefer [DONE] as
+                        // the authoritative terminator when the server
+                        // sends it, but close now so we don't hang if it
+                        // doesn't.
+                        let _ = tx.send(StreamEvent::Done).await;
+                        return;
                     }
                 }
             }
 
-            // If we exit without [DONE], send Done anyway.
             let _ = tx.send(StreamEvent::Done).await;
         });
 
@@ -543,5 +581,90 @@ mod tests {
         assert_eq!(converted[0]["type"], "function");
         assert_eq!(converted[0]["function"]["name"], "my_tool");
         assert_eq!(converted[0]["function"]["description"], "Does stuff");
+    }
+
+    /// Drain a receiver after a dispatch call into a Vec<StreamEvent>.
+    async fn drain(
+        rx: &mut tokio::sync::mpsc::Receiver<StreamEvent>,
+    ) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn dispatch_emits_delta_then_reports_termination() {
+        // Realistic "final" chunk: contains tool-call args AND finish_reason.
+        // Previous impl would return early on finish_reason and lose the
+        // arguments delta.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let data = json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"SF\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let terminate = dispatch_openai_chunk(&data, &tx).await;
+        let events = drain(&mut rx).await;
+        assert!(terminate, "finish_reason=tool_calls should signal termination");
+        // We must have seen both Start and Delta before termination.
+        assert!(events.iter().any(|e| matches!(e,
+            StreamEvent::ToolCallStart { id, name } if id == "call_1" && name == "get_weather"
+        )), "missing ToolCallStart: {:?}", events);
+        assert!(events.iter().any(|e| matches!(e,
+            StreamEvent::ToolCallDelta { id, arguments_delta }
+                if id == "call_1" && arguments_delta.contains("SF")
+        )), "missing ToolCallDelta — regression of the early-return bug: {:?}", events);
+    }
+
+    #[tokio::test]
+    async fn dispatch_content_delta_then_stop() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let data = json!({
+            "choices": [{
+                "delta": { "content": "Hello!" },
+                "finish_reason": "stop"
+            }]
+        });
+        let terminate = dispatch_openai_chunk(&data, &tx).await;
+        let events = drain(&mut rx).await;
+        assert!(terminate);
+        assert!(matches!(&events[0], StreamEvent::Delta(s) if s == "Hello!"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_no_finish_reason_does_not_terminate() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let data = json!({
+            "choices": [{
+                "delta": { "content": "partial..." }
+            }]
+        });
+        let terminate = dispatch_openai_chunk(&data, &tx).await;
+        let events = drain(&mut rx).await;
+        assert!(!terminate);
+        assert!(matches!(&events[0], StreamEvent::Delta(s) if s == "partial..."));
+    }
+
+    #[tokio::test]
+    async fn dispatch_handles_length_and_content_filter_as_terminators() {
+        // These reasons were NOT recognized by the old code; some models
+        // (especially safety-gated paths) report them.
+        for reason in ["length", "content_filter"] {
+            let (tx, mut _rx) = tokio::sync::mpsc::channel::<StreamEvent>(4);
+            let data = json!({ "choices": [{ "delta": {}, "finish_reason": reason }] });
+            let terminate = dispatch_openai_chunk(&data, &tx).await;
+            assert!(terminate, "finish_reason={} should terminate", reason);
+        }
     }
 }

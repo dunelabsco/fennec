@@ -219,20 +219,35 @@ impl Provider for OllamaProvider {
             .await
             .context("sending request to Ollama API")?;
 
+        // Read bytes first. Ollama normally returns JSON, but if the server
+        // is offline / behind a reverse proxy that returned HTML, the old
+        // `.json()`-first path produced a misleading parse error that hid
+        // the real HTTP status.
         let status = response.status();
-        let response_body: Value = response
-            .json()
+        let raw_body = response
+            .bytes()
             .await
-            .context("parsing Ollama API response")?;
+            .context("reading Ollama API response body")?;
 
         if !status.is_success() {
-            let error_msg = response_body
-                .get("error")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
+            let error_msg = serde_json::from_slice::<Value>(&raw_body)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| {
+                    String::from_utf8_lossy(&raw_body)
+                        .chars()
+                        .take(200)
+                        .collect()
+                });
             anyhow::bail!("Ollama API error ({}): {}", status, error_msg);
         }
 
+        let response_body: Value = serde_json::from_slice(&raw_body)
+            .context("parsing Ollama API response as JSON")?;
         Self::parse_response(&response_body)
     }
 
