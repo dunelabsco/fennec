@@ -11,10 +11,13 @@
 //! key availability (Copy the image_gen pattern).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+
+use crate::security::PathSandbox;
 
 use super::traits::{Tool, ToolResult};
 
@@ -40,6 +43,9 @@ pub struct TranscribeAudioTool {
     api_key: String,
     client: reqwest::Client,
     model: String,
+    /// Applied to the `audio_path` param before upload so a prompt-injected
+    /// path like ~/.ssh/id_rsa can't be sent to OpenAI.
+    sandbox: Arc<PathSandbox>,
 }
 
 impl TranscribeAudioTool {
@@ -55,7 +61,13 @@ impl TranscribeAudioTool {
             api_key,
             client,
             model: model.unwrap_or_else(|| "whisper-1".to_string()),
+            sandbox: Arc::new(PathSandbox::empty()),
         })
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 }
 
@@ -101,7 +113,18 @@ impl Tool for TranscribeAudioTool {
         };
         let language = args.get("language").and_then(|v| v.as_str()).unwrap_or("");
 
-        let bytes = match tokio::fs::read(&audio_path).await {
+        let resolved = match self.sandbox.check(Path::new(&audio_path)) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("path rejected by sandbox: {}", e)),
+                });
+            }
+        };
+
+        let bytes = match tokio::fs::read(&resolved).await {
             Ok(b) => b,
             Err(e) => {
                 return Ok(ToolResult {

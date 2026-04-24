@@ -1,20 +1,44 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::{Path, PathBuf};
+
+use crate::security::PathSandbox;
 
 use super::traits::{Tool, ToolResult};
+
+const MAX_READ_BYTES: usize = 10 * 1024 * 1024; // 10 MB hard cap on reads
+const MAX_WRITE_BYTES: usize = 10 * 1024 * 1024; // 10 MB hard cap on writes
+
+/// Convert a sandbox check error into a user-visible error line. The
+/// canonical-path detail is preserved so the LLM knows which path was
+/// rejected; the specific denylist pattern is shown too so the user can
+/// adjust `security.forbidden_paths` if needed.
+fn sandbox_err(e: anyhow::Error) -> String {
+    format!("path rejected by sandbox: {}", e)
+}
 
 // ---------------------------------------------------------------------------
 // ReadFileTool
 // ---------------------------------------------------------------------------
 
 /// Reads the contents of a file. Output is truncated if the file is too large.
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    sandbox: Arc<PathSandbox>,
+}
 
 impl ReadFileTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            sandbox: Arc::new(PathSandbox::empty()),
+        }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 }
 
@@ -51,11 +75,27 @@ impl Tool for ReadFileTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: path"))?;
 
-        match tokio::fs::read_to_string(path).await {
+        let resolved = match self.sandbox.check(Path::new(path)) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(sandbox_err(e)),
+                });
+            }
+        };
+
+        match tokio::fs::read_to_string(&resolved).await {
             Ok(content) => {
-                let output = if content.len() > 50_000 {
-                    let truncated = &content[..50_000];
-                    format!("{truncated}\n\n... [truncated, file is {} bytes]", content.len())
+                let total = content.len();
+                let output = if total > MAX_READ_BYTES {
+                    let cut = char_boundary_prefix(&content, MAX_READ_BYTES);
+                    format!(
+                        "{cut}\n\n... [truncated, file is {total} bytes]",
+                        cut = cut,
+                        total = total
+                    )
                 } else {
                     content
                 };
@@ -74,16 +114,39 @@ impl Tool for ReadFileTool {
     }
 }
 
+/// Take a prefix of `s` up to `max_bytes` bytes, falling back to the
+/// nearest char boundary at or before that index so we never split a
+/// multibyte character.
+fn char_boundary_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut idx = max_bytes;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    &s[..idx]
+}
+
 // ---------------------------------------------------------------------------
 // WriteFileTool
 // ---------------------------------------------------------------------------
 
 /// Writes content to a file, creating parent directories as needed.
-pub struct WriteFileTool;
+pub struct WriteFileTool {
+    sandbox: Arc<PathSandbox>,
+}
 
 impl WriteFileTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            sandbox: Arc::new(PathSandbox::empty()),
+        }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 }
 
@@ -124,16 +187,37 @@ impl Tool for WriteFileTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: content"))?;
 
-        let file_path = Path::new(path);
+        if content.len() > MAX_WRITE_BYTES {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "refusing to write {} bytes — exceeds cap of {}",
+                    content.len(),
+                    MAX_WRITE_BYTES
+                )),
+            });
+        }
+
+        let resolved = match self.sandbox.check(Path::new(path)) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(sandbox_err(e)),
+                });
+            }
+        };
 
         // Create parent directories if they don't exist.
-        if let Some(parent) = file_path.parent() {
+        if let Some(parent) = resolved.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await?;
             }
         }
 
-        match tokio::fs::write(file_path, content).await {
+        match tokio::fs::write(&resolved, content).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("wrote {} bytes to {path}", content.len()),
@@ -153,11 +237,20 @@ impl Tool for WriteFileTool {
 // ---------------------------------------------------------------------------
 
 /// Lists directory entries, appending `/` to directory names.
-pub struct ListDirTool;
+pub struct ListDirTool {
+    sandbox: Arc<PathSandbox>,
+}
 
 impl ListDirTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            sandbox: Arc::new(PathSandbox::empty()),
+        }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 }
 
@@ -194,8 +287,19 @@ impl Tool for ListDirTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: path"))?;
 
+        let resolved = match self.sandbox.check(Path::new(path)) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(sandbox_err(e)),
+                });
+            }
+        };
+
         let mut entries = Vec::new();
-        let mut read_dir = match tokio::fs::read_dir(path).await {
+        let mut read_dir = match tokio::fs::read_dir(&resolved).await {
             Ok(rd) => rd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -232,11 +336,20 @@ impl Tool for ListDirTool {
 
 /// Replaces a unique occurrence of `old_text` with `new_text` in a file.
 /// Fails if `old_text` is not found or appears more than once.
-pub struct EditFileTool;
+pub struct EditFileTool {
+    sandbox: Arc<PathSandbox>,
+}
 
 impl EditFileTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            sandbox: Arc::new(PathSandbox::empty()),
+        }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 }
 
@@ -286,7 +399,18 @@ impl Tool for EditFileTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: new_text"))?;
 
-        let content = match tokio::fs::read_to_string(path).await {
+        let resolved = match self.sandbox.check(Path::new(path)) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(sandbox_err(e)),
+                });
+            }
+        };
+
+        let content = match tokio::fs::read_to_string(&resolved).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult {
@@ -316,7 +440,7 @@ impl Tool for EditFileTool {
         }
 
         let new_content = content.replacen(old_text, new_text, 1);
-        match tokio::fs::write(path, &new_content).await {
+        match tokio::fs::write(&resolved, &new_content).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("edited {path}: replaced 1 occurrence"),
@@ -336,11 +460,20 @@ impl Tool for EditFileTool {
 // ---------------------------------------------------------------------------
 
 /// Searches for files matching a glob pattern.
-pub struct GlobTool;
+pub struct GlobTool {
+    sandbox: Arc<PathSandbox>,
+}
 
 impl GlobTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            sandbox: Arc::new(PathSandbox::empty()),
+        }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 }
 
@@ -392,13 +525,24 @@ impl Tool for GlobTool {
             .and_then(|v| v.as_str())
             .unwrap_or(".");
 
+        // Validate the base path is not denied. (The pattern itself may
+        // escape base via '..' or '/'; we re-check each match after the
+        // glob runs.)
+        if let Err(e) = self.sandbox.check(Path::new(base)) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(sandbox_err(e)),
+            });
+        }
+
         let full_pattern = if pattern.starts_with('/') || pattern.starts_with('.') {
             pattern.to_string()
         } else {
             format!("{base}/{pattern}")
         };
 
-        // Run the glob in a blocking task since it does filesystem I/O.
+        let sandbox = Arc::clone(&self.sandbox);
         let full_pattern_clone = full_pattern.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut paths = Vec::new();
@@ -406,7 +550,15 @@ impl Tool for GlobTool {
                 Ok(entries) => {
                     for entry in entries {
                         match entry {
-                            Ok(path) => paths.push(path.display().to_string()),
+                            Ok(path) => {
+                                // Re-check every matched path — glob can
+                                // resolve to files outside the original
+                                // base (via '..' or symlinks).
+                                if sandbox.check(&path).is_err() {
+                                    continue;
+                                }
+                                paths.push(path.display().to_string());
+                            }
                             Err(e) => {
                                 tracing::debug!("glob entry error: {e}");
                             }
@@ -425,7 +577,6 @@ impl Tool for GlobTool {
                 let output = if paths.is_empty() {
                     "no files matched".to_string()
                 } else {
-                    // Limit output to first 500 entries.
                     let display: Vec<&str> = paths.iter().take(500).map(|s| s.as_str()).collect();
                     let mut out = display.join("\n");
                     if count > 500 {
@@ -453,11 +604,20 @@ impl Tool for GlobTool {
 // ---------------------------------------------------------------------------
 
 /// Recursively searches files for a regex pattern and returns matching lines.
-pub struct GrepTool;
+pub struct GrepTool {
+    sandbox: Arc<PathSandbox>,
+}
 
 impl GrepTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            sandbox: Arc::new(PathSandbox::empty()),
+        }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 }
 
@@ -514,12 +674,19 @@ impl Tool for GrepTool {
             .unwrap_or(".")
             .to_string();
 
+        if let Err(e) = self.sandbox.check(Path::new(&base_path)) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(sandbox_err(e)),
+            });
+        }
+
         let file_type = args
             .get("file_type")
             .and_then(|v| v.as_str())
             .map(|s| format!(".{s}"));
 
-        // Compile the regex.
         let regex = match regex::Regex::new(&pattern_str) {
             Ok(r) => r,
             Err(e) => {
@@ -531,11 +698,11 @@ impl Tool for GrepTool {
             }
         };
 
-        // Run the search in a blocking task.
+        let sandbox = Arc::clone(&self.sandbox);
         let result = tokio::task::spawn_blocking(move || {
             let mut matches = Vec::new();
             let path = PathBuf::from(&base_path);
-            grep_recursive(&path, &regex, file_type.as_deref(), &mut matches, 0);
+            grep_recursive(&path, &regex, file_type.as_deref(), &mut matches, 0, &sandbox);
             matches
         })
         .await?;
@@ -564,13 +731,15 @@ impl Tool for GrepTool {
 }
 
 /// Recursively search a directory for regex matches. `depth` guards against
-/// excessive recursion.
+/// excessive recursion. Each file/dir is re-checked against the sandbox
+/// (symlink traversal might otherwise lead into a denied area).
 fn grep_recursive(
     path: &Path,
     regex: &regex::Regex,
     file_type: Option<&str>,
     matches: &mut Vec<String>,
     depth: usize,
+    sandbox: &PathSandbox,
 ) {
     const MAX_DEPTH: usize = 20;
     const MAX_MATCHES: usize = 1000;
@@ -579,8 +748,22 @@ fn grep_recursive(
         return;
     }
 
+    // Re-validate each path — a symlink inside the starting tree could
+    // resolve into a denied area.
+    if sandbox.check(path).is_err() {
+        return;
+    }
+
+    // Skip symlinks outright to avoid cycles and filesystem escapes that
+    // the check() sandbox-canonicalize alone can't always detect (e.g.
+    // a symlink whose target doesn't match any denylist substring).
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => return,
+        Err(_) => return,
+        _ => {}
+    }
+
     if path.is_file() {
-        // Apply file type filter.
         if let Some(ext) = file_type {
             let file_ext = path
                 .extension()
@@ -591,7 +774,6 @@ fn grep_recursive(
             }
         }
 
-        // Skip binary/large files.
         let metadata = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(_) => return,
@@ -612,8 +794,6 @@ fn grep_recursive(
             }
         }
     } else if path.is_dir() {
-        // Skip hidden directories and common ignores (but not the starting
-        // directory itself, which may be "." at depth 0).
         if depth > 0 {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.starts_with('.') || name == "node_modules" || name == "target" {
@@ -626,8 +806,125 @@ fn grep_recursive(
             let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
             sorted.sort_by_key(|e| e.file_name());
             for entry in sorted {
-                grep_recursive(&entry.path(), regex, file_type, matches, depth + 1);
+                grep_recursive(&entry.path(), regex, file_type, matches, depth + 1, sandbox);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn denylist() -> Arc<PathSandbox> {
+        Arc::new(PathSandbox::new(vec![
+            "/etc".to_string(),
+            ".ssh".to_string(),
+            ".fennec/.secret_key".to_string(),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn read_rejects_denied_path() {
+        let tool = ReadFileTool::new().with_sandbox(denylist());
+        let r = tool
+            .execute(json!({"path": "/etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("sandbox"));
+    }
+
+    #[tokio::test]
+    async fn write_rejects_denied_path() {
+        let tool = WriteFileTool::new().with_sandbox(denylist());
+        let r = tool
+            .execute(json!({
+                "path": "/etc/rogue.conf",
+                "content": "injected"
+            }))
+            .await
+            .unwrap();
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("sandbox"));
+    }
+
+    #[tokio::test]
+    async fn list_dir_rejects_denied_path() {
+        let tool = ListDirTool::new().with_sandbox(denylist());
+        let r = tool.execute(json!({"path": "/etc"})).await.unwrap();
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("sandbox"));
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_denied_path() {
+        let tool = EditFileTool::new().with_sandbox(denylist());
+        let r = tool
+            .execute(json!({
+                "path": "/etc/hosts",
+                "old_text": "localhost",
+                "new_text": "evil.example"
+            }))
+            .await
+            .unwrap();
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("sandbox"));
+    }
+
+    #[tokio::test]
+    async fn read_accepts_benign_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("ok.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let tool = ReadFileTool::new().with_sandbox(denylist());
+        let r = tool
+            .execute(json!({"path": file.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(r.success, "err: {:?}", r.error);
+        assert_eq!(r.output, "hello");
+    }
+
+    #[tokio::test]
+    async fn write_rejects_oversize_content() {
+        let tool = WriteFileTool::new();
+        let big = "a".repeat(MAX_WRITE_BYTES + 1);
+        let r = tool
+            .execute(json!({
+                "path": "/tmp/fennec-oversize-test",
+                "content": big
+            }))
+            .await
+            .unwrap();
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("cap"));
+    }
+
+    #[test]
+    fn char_boundary_prefix_handles_multibyte() {
+        let s = "日本語";
+        // "日" is 3 bytes; ask for prefix of 2 bytes — must not split.
+        assert_eq!(char_boundary_prefix(s, 2), "");
+        // 3 bytes exactly: just "日".
+        assert_eq!(char_boundary_prefix(s, 3), "日");
+        // 4 bytes: still just "日" (since 4 isn't a boundary either; next is at 6).
+        assert_eq!(char_boundary_prefix(s, 4), "日");
+        // 6 bytes: "日本".
+        assert_eq!(char_boundary_prefix(s, 6), "日本");
+    }
+
+    #[tokio::test]
+    async fn read_without_sandbox_accepts_anything() {
+        // Back-compat: a default ReadFileTool (no sandbox wired) still works.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("ok.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let tool = ReadFileTool::new();
+        let r = tool
+            .execute(json!({"path": file.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(r.success);
     }
 }

@@ -6,17 +6,23 @@
 //! header, no full decode.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::security::PathSandbox;
+
 use super::traits::{Tool, ToolResult};
 
 pub struct ImageInfoTool {
     client: reqwest::Client,
     temp_dir: PathBuf,
+    /// Applied to local-path sources only; URL fetches use the tool's own
+    /// temp dir.
+    sandbox: Arc<PathSandbox>,
 }
 
 impl ImageInfoTool {
@@ -25,7 +31,16 @@ impl ImageInfoTool {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("build reqwest client for image_info");
-        Self { client, temp_dir }
+        Self {
+            client,
+            temp_dir,
+            sandbox: Arc::new(PathSandbox::empty()),
+        }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     async fn load_bytes(&self, source: &str) -> Result<(Vec<u8>, Option<PathBuf>)> {
@@ -37,7 +52,11 @@ impl ImageInfoTool {
             tokio::fs::write(&path, &bytes).await?;
             Ok((bytes, Some(path)))
         } else {
-            let bytes = tokio::fs::read(source).await?;
+            let resolved = self
+                .sandbox
+                .check(Path::new(source))
+                .map_err(|e| anyhow::anyhow!("path rejected by sandbox: {}", e))?;
+            let bytes = tokio::fs::read(&resolved).await?;
             Ok((bytes, None))
         }
     }
