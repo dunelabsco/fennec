@@ -47,6 +47,9 @@ native-tls = "0.2"
 base64 = "0.22"
 pdf-extract = "0.7"
 imagesize = "0.14"
+# Maintained fork of the (now unmaintained) serde_yaml crate. Used for
+# parsing YAML frontmatter in skill files.
+serde_yaml_ng = "0.10"
 
 [dev-dependencies]
 tempfile = "3.15"
