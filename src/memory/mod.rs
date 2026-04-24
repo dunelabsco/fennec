@@ -6,6 +6,7 @@ pub mod embedding;
 pub mod consolidation;
 pub mod experience;
 pub mod snapshot;
+pub mod fts;
 
 pub use traits::{Memory, MemoryEntry, MemoryCategory};
 pub use embedding::{EmbeddingProvider, NoopEmbedding, OpenAIEmbedding};

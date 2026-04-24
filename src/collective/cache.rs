@@ -75,16 +75,9 @@ impl CollectiveCache {
         let query = query.to_string();
 
         tokio::task::spawn_blocking(move || {
-            // Build FTS5 query: wrap each word in quotes, join with OR.
-            let fts_query: String = query
-                .split_whitespace()
-                .map(|w| format!("\"{}\"", w))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-
-            if fts_query.is_empty() {
+            let Some(fts_query) = crate::memory::fts::build_match_query(&query) else {
                 return Ok(vec![]);
-            }
+            };
 
             let conn = conn.lock();
             let mut stmt = conn.prepare(

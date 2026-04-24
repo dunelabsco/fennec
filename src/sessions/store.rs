@@ -26,6 +26,12 @@ pub struct SessionRecord {
 }
 
 /// SQLite-backed session store with FTS5 search.
+///
+/// All read/write methods are `async` and internally delegate to
+/// `tokio::task::spawn_blocking` so that holding the connection mutex
+/// during a synchronous SQLite operation does not block a tokio worker
+/// thread. The `&self` methods are therefore safe to call from any
+/// async context (agent loop, Telegram handler, etc.).
 pub struct SessionStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -42,10 +48,16 @@ impl SessionStore {
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening sessions db at {}", db_path.display()))?;
 
+        // Performance + integrity PRAGMAs. `foreign_keys = ON` is required
+        // for the declared `session_messages.session_id REFERENCES
+        // sessions(id)` clause to actually be enforced — without it SQLite
+        // parses the constraint but never checks it, so orphan messages
+        // pointing at a deleted or never-created session can accumulate.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA temp_store = MEMORY;",
+             PRAGMA temp_store = MEMORY;
+             PRAGMA foreign_keys = ON;",
         )
         .context("applying PRAGMAs")?;
 
@@ -98,109 +110,129 @@ impl SessionStore {
     }
 
     /// Create a new session for the given channel. Returns the session ID.
-    pub fn create_session(&self, channel: &str) -> Result<String> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO sessions (id, channel, started_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![id, channel, now],
-        )
-        .context("inserting session")?;
-        Ok(id)
+    pub async fn create_session(&self, channel: &str) -> Result<String> {
+        let conn = Arc::clone(&self.conn);
+        let channel = channel.to_string();
+        tokio::task::spawn_blocking(move || {
+            let id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO sessions (id, channel, started_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, channel, now],
+            )
+            .context("inserting session")?;
+            Ok::<_, anyhow::Error>(id)
+        })
+        .await?
     }
 
     /// Add a message to an existing session.
-    pub fn add_message(&self, session_id: &str, role: &str, content: &str) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO session_messages (session_id, role, content, timestamp)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![session_id, role, content, now],
-        )
-        .context("inserting session message")?;
-        Ok(())
+    pub async fn add_message(&self, session_id: &str, role: &str, content: &str) -> Result<()> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        let role = role.to_string();
+        let content = content.to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now().to_rfc3339();
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO session_messages (session_id, role, content, timestamp)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![session_id, role, content, now],
+            )
+            .context("inserting session message")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
     }
 
     /// Mark a session as ended, optionally attaching a summary.
-    pub fn end_session(&self, session_id: &str, summary: Option<&str>) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE sessions SET ended_at = ?1, summary = ?2 WHERE id = ?3",
-            rusqlite::params![now, summary, session_id],
-        )
-        .context("ending session")?;
-        Ok(())
+    pub async fn end_session(&self, session_id: &str, summary: Option<&str>) -> Result<()> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        let summary = summary.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now().to_rfc3339();
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE sessions SET ended_at = ?1, summary = ?2 WHERE id = ?3",
+                rusqlite::params![now, summary, session_id],
+            )
+            .context("ending session")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
     }
 
     /// Full-text search across all session messages. Returns results ranked by
     /// BM25 relevance score.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let fts_query: String = query
-            .split_whitespace()
-            .map(|w| format!("\"{}\"", w))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-
-        if fts_query.is_empty() {
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let Some(fts_query) = crate::memory::fts::build_match_query(query) else {
             return Ok(vec![]);
-        }
+        };
 
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT m.session_id, m.role, m.content, m.timestamp, bm25(session_messages_fts) AS score
-             FROM session_messages_fts AS f
-             JOIN session_messages AS m ON m.id = f.rowid
-             WHERE session_messages_fts MATCH ?1
-             ORDER BY score
-             LIMIT ?2",
-        )?;
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT m.session_id, m.role, m.content, m.timestamp, bm25(session_messages_fts) AS score
+                 FROM session_messages_fts AS f
+                 JOIN session_messages AS m ON m.id = f.rowid
+                 WHERE session_messages_fts MATCH ?1
+                 ORDER BY score
+                 LIMIT ?2",
+            )?;
 
-        let rows = stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
-            let raw_score: f64 = row.get(4)?;
-            Ok(SearchHit {
-                session_id: row.get(0)?,
-                role: row.get(1)?,
-                content: row.get(2)?,
-                timestamp: row.get(3)?,
-                score: -raw_score, // negate BM25 so higher = more relevant
-            })
-        })?;
+            let rows = stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
+                let raw_score: f64 = row.get(4)?;
+                Ok(SearchHit {
+                    session_id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    timestamp: row.get(3)?,
+                    score: -raw_score, // negate BM25 so higher = more relevant
+                })
+            })?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok::<_, anyhow::Error>(results)
+        })
+        .await?
     }
 
     /// List the most recent sessions.
-    pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, channel, started_at, ended_at, summary
-             FROM sessions
-             ORDER BY started_at DESC
-             LIMIT ?1",
-        )?;
+    pub async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, channel, started_at, ended_at, summary
+                 FROM sessions
+                 ORDER BY started_at DESC
+                 LIMIT ?1",
+            )?;
 
-        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
-            Ok(SessionRecord {
-                id: row.get(0)?,
-                channel: row.get(1)?,
-                started_at: row.get(2)?,
-                ended_at: row.get(3)?,
-                summary: row.get(4)?,
-            })
-        })?;
+            let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+                Ok(SessionRecord {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    started_at: row.get(2)?,
+                    ended_at: row.get(3)?,
+                    summary: row.get(4)?,
+                })
+            })?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok::<_, anyhow::Error>(results)
+        })
+        .await?
     }
 }
 
@@ -216,41 +248,44 @@ mod tests {
         (store, dir)
     }
 
-    #[test]
-    fn create_and_list_sessions() {
+    #[tokio::test]
+    async fn create_and_list_sessions() {
         let (store, _dir) = make_store();
-        let id = store.create_session("telegram").unwrap();
-        let sessions = store.list_sessions(10).unwrap();
+        let id = store.create_session("telegram").await.unwrap();
+        let sessions = store.list_sessions(10).await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, id);
         assert_eq!(sessions[0].channel, "telegram");
         assert!(sessions[0].ended_at.is_none());
     }
 
-    #[test]
-    fn add_message_and_search() {
+    #[tokio::test]
+    async fn add_message_and_search() {
         let (store, _dir) = make_store();
-        let sid = store.create_session("cli").unwrap();
+        let sid = store.create_session("cli").await.unwrap();
         store
             .add_message(&sid, "user", "How do I configure Fennec?")
+            .await
             .unwrap();
         store
             .add_message(&sid, "assistant", "You can edit fennec.toml to configure Fennec.")
+            .await
             .unwrap();
 
-        let hits = store.search("configure Fennec", 10).unwrap();
+        let hits = store.search("configure Fennec", 10).await.unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].content.contains("Fennec"));
     }
 
-    #[test]
-    fn end_session_with_summary() {
+    #[tokio::test]
+    async fn end_session_with_summary() {
         let (store, _dir) = make_store();
-        let sid = store.create_session("discord").unwrap();
+        let sid = store.create_session("discord").await.unwrap();
         store
             .end_session(&sid, Some("Discussed configuration"))
+            .await
             .unwrap();
-        let sessions = store.list_sessions(10).unwrap();
+        let sessions = store.list_sessions(10).await.unwrap();
         assert!(sessions[0].ended_at.is_some());
         assert_eq!(
             sessions[0].summary.as_deref(),
@@ -258,10 +293,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn search_empty_query_returns_empty() {
+    #[tokio::test]
+    async fn search_empty_query_returns_empty() {
         let (store, _dir) = make_store();
-        let hits = store.search("", 10).unwrap();
+        let hits = store.search("", 10).await.unwrap();
         assert!(hits.is_empty());
+    }
+
+    /// Regression: a user query containing `"` used to produce an
+    /// FTS5 syntax error because the hand-rolled tokenizer emitted
+    /// `"foo"bar"` instead of a safe quoted phrase. Now strips the
+    /// inner quote and searches for `"foobar"`.
+    #[tokio::test]
+    async fn search_tolerates_embedded_quote() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        store.add_message(&sid, "user", "foobar works fine").await.unwrap();
+        let hits = store.search("foo\"bar", 10).await.unwrap();
+        // Either finds the message or returns empty — the critical
+        // invariant is that the call does not error.
+        let _ = hits;
+    }
+
+    /// Regression: the store's FK declaration (session_messages
+    /// REFERENCES sessions) was not being enforced because
+    /// `PRAGMA foreign_keys = ON` was missing. Inserting a message
+    /// pointing at a non-existent session must now fail.
+    #[tokio::test]
+    async fn foreign_key_constraint_is_enforced() {
+        let (store, _dir) = make_store();
+        let r = store
+            .add_message("non-existent-session-id", "user", "oops")
+            .await;
+        assert!(
+            r.is_err(),
+            "message with dangling session_id must be rejected (got Ok) — PRAGMA foreign_keys not applied?"
+        );
     }
 }
