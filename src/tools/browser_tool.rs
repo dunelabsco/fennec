@@ -17,18 +17,26 @@ pub struct BrowserTool {
 
 impl BrowserTool {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; Fennec/0.1; +https://fennec.dev)")
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .expect("build reqwest client for browser tool");
-        Self { client }
+        Self {
+            client: super::http::shared_client(),
+        }
     }
 
     /// Fetch a URL, strip HTML tags, collapse whitespace, and truncate.
     async fn fetch_and_extract(&self, url: &str) -> Result<String> {
-        let response = self.client.get(url).send().await?;
+        // Browser-shaped UA; some sites serve degraded HTML to the
+        // generic Fennec UA but cooperate when they see a Mozilla token.
+        // Per-request override of the shared client's default UA.
+        let response = self
+            .client
+            .get(url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (compatible; Fennec/0.1; +https://fennec.dev)",
+            )
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await?;
         let status = response.status();
         if !status.is_success() {
             anyhow::bail!("HTTP {status}");

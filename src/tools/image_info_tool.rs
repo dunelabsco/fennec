@@ -21,17 +21,24 @@ pub struct ImageInfoTool {
 
 impl ImageInfoTool {
     pub fn new(temp_dir: PathBuf) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("build reqwest client for image_info");
-        Self { client, temp_dir }
+        Self {
+            client: super::http::shared_client(),
+            temp_dir,
+        }
     }
 
     async fn load_bytes(&self, source: &str) -> Result<(Vec<u8>, Option<PathBuf>)> {
         if source.starts_with("http://") || source.starts_with("https://") {
             tokio::fs::create_dir_all(&self.temp_dir).await?;
-            let bytes = self.client.get(source).send().await?.bytes().await?.to_vec();
+            let bytes = self
+                .client
+                .get(source)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await?
+                .bytes()
+                .await?
+                .to_vec();
             let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
             let path = self.temp_dir.join(format!("imginfo_{}", ts));
             tokio::fs::write(&path, &bytes).await?;

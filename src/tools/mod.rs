@@ -1,4 +1,5 @@
 pub mod traits;
+pub mod http;
 pub mod shell;
 pub mod files;
 pub mod web;

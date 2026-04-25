@@ -58,10 +58,7 @@ impl VisionTool {
             VisionBackend::Anthropic => "claude-sonnet-4-20250514".to_string(),
             VisionBackend::OpenAi => "gpt-4o".to_string(),
         });
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .expect("build reqwest client for vision tool");
+        let client = super::http::shared_client();
         Some(Self {
             backend,
             api_key,
@@ -76,7 +73,12 @@ impl VisionTool {
     /// fetched via reqwest; paths are read from disk.
     async fn load_image(&self, source: &str) -> Result<(Vec<u8>, String)> {
         if source.starts_with("http://") || source.starts_with("https://") {
-            let resp = self.client.get(source).send().await?;
+            let resp = self
+                .client
+                .get(source)
+                .timeout(std::time::Duration::from_secs(60))
+                .send()
+                .await?;
             let mime = resp
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -117,6 +119,7 @@ impl VisionTool {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
+            .timeout(std::time::Duration::from_secs(60))
             .json(&body)
             .send()
             .await?;
@@ -154,6 +157,7 @@ impl VisionTool {
             .post("https://api.openai.com/v1/chat/completions")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
+            .timeout(std::time::Duration::from_secs(60))
             .json(&body)
             .send()
             .await?;

@@ -27,11 +27,9 @@ impl Default for WeatherTool {
 
 impl WeatherTool {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("build reqwest client for weather");
-        Self { client }
+        Self {
+            client: super::http::shared_client(),
+        }
     }
 
     async fn geocode(&self, city: &str) -> Result<Option<(f64, f64, String, String)>> {
@@ -39,6 +37,7 @@ impl WeatherTool {
             .client
             .get(GEOCODE_URL)
             .query(&[("name", city), ("count", "1")])
+            .timeout(Duration::from_secs(10))
             .send()
             .await?
             .json()
@@ -81,6 +80,7 @@ impl WeatherTool {
                 ("temperature_unit", temp_unit),
                 ("windspeed_unit", wind_unit),
             ])
+            .timeout(Duration::from_secs(10))
             .send()
             .await?
             .json()

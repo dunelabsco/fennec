@@ -32,12 +32,10 @@ impl Default for HttpRequestTool {
 
 impl HttpRequestTool {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .build()
-            .expect("build reqwest client for http_request");
+        // Shared client — DNS cache + connection pool reused across all
+        // tools. Per-request timeout below.
         Self {
-            client,
+            client: super::http::shared_client(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
@@ -140,7 +138,12 @@ impl Tool for HttpRequestTool {
             }
         };
 
-        let mut builder = self.client.request(method, &url);
+        // Per-request timeout. Shared client has no global timeout —
+        // each tool sets its own here.
+        let mut builder = self
+            .client
+            .request(method, &url)
+            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS));
 
         if let Some(headers) = args.get("headers").and_then(|v| v.as_object()) {
             for (k, v) in headers {

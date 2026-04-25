@@ -21,12 +21,8 @@ pub struct PdfReadTool {
 
 impl PdfReadTool {
     pub fn new(temp_dir: PathBuf) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .expect("build reqwest client for pdf read");
         Self {
-            client,
+            client: super::http::shared_client(),
             temp_dir,
             max_size_bytes: 50 * 1024 * 1024, // 50 MB
         }
@@ -45,7 +41,14 @@ impl PdfReadTool {
     async fn resolve_to_local(&self, source: &str) -> Result<(PathBuf, bool)> {
         if source.starts_with("http://") || source.starts_with("https://") {
             tokio::fs::create_dir_all(&self.temp_dir).await?;
-            let bytes = self.client.get(source).send().await?.bytes().await?;
+            let bytes = self
+                .client
+                .get(source)
+                .timeout(std::time::Duration::from_secs(60))
+                .send()
+                .await?
+                .bytes()
+                .await?;
             if bytes.len() > self.max_size_bytes {
                 anyhow::bail!(
                     "PDF too large: {} bytes (max {})",

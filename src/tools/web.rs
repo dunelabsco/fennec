@@ -17,12 +17,9 @@ pub struct WebFetchTool {
 
 impl WebFetchTool {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent("Fennec/0.1")
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("build reqwest client");
-        Self { client }
+        Self {
+            client: super::http::shared_client(),
+        }
     }
 }
 
@@ -74,7 +71,13 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(50_000) as usize;
 
-        match self.client.get(url).send().await {
+        match self
+            .client
+            .get(url)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+        {
             Ok(response) => {
                 let status = response.status();
                 if !status.is_success() {
@@ -137,12 +140,9 @@ pub struct WebSearchTool {
 
 impl WebSearchTool {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent("Fennec/0.1")
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .expect("build reqwest client");
-        Self { client }
+        Self {
+            client: super::http::shared_client(),
+        }
     }
 }
 
@@ -199,7 +199,13 @@ impl Tool for WebSearchTool {
             urlencoded(query)
         );
 
-        match self.client.get(&url).send().await {
+        match self
+            .client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+        {
             Ok(response) => {
                 if !response.status().is_success() {
                     return Ok(ToolResult {
