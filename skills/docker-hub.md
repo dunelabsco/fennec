@@ -30,10 +30,12 @@ For authenticated reads (private repos, higher limits):
    ```
 4. Use on subsequent requests:
    ```
-   Authorization: JWT <JWT>
+   Authorization: Bearer <JWT>
    ```
 
-(Docker's authenticated header uses `JWT <token>`, not `Bearer`. An uncommon scheme.)
+Docker's official OpenAPI spec (`docs.docker.com/reference/api/hub/latest.yaml`) defines the auth scheme as `type: http, scheme: bearer, bearerFormat: JWT` — i.e. `Authorization: Bearer <jwt>` is the documented form. The token *content* is a JWT; the *prefix* is `Bearer`.
+
+> Older docs and many community examples use `Authorization: JWT <token>`. That worked for the legacy login JWT and may still work today, but the published API contract is `Bearer`. Prefer `Bearer` for forward compatibility, especially when using a Docker Hub Personal Access Token directly (PATs only auth as `Bearer`).
 
 ## List tags for an image
 

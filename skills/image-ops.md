@@ -80,10 +80,16 @@ magick input.jpg -auto-orient output.jpg           # respect EXIF orientation ta
 ## Strip metadata (privacy)
 
 ```
-magick input.jpg -strip output.jpg                 # removes EXIF, ICC, thumbnail
+magick input.jpg -strip output.jpg                 # removes EXIF, ICC, thumbnail, all profiles
 ```
 
 Photos from phones carry location + device data; `-strip` is the standard cleanup before sharing publicly.
+
+> **Warning:** `-strip` also drops the **ICC colour profile**. Wide-gamut sources (iPhone DisplayP3, Adobe RGB DSLRs) viewed as untagged sRGB look noticeably desaturated or shifted. To drop EXIF/GPS but keep colour, exclude the ICC profile from the strip:
+> ```
+> magick input.jpg -strip +profile '!icc,*' output.jpg   # strip everything except ICC
+> ```
+> See "Preserve colour profiles" under Rules.
 
 ## Composite / watermark
 

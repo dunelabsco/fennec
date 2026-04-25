@@ -41,6 +41,8 @@ bw login                    # interactive: email + master password [+ 2FA if ena
 bw login --apikey           # uses BW_CLIENTID + BW_CLIENTSECRET env vars
 ```
 
+> **Where do `BW_CLIENTID` / `BW_CLIENTSECRET` come from?** The Bitwarden web vault → **Account Settings → Security → Keys → API Key → View API Key**. That page shows both values; copy them into env vars. They're per-account (not per-org) and rotate them by clicking "Rotate" on the same page.
+
 After login, the vault is **locked**. Unlock to start a session:
 
 ```
