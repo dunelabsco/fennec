@@ -11,7 +11,7 @@ arxiv.org has a free, no-key HTTP API that returns search results as Atom 1.0 XM
 ## Endpoint
 
 ```
-http://export.arxiv.org/api/query?search_query=<query>&start=<offset>&max_results=<n>
+https://export.arxiv.org/api/query?search_query=<query>&start=<offset>&max_results=<n>
 ```
 
 - `search_query` — required. Field-prefixed query string (see below).
@@ -41,7 +41,7 @@ Combine with `AND`, `OR`, `ANDNOT`. Quote multi-word phrases: `ti:"attention is 
 Example — recent ML transformers:
 
 ```
-http://export.arxiv.org/api/query?search_query=cat:cs.LG+AND+abs:transformer&max_results=10&sortBy=submittedDate&sortOrder=descending
+https://export.arxiv.org/api/query?search_query=cat:cs.LG+AND+abs:transformer&max_results=10&sortBy=submittedDate&sortOrder=descending
 ```
 
 URL-encode spaces as `+` or `%20`.
