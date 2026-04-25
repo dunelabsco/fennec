@@ -43,13 +43,15 @@ export HUE_BRIDGE_IP="192.168.1.42"
 export HUE_USERNAME="<generated-username-string>"
 ```
 
-The "username" is a 32-char hex-like string and doubles as the API key. Keep it private — anyone on the LAN with it controls the lights.
+The "username" is an opaque token (around 40 characters on modern bridges) and doubles as the API key. Keep it private — anyone on the LAN with it controls the lights.
 
 ## TLS note
 
-Hue bridges use a self-signed certificate. Either:
-- Use `curl -k` / `http_request` with cert verification disabled (accepted practice on trusted LANs), OR
-- Fetch the bridge's root cert once and trust it.
+Hue bridges use a self-signed certificate. There's no fully clean option:
+
+- **Trusted home LAN** (your own router, no untrusted devices): `curl -k` / `http_request` with cert verification disabled is the practical choice and what the official Philips Hue libraries do. Risk: any device on the LAN can MITM bulb commands. Low-impact in practice — they could already join the LAN, find the bridge, and run their own auth.
+- **Shared / untrusted network** (coworking, dorm, café): do NOT use `-k`. Fetch the bridge's certificate once (`openssl s_client -connect <BRIDGE_IP>:443 -showcerts`), pin it, and trust only that fingerprint. An attacker on the same network could otherwise intercept your username/API key.
+- **Either case:** the username itself is the more important secret — leak it and `-k` becomes irrelevant.
 
 ## Base URL
 

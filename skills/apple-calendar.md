@@ -16,12 +16,15 @@ osascript -e 'tell application "Calendar" to return name of calendars'
 
 ## Events in a date range
 
+> **Performance warning:** `whose start date ≥ … and start date ≤ …` over `events of c` is O(all events in the calendar). Calendars with thousands of recurring events (multi-year iCloud histories, busy work calendars) take **minutes or hang**. Always narrow scope first — pick a specific calendar, or prefer `icalBuddy` (see below) for read-only "what's coming up" queries. Use the `whose` form below only when you've confirmed the target calendar is small.
+
 ```bash
 osascript <<'APPLESCRIPT'
 tell application "Calendar"
   set startD to current date
   set endD to startD + 7 * days
   set out to {}
+  -- Replace this with: tell calendar "Work" -- once you know the target.
   repeat with c in calendars
     set evs to (events of c whose start date ≥ startD and start date ≤ endD)
     repeat with e in evs
@@ -33,7 +36,7 @@ end tell
 APPLESCRIPT
 ```
 
-For single-calendar queries, replace the outer `repeat with c` loop with direct access, e.g. `calendar "Work"`.
+For single-calendar queries, replace the outer `repeat with c` loop with direct access, e.g. `calendar "Work"`. If the user just wants "what's next" across all calendars, use `icalBuddy` below instead — it doesn't have the `whose`-clause cost.
 
 ## Create an event
 

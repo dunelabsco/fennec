@@ -10,7 +10,7 @@ X (Twitter) API v2 uses OAuth 2.0 with PKCE for user-authenticated access. Perso
 
 ## First-time setup
 
-1. Apply for a developer account at https://developer.x.com — free tier suffices for personal use, but posting requires at least the "Free" tier (~500 posts/month as of late 2026; verify current limits).
+1. Apply for a developer account at https://developer.x.com. Tier names, write quotas, and pricing have changed multiple times in 2024–2026 (X moved to a pay-per-usage model in early 2026), and the public docs no longer list a fixed "free tier monthly post quota". **Always check the current limits in the developer console (https://console.x.com) before relying on the API for a recurring task** — assume nothing.
 2. Create a Project + App in the dev portal.
 3. Enable **User authentication settings**:
    - Type of App: **Native App** (public client — no client secret needed with PKCE).
@@ -113,7 +113,7 @@ Always include `offline.access` in the initial auth request; otherwise the refre
 
 - **Never post without explicit user confirmation.** Show the full draft and wait for "yes".
 - Access tokens last 2 hours. Check for 401 and auto-refresh before retrying.
-- Rate limits are aggressive on the free tier — honour `x-rate-limit-remaining` / `x-rate-limit-reset` headers.
+- Rate limits are aggressive at the lowest tier and change frequently — always honour `x-rate-limit-remaining` / `x-rate-limit-reset` response headers rather than relying on a hard-coded count.
 - `text` is HTML-unsafe — users see whatever you send. Escape nothing; trust user intent.
 - Media uploads are a two-step process (upload via v1.1 media endpoint, then reference `media_ids` in v2 tweet). If the user asks to post an image, confirm and walk the steps.
 
