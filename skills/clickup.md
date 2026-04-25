@@ -97,6 +97,13 @@ Body:
 
 `due_date` is milliseconds since epoch. `priority`: 1 (urgent) → 4 (low).
 
+**Create a subtask**
+```
+POST /api/v2/list/<list_id>/task
+Body: {"name": "Subtask name", "parent": "<parent_task_id>"}
+```
+Same endpoint as a normal create — the `parent` field is what makes it a subtask. The `<list_id>` should be the parent task's list (subtasks live under their parent's list).
+
 **Update a task**
 ```
 PUT /api/v2/task/<task_id>

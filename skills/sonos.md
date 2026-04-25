@@ -135,7 +135,7 @@ Response contains `TrackMetaData` (DIDL-Lite XML) with current song info.
 
 - **HTTP on the LAN.** Don't try HTTPS; speakers don't run a public-facing TLS stack.
 - SOAP is verbose but stable. If hand-writing the XML is painful, route through `node-sonos-http-api` (trivial HTTP wrapper) instead.
-- Volume changes are per-speaker even when grouped. To set the whole group's volume, iterate members or use the group coordinator's `SetRelativeGroupVolume`.
+- Volume changes are per-speaker even when grouped. To set the whole group's volume, iterate members, or send `SetGroupVolume` / `SetRelativeGroupVolume` to the group coordinator on the `GroupRenderingControl` service (endpoint `/MediaRenderer/GroupRenderingControl/Control`, SOAPACTION `urn:schemas-upnp-org:service:GroupRenderingControl:1#SetGroupVolume`) — these actions don't exist on `RenderingControl`.
 - Unknown `CurrentURI` values (non-stream, non-`x-rincon:`) return 500 with a SOAP fault. Verify URIs before sending.
 - Don't poll aggressively (every < 1 s); speakers are not servers. Subscribe to UPnP events if continuous status is needed.
 
