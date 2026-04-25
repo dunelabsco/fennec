@@ -20,7 +20,7 @@ NCBI asks every caller to identify itself:
 - `tool=<your-app-name>` — e.g. `fennec`.
 - `email=<your-email>` — used only to contact you if something breaks.
 
-Without these, NCBI may deny service under heavy load.
+Without these, NCBI will throttle aggressively and may eventually block your IP entirely during load events. Treat them as required, not optional. NCBI also rate-limits unauthenticated callers to ~3 req/s — for higher rates request an [API key](https://ncbiinsights.ncbi.nlm.nih.gov/2017/11/02/new-api-keys-for-the-e-utilities/) and pass it via `&api_key=<KEY>`.
 
 ## Three endpoints covering most needs
 

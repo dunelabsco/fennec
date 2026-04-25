@@ -50,10 +50,12 @@ Print a scannable QR code in the terminal:
 qrencode -t ANSIUTF8 "https://example.com"          # UTF-8 half-blocks + ANSI colour (densest, most scannable)
 qrencode -t UTF8 "https://example.com"              # plain UTF-8 block characters, no colour (larger)
 qrencode -t ANSI "https://example.com"              # ANSI colour with space characters (no UTF-8 needed)
-qrencode -t ANSI256UTF8 "https://example.com"       # 256-colour variant of ANSIUTF8
+qrencode -t ANSI256UTF8 "https://example.com"       # 256-colour variant of ANSIUTF8 (qrencode ≥ 4.1)
 ```
 
 `ANSIUTF8` is usually the smallest readable option in a modern terminal. `UTF8` is the most compatible when colour isn't available.
+
+> **Version note:** `ANSI256UTF8` requires qrencode ≥ 4.1. Older distros (Debian stable, Ubuntu LTS releases shipping qrencode 4.0.x) reject it with `Invalid output type`. Run `qrencode --version` to check; if older than 4.1, fall back to `ANSIUTF8`.
 
 ## Common content patterns
 
