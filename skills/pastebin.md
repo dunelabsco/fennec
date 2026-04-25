@@ -26,6 +26,7 @@ POST https://api.github.com/gists
 Headers:
   Authorization: Bearer <GITHUB_TOKEN>
   Accept: application/vnd.github+json
+  X-GitHub-Api-Version: 2022-11-28
 Body:
 {
   "description": "what this is",
@@ -71,13 +72,28 @@ Content-Type: application/x-www-form-urlencoded
 api_dev_key=<PASTEBIN_API_KEY>
 api_option=paste
 api_paste_code=<content>
-api_paste_private=1              # 0 public, 1 unlisted, 2 private (needs user token)
+api_paste_private=1              # 0 public, 1 unlisted, 2 private (requires api_user_key, see below)
 api_paste_expire_date=1H         # N|10M|1H|1D|1W|2W|1M|6M|1Y
 api_paste_format=python          # optional syntax hint
 api_paste_name=<title>           # optional
 ```
 
 Response body is the paste URL (plain text) or an error starting with `Bad API request`.
+
+### Private (account-bound) pastes
+
+`api_paste_private=2` requires an `api_user_key` tied to your account. Mint it with a one-time login call:
+
+```
+POST https://pastebin.com/api/api_login.php
+Content-Type: application/x-www-form-urlencoded
+
+api_dev_key=<PASTEBIN_API_KEY>
+api_user_name=<account username>
+api_user_password=<account password>
+```
+
+Response body is the user key (plain text). Save it as `PASTEBIN_USER_KEY`, then add `api_user_key=<PASTEBIN_USER_KEY>` to the create-paste form. The user key doesn't expire on its own.
 
 ## Rules
 

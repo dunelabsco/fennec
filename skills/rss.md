@@ -65,6 +65,21 @@ cron(schedule: "*/30 * * * *", prompt: "Check the <feed_url> RSS feed and report
 
 The `cron` origin routes results back to the channel the user asked from.
 
+## Conditional GET (be a polite poller)
+
+Most feed hosts return `ETag` and/or `Last-Modified` headers. Send them back on the next poll and the server replies `304 Not Modified` with no body — saves bandwidth on both sides and keeps you off rate-limit lists.
+
+1. On a successful fetch, stash the response's `ETag` and `Last-Modified` values via `memory_store` under `rss:<feed_url>:cache`.
+2. On the next poll, set:
+   ```
+   If-None-Match: <stored ETag>
+   If-Modified-Since: <stored Last-Modified>
+   ```
+3. If the response is `304`, skip parsing — nothing changed.
+4. If `200`, refresh the stored values from the new response headers.
+
+Some feeds return only one of the two; send whichever you have. Cloudflare-fronted feeds in particular reward this — they'll serve a cached 304 without origin hits.
+
 ## Tips
 
 - Respect the feed's `<ttl>` (RSS) or `<updated>` cadence hint. Don't poll faster than the feed updates.
