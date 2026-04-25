@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -13,6 +13,19 @@ use super::traits::{Channel, SendMessage};
 
 /// Maximum message length allowed by the Telegram Bot API.
 const TELEGRAM_MAX_LEN: usize = 4096;
+
+/// Hard cap on the number of per-chat entries in [`TelegramChannel::last_edit`].
+/// When exceeded, the oldest entry is evicted on insert.
+const MAX_LAST_EDIT_ENTRIES: usize = 1024;
+
+/// Maximum number of times a request will retry on 429 (Too Many Requests)
+/// before bailing.
+const MAX_RETRY_AFTER_ATTEMPTS: u32 = 3;
+
+/// Cap on `parameters.retry_after` honored from a 429 response. Telegram
+/// occasionally returns very long waits during punishment windows; we'd
+/// rather surface the failure than block a listener for many minutes.
+const RETRY_AFTER_CAP_SECS: u64 = 60;
 
 /// Telegram channel using the Bot API with long-polling and streaming edits.
 pub struct TelegramChannel {
@@ -35,6 +48,110 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("https://api.telegram.org/bot{}/{}", self.bot_token, method)
+    }
+
+    /// Insert into `last_edit` with an LRU-style eviction when the map is
+    /// at capacity. Cap is `MAX_LAST_EDIT_ENTRIES`.
+    fn last_edit_insert(&self, chat_id: String, when: Instant) {
+        let mut map = self.last_edit.lock();
+        if map.len() >= MAX_LAST_EDIT_ENTRIES && !map.contains_key(&chat_id) {
+            // Evict the oldest entry (smallest Instant). O(n) but cap is small.
+            if let Some(oldest_key) = map
+                .iter()
+                .min_by_key(|(_, v)| *v)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest_key);
+            }
+        }
+        map.insert(chat_id, when);
+    }
+
+    /// Send a JSON POST that honors Telegram's 429 `parameters.retry_after`.
+    /// Returns the parsed JSON body on success; bails after
+    /// `MAX_RETRY_AFTER_ATTEMPTS` retries.
+    async fn post_json_with_retry(&self, url: &str, body: &Value) -> Result<Value> {
+        let mut attempt: u32 = 0;
+        loop {
+            let resp = self
+                .client
+                .post(url)
+                .json(body)
+                .send()
+                .await
+                .context("Telegram POST request failed")?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+
+            if status.is_success() {
+                return serde_json::from_str(&text)
+                    .context("Telegram POST response parse failed");
+            }
+
+            if status.as_u16() == 429 && attempt < MAX_RETRY_AFTER_ATTEMPTS {
+                let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                let retry_after = parsed
+                    .get("parameters")
+                    .and_then(|p| p.get("retry_after"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1)
+                    .min(RETRY_AFTER_CAP_SECS);
+                tracing::warn!(
+                    "Telegram 429 on {}: sleeping {}s (attempt {}/{})",
+                    url,
+                    retry_after,
+                    attempt + 1,
+                    MAX_RETRY_AFTER_ATTEMPTS
+                );
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                attempt += 1;
+                continue;
+            }
+
+            anyhow::bail!("Telegram POST {} returned {}: {}", url, status, text);
+        }
+    }
+
+    /// GET variant of [`Self::post_json_with_retry`] for `getUpdates` long-poll.
+    async fn get_with_retry(&self, url: &str) -> Result<Value> {
+        let mut attempt: u32 = 0;
+        loop {
+            let resp = self
+                .client
+                .get(url)
+                .send()
+                .await
+                .context("Telegram GET request failed")?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+
+            if status.is_success() {
+                return serde_json::from_str(&text)
+                    .context("Telegram GET response parse failed");
+            }
+
+            if status.as_u16() == 429 && attempt < MAX_RETRY_AFTER_ATTEMPTS {
+                let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                let retry_after = parsed
+                    .get("parameters")
+                    .and_then(|p| p.get("retry_after"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1)
+                    .min(RETRY_AFTER_CAP_SECS);
+                tracing::warn!(
+                    "Telegram 429 on {}: sleeping {}s (attempt {}/{})",
+                    url,
+                    retry_after,
+                    attempt + 1,
+                    MAX_RETRY_AFTER_ATTEMPTS
+                );
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                attempt += 1;
+                continue;
+            }
+
+            anyhow::bail!("Telegram GET {} returned {}: {}", url, status, text);
+        }
     }
 
     /// Register bot commands with Telegram so they appear in the menu.
@@ -215,23 +332,13 @@ impl Channel for TelegramChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let parts = split_message(&message.content, TELEGRAM_MAX_LEN);
+        let url = self.api_url("sendMessage");
         for part in &parts {
             let body = serde_json::json!({
                 "chat_id": message.recipient,
                 "text": part,
             });
-            let resp = self
-                .client
-                .post(self.api_url("sendMessage"))
-                .json(&body)
-                .send()
-                .await
-                .context("Telegram sendMessage request failed")?;
-            let status = resp.status();
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Telegram sendMessage returned {}: {}", status, text);
-            }
+            self.post_json_with_retry(&url, &body).await?;
         }
         Ok(())
     }
@@ -250,14 +357,7 @@ impl Channel for TelegramChannel {
                 self.api_url("getUpdates"),
                 offset
             );
-            let resp = self
-                .client
-                .get(&url)
-                .send()
-                .await
-                .context("Telegram getUpdates request failed")?;
-
-            let body: Value = resp.json().await.context("Telegram getUpdates parse failed")?;
+            let body = self.get_with_retry(&url).await?;
             let updates = Self::parse_updates(&body);
 
             for (update_id, sender_id, chat_id, text) in updates {
@@ -313,14 +413,9 @@ impl Channel for TelegramChannel {
             "chat_id": chat_id,
             "text": "...",
         });
-        let resp = self
-            .client
-            .post(self.api_url("sendMessage"))
-            .json(&body)
-            .send()
-            .await
-            .context("Telegram streaming start sendMessage failed")?;
-        let data: Value = resp.json().await.context("Telegram streaming start parse failed")?;
+        let data = self
+            .post_json_with_retry(&self.api_url("sendMessage"), &body)
+            .await?;
         let message_id = data
             .get("result")
             .and_then(|r| r.get("message_id"))
@@ -350,17 +445,10 @@ impl Channel for TelegramChannel {
             "message_id": message_id,
             "text": full_text,
         });
-        self.client
-            .post(self.api_url("editMessageText"))
-            .json(&body)
-            .send()
-            .await
-            .context("Telegram editMessageText delta failed")?;
+        self.post_json_with_retry(&self.api_url("editMessageText"), &body)
+            .await?;
 
-        {
-            let mut map = self.last_edit.lock();
-            map.insert(chat_id.to_string(), Instant::now());
-        }
+        self.last_edit_insert(chat_id.to_string(), Instant::now());
 
         Ok(())
     }
@@ -376,12 +464,8 @@ impl Channel for TelegramChannel {
             "message_id": message_id,
             "text": full_text,
         });
-        self.client
-            .post(self.api_url("editMessageText"))
-            .json(&body)
-            .send()
-            .await
-            .context("Telegram editMessageText end failed")?;
+        self.post_json_with_retry(&self.api_url("editMessageText"), &body)
+            .await?;
 
         // Clear the rate-limit entry for this chat.
         {
