@@ -179,6 +179,13 @@ impl AnthropicProvider {
             }
         }
 
+        // Apply extended thinking parameters if the agent selected a level.
+        crate::agent::thinking::apply_thinking_params(
+            &mut body,
+            request.thinking_level,
+            "anthropic",
+        );
+
         body
     }
 

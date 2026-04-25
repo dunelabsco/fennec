@@ -357,13 +357,19 @@ async fn build_agent(
 
     // Set up collective intelligence layer.
     let collective_search: Option<Arc<CollectiveSearch>> = if config.collective.enabled {
-        // Resolve collective API key.
+        // Resolve collective API key. Fail-closed: if the configured value is
+        // present but cannot be decrypted, treat the integration as
+        // unavailable rather than leaking the encrypted blob to the
+        // collective endpoint as if it were the plaintext key.
         let collective_api_key = if !config.collective.api_key.is_empty() {
             match secret_store.decrypt(&config.collective.api_key) {
                 Ok(key) => key,
                 Err(e) => {
-                    tracing::warn!("Failed to decrypt collective API key: {e}; trying raw value");
-                    config.collective.api_key.clone()
+                    tracing::error!(
+                        "Failed to decrypt collective API key: {e}; disabling collective \
+                         (set a fresh encrypted key or unset to use PLURUM_API_KEY env var)"
+                    );
+                    String::new()
                 }
             }
         } else {
@@ -461,10 +467,19 @@ async fn build_agent(
 
         // CollectiveReportTool needs a CollectiveLayer; create one based on config.
         if config.collective.publish_enabled {
+            // Fail-closed on decrypt error: empty key → MockCollective fallback
+            // below, so we never publish using the encrypted blob as plaintext.
             let collective_api_key = if !config.collective.api_key.is_empty() {
-                secret_store
-                    .decrypt(&config.collective.api_key)
-                    .unwrap_or_else(|_| config.collective.api_key.clone())
+                match secret_store.decrypt(&config.collective.api_key) {
+                    Ok(key) => key,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to decrypt collective API key for publish layer: {e}; \
+                             falling back to MockCollective (publish disabled)"
+                        );
+                        String::new()
+                    }
+                }
             } else {
                 std::env::var("PLURUM_API_KEY").unwrap_or_default()
             };

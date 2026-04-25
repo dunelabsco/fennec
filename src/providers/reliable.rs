@@ -87,6 +87,7 @@ impl Provider for ReliableProvider {
                     tools: request.tools,
                     max_tokens: request.max_tokens,
                     temperature: request.temperature,
+                    thinking_level: request.thinking_level,
                 };
 
                 match provider.chat(req).await {
@@ -161,6 +162,7 @@ impl Provider for ReliableProvider {
                 tools: request.tools,
                 max_tokens: request.max_tokens,
                 temperature: request.temperature,
+                thinking_level: request.thinking_level,
             };
 
             match provider.chat_stream(req).await {

@@ -157,6 +157,13 @@ impl OpenAIProvider {
             }
         }
 
+        // Apply reasoning_effort if the agent selected a thinking level.
+        crate::agent::thinking::apply_thinking_params(
+            &mut body,
+            request.thinking_level,
+            "openai",
+        );
+
         (messages, body)
     }
 
