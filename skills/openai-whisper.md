@@ -91,6 +91,19 @@ Always tell the user which path you used — the transcripts can differ, and the
   ```
   Transcribe each chunk, concatenate in order.
 
+  **Caveats with `-c copy`:**
+  - Cuts on the nearest stream keyframe rather than exactly 600 s, so chunks won't all be the same length and chunk boundaries can land mid-word — small overlap or gap when you concatenate transcripts.
+  - For some lossy formats the resulting chunks can still exceed the 25 MB cap if the source bitrate is high. Verify with `ls -lh chunk-*.mp3`; if any is over 25 MB, re-encode at a lower bitrate instead:
+    ```
+    ffmpeg -i long.mp3 -f segment -segment_time 600 -c:a libmp3lame -b:a 64k chunk-%03d.mp3
+    ```
+    64 kbps mono is plenty for speech.
+  - If word-level timing across the chunk boundary matters, prefer splitting at a silence:
+    ```
+    ffmpeg -i long.mp3 -af silencedetect=noise=-40dB:d=0.5 -f null -
+    ```
+    Use the reported silence timestamps as cut points, then split with `-ss` / `-to`.
+
 ## Rules
 
 - Confirm with the user before running long audio through the paid API — bill depends on duration.
