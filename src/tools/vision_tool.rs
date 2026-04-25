@@ -55,7 +55,7 @@ impl VisionTool {
             return None;
         }
         let model = model.unwrap_or_else(|| match backend {
-            VisionBackend::Anthropic => "claude-sonnet-4-20250514".to_string(),
+            VisionBackend::Anthropic => "claude-sonnet-4-6".to_string(),
             VisionBackend::OpenAi => "gpt-4o".to_string(),
         });
         let client = reqwest::Client::builder()

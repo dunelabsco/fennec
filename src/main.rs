@@ -148,7 +148,17 @@ fn build_provider(
                     "https://api.moonshot.ai/v1".to_string()
                 }
             });
-            let kimi_model = if model.is_empty() || model == "claude-sonnet-4-20250514" || model == "moonshot-v1-128k" {
+            // Detect "user kept the Anthropic-flavored default and switched
+            // provider to Kimi" — fall back to a Kimi-shaped default. We
+            // accept BOTH the new default (claude-sonnet-4-6, current) and
+            // the old default (claude-sonnet-4-20250514, deprecated June
+            // 2026) so users whose configs still hold the legacy string
+            // continue to get the right behavior.
+            let kimi_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+                || model == "moonshot-v1-128k"
+            {
                 "kimi-k2.5".to_string()
             } else {
                 model
@@ -160,7 +170,12 @@ fn build_provider(
             Box::new(OpenAIProvider::new(api_key, Some(model), Some(or_url), None))
         }
         "ollama" => {
-            let ollama_model = if model.is_empty() || model == "claude-sonnet-4-20250514" {
+            // Same back-compat as kimi: accept both new and old Anthropic
+            // defaults when falling back to Ollama's local default.
+            let ollama_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+            {
                 "llama3.1".to_string()
             } else {
                 model

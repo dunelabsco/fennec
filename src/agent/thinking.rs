@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn apply_anthropic_thinking() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "temperature": 0.7
         });
         apply_thinking_params(&mut body, ThinkingLevel::High, "anthropic");
@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn apply_off_does_nothing() {
         let mut body = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "temperature": 0.7
         });
         apply_thinking_params(&mut body, ThinkingLevel::Off, "anthropic");

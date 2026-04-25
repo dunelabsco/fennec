@@ -54,7 +54,7 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         .interact()?;
 
     let (provider_name, default_model, env_var) = match provider_idx {
-        0 => ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
+        0 => ("anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
         1 => ("openai", "gpt-4o", "OPENAI_API_KEY"),
         2 => ("kimi", "kimi-k2.5", "KIMI_API_KEY"),
         3 => (
@@ -63,7 +63,7 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
             "OPENROUTER_API_KEY",
         ),
         4 => ("ollama", "llama3.1", ""),
-        _ => ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
+        _ => ("anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
     };
     frame.complete_step(StepSummary::done(
         "Provider",
@@ -315,7 +315,7 @@ fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         .interact()?;
 
     let (provider_name, default_model, env_var) = match provider_idx {
-        0 => ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
+        0 => ("anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
         1 => ("openai", "gpt-4o", "OPENAI_API_KEY"),
         2 => ("kimi", "kimi-k2.5", "KIMI_API_KEY"),
         3 => (
@@ -324,7 +324,7 @@ fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
             "OPENROUTER_API_KEY",
         ),
         4 => ("ollama", "llama3.1", ""),
-        _ => ("anthropic", "claude-sonnet-4-20250514", "ANTHROPIC_API_KEY"),
+        _ => ("anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
     };
 
     let api_key = if provider_name == "anthropic" {
@@ -612,7 +612,7 @@ mod tests {
         let config = build_config_toml(
             "TestBot",
             "anthropic",
-            "claude-sonnet-4-20250514",
+            "claude-sonnet-4-6",
             "sk-test-key",
             "",
             "",
