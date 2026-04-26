@@ -259,7 +259,14 @@ pub fn url_literal_ip(url: &Url) -> Option<IpAddr> {
 mod tests {
     use super::*;
 
+    /// Tests touching env vars must serialize because `cargo test` runs in
+    /// parallel by default — concurrent set/unset of OVERRIDE_ENV across
+    /// tests races and produces flake. This mutex makes those tests
+    /// effectively serial.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn with_override<F: FnOnce() -> R, R>(value: &str, f: F) -> R {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var(OVERRIDE_ENV, value);
         }

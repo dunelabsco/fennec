@@ -162,6 +162,25 @@ fn window_matches(window: &[&std::ffi::OsStr], pat_parts: &[&str]) -> bool {
     true
 }
 
+/// On macOS, `std::fs::canonicalize` resolves `/etc` → `/private/etc`,
+/// `/var` → `/private/var`, `/tmp` → `/private/tmp` because those are
+/// real symlinks at the root. Without normalization, anchored patterns
+/// like `/etc` would never match the canonical form. Strip the `/private`
+/// prefix on macOS so the denylist sees the user-visible path.
+#[cfg(target_os = "macos")]
+fn normalize_macos(path: PathBuf) -> PathBuf {
+    if let Ok(stripped) = path.strip_prefix("/private") {
+        // Re-anchor at root.
+        return PathBuf::from("/").join(stripped);
+    }
+    path
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normalize_macos(path: PathBuf) -> PathBuf {
+    path
+}
+
 /// Canonicalize `path` if it exists. If it doesn't, walk up to find the
 /// deepest existing ancestor, canonicalize that, and append the remaining
 /// non-existing tail literally. This lets writes to new files still
@@ -174,7 +193,7 @@ fn resolve_best_effort(path: &Path) -> Result<PathBuf> {
     };
 
     if absolute.exists() {
-        return Ok(std::fs::canonicalize(&absolute)?);
+        return Ok(normalize_macos(std::fs::canonicalize(&absolute)?));
     }
 
     // Walk up looking for an existing ancestor.
@@ -182,7 +201,7 @@ fn resolve_best_effort(path: &Path) -> Result<PathBuf> {
     let mut cursor = absolute.as_path();
     loop {
         if cursor.exists() {
-            let mut result = std::fs::canonicalize(cursor)?;
+            let mut result = normalize_macos(std::fs::canonicalize(cursor)?);
             for seg in tail.iter().rev() {
                 result.push(seg);
             }
@@ -250,7 +269,10 @@ mod tests {
         std::fs::write(&f, b"hello").unwrap();
         let s = sandbox();
         let resolved = s.check(&f).unwrap();
-        assert_eq!(resolved, f.canonicalize().unwrap());
+        // On macOS the sandbox normalizes /private/var → /var so that
+        // anchored denylist patterns match the user-visible paths. Apply
+        // the same normalization to the comparison side.
+        assert_eq!(resolved, normalize_macos(f.canonicalize().unwrap()));
     }
 
     #[test]
@@ -363,6 +385,8 @@ mod tests {
         let r = resolve_best_effort(&non).unwrap();
         assert!(r.ends_with("does/not/exist/yet.txt"));
         // The existing portion (tmp.path()) should be canonicalized.
-        assert!(r.starts_with(tmp.path().canonicalize().unwrap()));
+        // Normalize both sides so the macOS /private dance doesn't break the
+        // assertion.
+        assert!(r.starts_with(normalize_macos(tmp.path().canonicalize().unwrap())));
     }
 }
