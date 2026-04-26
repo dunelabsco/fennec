@@ -1,7 +1,13 @@
 //! Read-only git tool.
 //!
-//! Commands are shell-word tokenized and executed via direct `Command::new("git")`
-//! (no `sh -c`), so shell metacharacters can't slip through the allowlist.
+//! Commands are shell-word tokenized and executed via direct
+//! `Command::new("git")` (no `sh -c`). Because there is no shell, characters
+//! like `;`, `|`, `&`, `>`, `$`, and backticks have no special meaning to
+//! the kernel — they are passed to git as literal arg bytes. So legitimate
+//! uses like `git log --grep="fix; bug"` or `git log --grep='hot|cold'`
+//! work as the user expects: git sees the whole quoted content as a single
+//! regex argument. (We previously rejected metachars up front, which broke
+//! these cases.)
 //!
 //! In addition to the "safe subcommand" check, individual args are
 //! inspected for known-bad flags that let git execute arbitrary code
@@ -51,21 +57,12 @@ const BLOCKED_FLAG_PREFIXES: &[&str] = &[
     "--get-urlmatch",
 ];
 
-/// Characters that shouldn't appear in a git command we pass through —
-/// shell metacharacters are not meaningful without `sh -c`, but their
-/// presence still indicates someone is trying to smuggle something.
-const FORBIDDEN_METACHARS: &[char] = &[';', '&', '|', '>', '<', '$', '`', '\n', '\r'];
-
 /// A tool that runs safe, read-only git commands.
 pub struct GitTool;
 
 impl GitTool {
     pub fn new() -> Self {
         Self
-    }
-
-    fn find_metachar(command: &str) -> Option<char> {
-        command.chars().find(|c| FORBIDDEN_METACHARS.contains(c))
     }
 
     /// Check that a single arg isn't a blocked flag.
@@ -134,17 +131,11 @@ impl Tool for GitTool {
             }
         };
 
-        if let Some(ch) = Self::find_metachar(command) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "shell metacharacter '{}' is not permitted in git commands",
-                    ch
-                )),
-            });
-        }
-
+        // Tokenize first. shell-words preserves quoted args (so
+        // `--grep="fix; bug"` becomes a single argv element with the `;` as
+        // literal content, not a token boundary). Argv-style exec then
+        // passes each element to git verbatim — no shell, no meta-character
+        // expansion, no compounding.
         let argv = match shell_words::split(command) {
             Ok(v) if !v.is_empty() => v,
             Ok(_) => {
@@ -313,15 +304,35 @@ mod tests {
         assert_eq!(GitTool::arg_is_blocked("HEAD"), None);
     }
 
+    /// `git log --grep="fix; bug"` is a legitimate use — the `;` is inside
+    /// a quoted regex pattern, not a shell separator. shell-words tokenizes
+    /// it as `["log", "--grep=fix; bug"]` and argv-exec passes the second
+    /// element to git verbatim. The pre-tokenize metachar reject we used
+    /// to have blocked this case incorrectly.
+    #[test]
+    fn metachar_inside_quoted_grep_arg_tokenizes_intact() {
+        let v = shell_words::split("log --grep=\"fix; bug\"").unwrap();
+        assert_eq!(v, vec!["log", "--grep=fix; bug"]);
+    }
+
+    /// A bare `;` between subcommands no longer triggers a metachar reject;
+    /// it just gets passed as a literal arg to whatever subcommand was
+    /// requested. Since we're already gating on subcommand allowlist + flag
+    /// denylist + restricted env, that's safe.
     #[tokio::test]
-    async fn rejects_metachar() {
+    async fn bare_semicolon_does_not_trigger_metachar_reject() {
         let t = GitTool::new();
         let r = t
-            .execute(json!({"command": "log; rm -rf /"}))
+            .execute(json!({"command": "log; echo hi"}))
             .await
             .unwrap();
+        // shell-words splits to `["log;", "echo", "hi"]`, argv[0]="log;" is
+        // not in SAFE_COMMANDS — so we get a "not in the safe list" error,
+        // not a "metacharacter" error. Verify the error class changed.
         assert!(!r.success);
-        assert!(r.error.unwrap().contains("metacharacter"));
+        let err = r.error.unwrap();
+        assert!(!err.contains("metacharacter"), "got: {}", err);
+        assert!(err.contains("not in the safe list") || err.contains("safe"));
     }
 
     #[tokio::test]
@@ -360,12 +371,6 @@ mod tests {
         assert!(err.contains("arbitrary code"), "err: {}", err);
     }
 
-    #[test]
-    fn find_metachar_hits() {
-        assert_eq!(GitTool::find_metachar("log; echo"), Some(';'));
-        assert_eq!(GitTool::find_metachar("log | grep"), Some('|'));
-        assert_eq!(GitTool::find_metachar("log --oneline -10"), None);
-    }
 }
 
 impl Default for GitTool {
