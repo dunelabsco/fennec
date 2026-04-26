@@ -26,7 +26,7 @@ use fennec::providers::openai::OpenAIProvider;
 use fennec::providers::ollama::OllamaProvider;
 use fennec::providers::traits::Provider;
 use fennec::security::prompt_guard::{GuardAction, PromptGuard};
-use fennec::security::SecretStore;
+use fennec::security::{PathSandbox, SecretStore};
 use fennec::tools::collective_tools::{CollectiveGetExperienceTool, CollectivePublishTool, CollectiveReportTool, CollectiveSearchTool};
 use fennec::tools::cron_tool::{CronOrigin, CronTool};
 use fennec::tools::files::{ListDirTool, ReadFileTool, WriteFileTool};
@@ -286,9 +286,13 @@ async fn build_agent(
         config.security.forbidden_paths.clone(),
         config.security.command_timeout_secs,
     );
-    let read_file_tool = ReadFileTool::new();
-    let write_file_tool = WriteFileTool::new();
-    let list_dir_tool = ListDirTool::new();
+    // Shared filesystem sandbox driven by `security.forbidden_paths` from
+    // config. Every tool that takes a file path from the LLM clones this
+    // Arc so the denylist is enforced in one place.
+    let path_sandbox = Arc::new(PathSandbox::new(config.security.forbidden_paths.clone()));
+    let read_file_tool = ReadFileTool::new().with_sandbox(Arc::clone(&path_sandbox));
+    let write_file_tool = WriteFileTool::new().with_sandbox(Arc::clone(&path_sandbox));
+    let list_dir_tool = ListDirTool::new().with_sandbox(Arc::clone(&path_sandbox));
     let web_fetch_tool = WebFetchTool::new();
     let web_search_tool = WebSearchTool::new();
     let browser_tool = BrowserTool::new();
@@ -303,7 +307,8 @@ async fn build_agent(
         &config.provider.name,
         vision_api_key,
         Some(config.provider.model.clone()),
-    );
+    )
+    .map(|t| t.with_sandbox(Arc::clone(&path_sandbox)));
     match &vision_tool {
         Some(_) => tracing::info!("Vision tool enabled ({})", config.provider.name),
         None => tracing::debug!(
@@ -341,7 +346,8 @@ async fn build_agent(
     // Voice tools (transcription + TTS). Both use OpenAI; shared key
     // resolution with the image gen tool.
     let voice_key = voice_resolve_openai_key(&config.provider.name, &img_config_key);
-    let transcribe_tool = TranscribeAudioTool::new_with_key(voice_key.clone(), None);
+    let transcribe_tool = TranscribeAudioTool::new_with_key(voice_key.clone(), None)
+        .map(|t| t.with_sandbox(Arc::clone(&path_sandbox)));
     let tts_tool = TextToSpeechTool::new_with_key(
         voice_key,
         default_tts_output_dir(home_dir),
@@ -434,11 +440,15 @@ async fn build_agent(
         builder = builder.tool(Box::new(igt));
     }
     builder = builder.tool(Box::new(code_exec_tool));
-    builder = builder.tool(Box::new(PdfReadTool::new(home_dir.join("pdf_cache"))));
+    builder = builder.tool(Box::new(
+        PdfReadTool::new(home_dir.join("pdf_cache")).with_sandbox(Arc::clone(&path_sandbox)),
+    ));
     builder = builder.tool(Box::new(ScreenshotTool::new(default_screenshot_dir(home_dir))));
     builder = builder.tool(Box::new(HttpRequestTool::new()));
     builder = builder.tool(Box::new(WeatherTool::new()));
-    builder = builder.tool(Box::new(ImageInfoTool::new(home_dir.join("image_cache"))));
+    builder = builder.tool(Box::new(
+        ImageInfoTool::new(home_dir.join("image_cache")).with_sandbox(Arc::clone(&path_sandbox)),
+    ));
     if let Some(claude_tool) = ClaudeCodeCliTool::detect() {
         tracing::info!("Claude Code CLI tool enabled");
         builder = builder.tool(Box::new(claude_tool));

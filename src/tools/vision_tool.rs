@@ -8,12 +8,16 @@
 //! existing agent message type is text-only. Wrapping the vision call in
 //! a tool keeps the change fully additive — no provider trait updates.
 
+use std::path::Path;
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 
 use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str};
+use crate::security::PathSandbox;
 
 use super::traits::{Tool, ToolResult};
 
@@ -45,6 +49,8 @@ pub struct VisionTool {
     api_key: String,
     model: String,
     client: reqwest::Client,
+    /// Applied to local-path sources; URL sources are unaffected.
+    sandbox: Arc<PathSandbox>,
 }
 
 impl VisionTool {
@@ -70,7 +76,13 @@ impl VisionTool {
             api_key,
             model,
             client,
+            sandbox: Arc::new(PathSandbox::empty()),
         })
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Load image bytes + detect mime type.
@@ -99,7 +111,11 @@ impl VisionTool {
             }
             Ok((bytes, mime))
         } else {
-            let bytes = tokio::fs::read(source).await?;
+            let resolved = self
+                .sandbox
+                .check(Path::new(source))
+                .map_err(|e| anyhow::anyhow!("path rejected by sandbox: {}", e))?;
+            let bytes = tokio::fs::read(&resolved).await?;
             let mime = guess_mime_from_path(source);
             Ok((bytes, mime))
         }

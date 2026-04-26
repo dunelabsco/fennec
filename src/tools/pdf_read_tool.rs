@@ -4,13 +4,15 @@
 //! path or http(s) URL; fetched PDFs are written to a temp file so
 //! `pdf-extract` can mmap them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str};
+use crate::security::PathSandbox;
 
 use super::traits::{Tool, ToolResult};
 
@@ -19,6 +21,9 @@ pub struct PdfReadTool {
     temp_dir: PathBuf,
     /// Max PDF size we'll accept before refusing (bytes).
     max_size_bytes: usize,
+    /// Applied to local-path sources. URL-fetched PDFs bypass this (they
+    /// land in the tool-owned temp_dir).
+    sandbox: Arc<PathSandbox>,
 }
 
 impl PdfReadTool {
@@ -28,11 +33,17 @@ impl PdfReadTool {
             client,
             temp_dir,
             max_size_bytes: 50 * 1024 * 1024, // 50 MB
+            sandbox: Arc::new(PathSandbox::empty()),
         }
     }
 
     pub fn with_max_size(mut self, bytes: usize) -> Self {
         self.max_size_bytes = bytes;
+        self
+    }
+
+    pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
@@ -63,11 +74,17 @@ impl PdfReadTool {
             tokio::fs::write(&path, &bytes).await?;
             Ok((path, true))
         } else {
-            let path = PathBuf::from(source);
-            if !path.exists() {
+            // Local path: validate against the filesystem sandbox before
+            // opening, so a prompt-injected source like ~/.ssh/id_rsa is
+            // rejected rather than fed into pdf-extract.
+            let resolved = self
+                .sandbox
+                .check(Path::new(source))
+                .map_err(|e| anyhow::anyhow!("path rejected by sandbox: {}", e))?;
+            if !resolved.exists() {
                 anyhow::bail!("file does not exist: {}", source);
             }
-            let meta = tokio::fs::metadata(&path).await?;
+            let meta = tokio::fs::metadata(&resolved).await?;
             if meta.len() as usize > self.max_size_bytes {
                 anyhow::bail!(
                     "PDF too large: {} bytes (max {})",
@@ -75,7 +92,7 @@ impl PdfReadTool {
                     self.max_size_bytes
                 );
             }
-            Ok((path, false))
+            Ok((resolved, false))
         }
     }
 }
