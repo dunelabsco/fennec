@@ -85,45 +85,58 @@ fn private_urls_allowed() -> bool {
     )
 }
 
+/// Build a rejection error that tells the caller (LLM or human) why we
+/// refused AND how to opt out. Without this hint a user trying to point
+/// the agent at e.g. their local Ollama or Pi-hole sees a flat error and
+/// has no path forward — the agent can't learn `FENNEC_ALLOW_PRIVATE_URLS`
+/// from a stack trace.
+fn blocked(reason: &str) -> anyhow::Error {
+    anyhow!(
+        "{} (set {}=1 in the agent's env to allow private/internal addresses)",
+        reason,
+        OVERRIDE_ENV
+    )
+}
+
 fn check_ipv4(ip: Ipv4Addr) -> Result<()> {
     if ip.is_loopback() {
-        bail!("URL targets loopback: {}", ip);
+        return Err(blocked(&format!("URL targets loopback: {}", ip)));
     }
     if ip.is_private() {
-        bail!("URL targets RFC1918 private range: {}", ip);
+        return Err(blocked(&format!("URL targets RFC1918 private range: {}", ip)));
     }
     if ip.is_link_local() {
-        bail!("URL targets link-local range: {}", ip);
+        return Err(blocked(&format!("URL targets link-local range: {}", ip)));
     }
     if ip.is_multicast() {
-        bail!("URL targets multicast range: {}", ip);
+        return Err(blocked(&format!("URL targets multicast range: {}", ip)));
     }
     if ip.is_broadcast() {
-        bail!("URL targets broadcast: {}", ip);
+        return Err(blocked(&format!("URL targets broadcast: {}", ip)));
     }
     if ip.is_unspecified() {
-        bail!("URL targets unspecified address: {}", ip);
+        return Err(blocked(&format!("URL targets unspecified address: {}", ip)));
     }
     if ip.is_documentation() {
-        bail!("URL targets documentation range: {}", ip);
+        return Err(blocked(&format!("URL targets documentation range: {}", ip)));
     }
     // 100.64.0.0/10 — CGNAT. Not covered by `is_private`.
     let [a, b, _, _] = ip.octets();
     if a == 100 && (64..=127).contains(&b) {
-        bail!("URL targets CGNAT range: {}", ip);
+        return Err(blocked(&format!("URL targets CGNAT range: {}", ip)));
     }
     Ok(())
 }
 
 fn check_ipv6(ip: Ipv6Addr) -> Result<()> {
     if ip.is_loopback() {
-        bail!("URL targets IPv6 loopback: {}", ip);
+        return Err(blocked(&format!("URL targets IPv6 loopback: {}", ip)));
     }
     if ip.is_multicast() {
-        bail!("URL targets IPv6 multicast: {}", ip);
+        return Err(blocked(&format!("URL targets IPv6 multicast: {}", ip)));
     }
     if ip.is_unspecified() {
-        bail!("URL targets IPv6 unspecified: {}", ip);
+        return Err(blocked(&format!("URL targets IPv6 unspecified: {}", ip)));
     }
     // IPv4-mapped IPv6 (::ffff:a.b.c.d) — re-run IPv4 checks on the mapped addr.
     if let Some(v4) = ip.to_ipv4_mapped() {
@@ -132,11 +145,11 @@ fn check_ipv6(ip: Ipv6Addr) -> Result<()> {
     let segs = ip.segments();
     // fc00::/7 — unique local.
     if (segs[0] & 0xfe00) == 0xfc00 {
-        bail!("URL targets IPv6 unique-local range: {}", ip);
+        return Err(blocked(&format!("URL targets IPv6 unique-local range: {}", ip)));
     }
     // fe80::/10 — link-local.
     if (segs[0] & 0xffc0) == 0xfe80 {
-        bail!("URL targets IPv6 link-local range: {}", ip);
+        return Err(blocked(&format!("URL targets IPv6 link-local range: {}", ip)));
     }
     Ok(())
 }
@@ -155,12 +168,12 @@ fn check_domain(name: &str) -> Result<()> {
     ];
     for bad in BLOCKED_EXACT {
         if lower == *bad {
-            bail!("URL targets blocked host: {}", name);
+            return Err(blocked(&format!("URL targets blocked host: {}", name)));
         }
     }
     // .localhost and .internal TLDs.
     if lower.ends_with(".localhost") || lower.ends_with(".internal") {
-        bail!("URL targets blocked TLD: {}", name);
+        return Err(blocked(&format!("URL targets blocked TLD: {}", name)));
     }
     Ok(())
 }
@@ -335,6 +348,30 @@ mod tests {
         assert!(validate_url_str("http://metadata.google.internal/").is_err());
         assert!(validate_url_str("http://foo.internal/").is_err());
         assert!(validate_url_str("http://api.localhost/").is_err());
+    }
+
+    /// Reject errors must mention the override env var so an agent (or a
+    /// human reading the agent's tool output) can learn how to opt in.
+    /// Without the hint, a user pointing the agent at e.g. their local
+    /// Ollama or Pi-hole sees a flat error and the agent stalls.
+    #[test]
+    fn rejection_messages_mention_override_env() {
+        let cases = [
+            "http://127.0.0.1/",
+            "http://192.168.1.1/",
+            "http://localhost/",
+            "http://[fc00::1]/",
+            "http://169.254.169.254/",
+        ];
+        for url in cases {
+            let err = validate_url_str(url).unwrap_err().to_string();
+            assert!(
+                err.contains("FENNEC_ALLOW_PRIVATE_URLS"),
+                "{} → error missing override hint: {}",
+                url,
+                err
+            );
+        }
     }
 
     #[test]
