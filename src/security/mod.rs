@@ -1,4 +1,5 @@
 pub mod ct;
+pub mod fs;
 pub mod secrets;
 pub mod prompt_guard;
 pub mod pairing;
