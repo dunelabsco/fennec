@@ -1,4 +1,5 @@
 pub mod traits;
+pub mod proc_util;
 pub mod shell;
 pub mod files;
 pub mod web;

@@ -18,10 +18,17 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+use super::proc_util::{
+    run_with_timeout, scrub_sensitive_env, use_process_group,
+};
 use super::traits::{Tool, ToolResult};
+
+/// Per-stream output cap. 1 MB of print-loop output is plenty for the LLM
+/// to notice something is wrong; anything past this gets dropped.
+const MAX_STDOUT_BYTES: usize = 1_000_000;
+const MAX_STDERR_BYTES: usize = 200_000;
 
 /// Which language runner to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,49 +93,39 @@ impl CodeExecTool {
 
     /// Execute the code file with the language runner. Returns stdout,
     /// stderr, exit code, and a timed_out flag.
+    ///
+    /// Uses `proc_util::run_with_timeout` which drains stdout and stderr
+    /// concurrently with the wait — avoids the pipe-buffer deadlock where
+    /// a child that prints >64 KB blocks forever because `wait()` runs
+    /// before anyone reads the pipe.
+    ///
+    /// Also:
+    ///   - runs in its own process group so the timeout kill sends SIGKILL
+    ///     to the whole subtree (bash backgrounds, python subprocess,
+    ///     node worker threads) rather than just the direct child.
+    ///   - scrubs known-sensitive env vars (API keys, bot tokens) so a
+    ///     prompt-injected agent that writes `os.environ` can't exfiltrate.
     async fn run(&self, path: &std::path::Path, lang: Language) -> Result<ExecOutcome> {
         let mut cmd = Command::new(lang.runner());
         cmd.arg(path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
-        let mut child = cmd
+        scrub_sensitive_env(&mut cmd);
+        use_process_group(&mut cmd);
+
+        let child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {}", lang.runner()))?;
 
-        let mut stdout = child.stdout.take().context("no stdout")?;
-        let mut stderr = child.stderr.take().context("no stderr")?;
+        let spawn = run_with_timeout(child, self.timeout, MAX_STDOUT_BYTES, MAX_STDERR_BYTES).await?;
 
-        // `tokio::time::timeout` wraps `child.wait()` and returns Err on
-        // elapsed. We then own `child` back and can kill it safely.
-        match tokio::time::timeout(self.timeout, child.wait()).await {
-            Ok(status) => {
-                let status = status?;
-                let mut out = String::new();
-                let mut err = String::new();
-                stdout.read_to_string(&mut out).await.ok();
-                stderr.read_to_string(&mut err).await.ok();
-                Ok(ExecOutcome {
-                    stdout: out,
-                    stderr: err,
-                    exit_code: status.code(),
-                    timed_out: false,
-                })
-            }
-            Err(_elapsed) => {
-                let _ = child.kill().await;
-                let mut out = String::new();
-                let mut err = String::new();
-                stdout.read_to_string(&mut out).await.ok();
-                stderr.read_to_string(&mut err).await.ok();
-                Ok(ExecOutcome {
-                    stdout: out,
-                    stderr: err,
-                    exit_code: None,
-                    timed_out: true,
-                })
-            }
-        }
+        Ok(ExecOutcome {
+            stdout: String::from_utf8_lossy(&spawn.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&spawn.stderr).into_owned(),
+            exit_code: spawn.exit_code,
+            timed_out: spawn.timed_out,
+        })
     }
 }
 
@@ -477,6 +474,66 @@ mod tests {
         let path = t.write_code("print(1)", Language::Python).await.unwrap();
         assert!(path.exists());
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("py"));
+    }
+
+    /// Regression: a script that writes more than the pipe-buffer size
+    /// (~64 KB on Linux) used to deadlock under the wait-then-read pattern,
+    /// never exiting until the timeout fired. With concurrent drainage,
+    /// the child completes normally and the output is captured (up to
+    /// MAX_STDOUT_BYTES).
+    #[tokio::test]
+    async fn large_output_does_not_deadlock() {
+        if which("python3").is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let t = CodeExecTool::new(15, tmp.path().to_path_buf());
+        let r = t
+            .execute(json!({
+                // Print 200 KB of output — well past any pipe buffer.
+                "code": "import sys; sys.stdout.write('x' * 200_000)",
+                "language": "python"
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "output: {}", r.output);
+        assert!(!r.output.contains("timed out"));
+    }
+
+    /// Regression: sensitive env vars from the Fennec process must not
+    /// leak into the subprocess. Prompt-injected code should NOT be able
+    /// to read API keys via `os.environ`.
+    #[tokio::test]
+    async fn subprocess_does_not_inherit_sensitive_env() {
+        if which("python3").is_none() {
+            return;
+        }
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-scrub-code-exec");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let t = CodeExecTool::new(10, tmp.path().to_path_buf());
+        let r = t
+            .execute(json!({
+                "code": "import os; print(os.environ.get('ANTHROPIC_API_KEY', '<unset>'))",
+                "language": "python"
+            }))
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        assert!(r.success, "output: {}", r.output);
+        assert!(
+            r.output.contains("<unset>"),
+            "API key leaked to subprocess: {}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("sk-ant-test-scrub-code-exec"),
+            "secret leaked: {}",
+            r.output
+        );
     }
 
     /// Test helper: check if a binary exists on PATH.

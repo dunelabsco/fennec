@@ -16,10 +16,16 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+use super::proc_util::{run_with_timeout, use_process_group};
 use super::traits::{Tool, ToolResult};
+
+// A claude-code session can produce a lot of output (diffs, file listings).
+// Cap at 2 MB combined — past that the LLM is better off being told the
+// output was too large than being given context-blowing garbage.
+const MAX_STDOUT_BYTES: usize = 2_000_000;
+const MAX_STDERR_BYTES: usize = 200_000;
 
 /// Default per-call timeout. Claude Code sessions can take a while on big
 /// tasks; default is generous but not infinite.
@@ -121,8 +127,13 @@ impl Tool for ClaudeCodeCliTool {
         if let Some(d) = working_dir {
             cmd.current_dir(d);
         }
+        // Put claude + any subprocesses it spawns (git, cargo, editors) in
+        // one process group so the timeout's SIGKILL reaches the subtree,
+        // not just the direct child. NOTE: env is intentionally NOT scrubbed
+        // — claude-code needs Anthropic auth from env or ~/.claude.
+        use_process_group(&mut cmd);
 
-        let mut child = match cmd.spawn() {
+        let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult {
@@ -133,48 +144,39 @@ impl Tool for ClaudeCodeCliTool {
             }
         };
 
-        let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
+        let spawn = run_with_timeout(child, self.timeout, MAX_STDOUT_BYTES, MAX_STDERR_BYTES).await?;
 
-        match tokio::time::timeout(self.timeout, child.wait()).await {
-            Ok(Ok(status)) => {
-                let mut out = String::new();
-                let mut err = String::new();
-                stdout.read_to_string(&mut out).await.ok();
-                stderr.read_to_string(&mut err).await.ok();
-                let success = status.success();
-                let mut payload = out.trim_end().to_string();
-                if !err.trim().is_empty() {
-                    payload.push_str("\n\n--- claude stderr ---\n");
-                    payload.push_str(err.trim_end());
-                }
-                Ok(ToolResult {
-                    success,
-                    output: payload,
-                    error: if success {
-                        None
-                    } else {
-                        Some(format!("claude exited with {}", status))
-                    },
-                })
-            }
-            Ok(Err(e)) => Ok(ToolResult {
+        if spawn.timed_out {
+            return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("waiting for claude failed: {}", e)),
-            }),
-            Err(_elapsed) => {
-                let _ = child.kill().await;
-                Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "claude timed out after {}s",
-                        self.timeout.as_secs()
-                    )),
-                })
-            }
+                error: Some(format!(
+                    "claude timed out after {}s",
+                    self.timeout.as_secs()
+                )),
+            });
         }
+
+        let out = String::from_utf8_lossy(&spawn.stdout);
+        let err = String::from_utf8_lossy(&spawn.stderr);
+        let success = spawn.exit_code == Some(0);
+        let mut payload = out.trim_end().to_string();
+        if !err.trim().is_empty() {
+            payload.push_str("\n\n--- claude stderr ---\n");
+            payload.push_str(err.trim_end());
+        }
+        Ok(ToolResult {
+            success,
+            output: payload,
+            error: if success {
+                None
+            } else {
+                Some(format!(
+                    "claude exited with code {}",
+                    spawn.exit_code.unwrap_or(-1)
+                ))
+            },
+        })
     }
 
     fn is_read_only(&self) -> bool {
