@@ -131,11 +131,13 @@ static SCRUB_PATTERNS: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
         ),
 
         // -- Generic key=value catch-all (lowest priority) --
-        // Only applied AFTER the specific patterns above so real AWS /
-        // GCP / JWT / ... tokens end up tagged precisely rather than
-        // swept into the generic `[REDACTED_SECRET]` bucket.
+        // Only applied AFTER the specific patterns above. The value
+        // matcher excludes `[` as the leading char so already-redacted
+        // placeholders (`[REDACTED_GITHUB_TOKEN]`, `[REDACTED_JWT]`, …)
+        // are left intact instead of being clobbered into a generic
+        // `[REDACTED_SECRET]`.
         (
-            Regex::new(r"(?i)(password|passwd|secret|token|api_key)\s*[=:]\s*\S+").unwrap(),
+            Regex::new(r"(?i)(password|passwd|secret|token|api_key)\s*[=:]\s*[^\[\s]\S*").unwrap(),
             "[REDACTED_SECRET]",
         ),
     ]
@@ -286,10 +288,11 @@ mod tests {
         assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
     }
 
-    /// Regression for T3-A: GCP API keys.
+    /// Regression for T3-A: GCP API keys. Real GCP keys are 39 chars
+    /// total (4-char `AIza` prefix + 35-char body).
     #[test]
     fn scrubs_gcp_api_key() {
-        let out = scrub_text("key: AIzaSyA-1234567890abcdefghijklmnopqrstuvw");
+        let out = scrub_text("AIzaSyA-1234567890abcdefghijklmnopqrstu");
         assert!(out.contains("[REDACTED_GCP_KEY]"), "got: {}", out);
     }
 

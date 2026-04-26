@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Describes the context in which an experience occurred.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExperienceContext {
     pub tools_used: Vec<String>,
     pub environment: String,
