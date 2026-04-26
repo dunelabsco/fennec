@@ -15,9 +15,18 @@
 //!    doesn't exist yet (write case), the deepest existing ancestor is
 //!    canonicalized and the non-existing tail is appended literally.
 //! 2. Runs the canonical path through the `security.forbidden_paths`
-//!    denylist from config. Each denied entry is a substring match against
-//!    the canonical path string (e.g. `.ssh`, `.gnupg`, `.aws`,
-//!    `.fennec/config.toml`, `.fennec/.secret_key`).
+//!    denylist from config. Each denied entry is matched **by path
+//!    components**, not by raw substring. So `.ssh` rejects `~/.ssh/id_rsa`
+//!    but does *not* reject `~/projects/.sshare/notes.md` (the substring
+//!    `.ssh` appears inside `.sshare` but it isn't a complete component).
+//!    Patterns starting with `/` are anchored to the filesystem root;
+//!    patterns without a leading slash match anywhere as a contiguous
+//!    component run.
+//!
+//!    We started with naive `String::contains` here, which is what flagged
+//!    legitimate paths like `/home/user/letsencrypt/...` (substring "etc"
+//!    inside "letsencrypt") and `~/Documents/.ssh-tools-doc.txt`. Component
+//!    matching keeps the same denials we want without those false positives.
 //!
 //! The sandbox is a *denylist*, not an allowlist root. Agents are often
 //! asked to touch `/tmp/...` or `~/Downloads/...`, so requiring a
@@ -26,7 +35,7 @@
 //! easy to extend via config.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
@@ -37,9 +46,13 @@ use anyhow::{bail, Context, Result};
 /// `Default` for tests / unconfigured setups.
 #[derive(Debug, Clone, Default)]
 pub struct PathSandbox {
-    /// Substrings in the canonicalized path that cause a reject. Matched
-    /// case-sensitively on Unix / Linux; on macOS we also match
-    /// case-insensitively because HFS+ is case-insensitive by default.
+    /// Component-aware denial patterns. Each entry is a path-like string
+    /// (e.g. `.ssh`, `.config/gcloud`, `/etc`, `.fennec/config.toml`).
+    /// Matched component-by-component against the canonical path —
+    /// patterns starting with `/` are anchored to the filesystem root,
+    /// patterns without a leading slash match a contiguous component run
+    /// anywhere in the path. macOS uses case-insensitive comparison
+    /// because HFS+ is case-insensitive by default.
     denied: Vec<String>,
 }
 
@@ -66,28 +79,13 @@ impl PathSandbox {
             format!("resolving path: {}", path.display())
         })?;
 
-        let canonical_str = canonical.to_string_lossy();
         for pat in &self.denied {
-            if canonical_str.contains(pat.as_str()) {
+            if path_matches_pattern(&canonical, pat) {
                 bail!(
                     "path matches forbidden pattern '{}': {}",
                     pat,
                     canonical.display()
                 );
-            }
-            #[cfg(target_os = "macos")]
-            {
-                if canonical_str
-                    .to_lowercase()
-                    .contains(&pat.to_lowercase())
-                    && !canonical_str.contains(pat.as_str())
-                {
-                    bail!(
-                        "path matches forbidden pattern '{}' (case-insensitive): {}",
-                        pat,
-                        canonical.display()
-                    );
-                }
             }
         }
         Ok(canonical)
@@ -98,6 +96,70 @@ impl PathSandbox {
     pub fn is_empty(&self) -> bool {
         self.denied.is_empty()
     }
+}
+
+/// Component-aware match: does `path` contain a contiguous run of
+/// components equal to the components of `pattern`? Patterns starting with
+/// `/` are anchored to the root of the path; otherwise the run can start
+/// at any position.
+///
+/// We compare via `OsStr` to stay correct on platforms with non-UTF-8 path
+/// components, falling back to case-insensitive comparison via
+/// `to_string_lossy` on macOS (HFS+ default is case-insensitive).
+fn path_matches_pattern(path: &Path, pattern: &str) -> bool {
+    let pat_parts: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    if pat_parts.is_empty() {
+        return false;
+    }
+    let anchored = pattern.starts_with('/');
+
+    let path_parts: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            // RootDir/Prefix/CurDir/ParentDir are not real components —
+            // canonicalization should have eliminated CurDir/ParentDir; we
+            // skip the rest because they aren't matched against names.
+            _ => None,
+        })
+        .collect();
+
+    if path_parts.len() < pat_parts.len() {
+        return false;
+    }
+
+    let max_start = if anchored {
+        0
+    } else {
+        path_parts.len() - pat_parts.len()
+    };
+
+    for start in 0..=max_start {
+        if window_matches(&path_parts[start..start + pat_parts.len()], &pat_parts) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Compare a window of path components against a pattern's parts.
+fn window_matches(window: &[&std::ffi::OsStr], pat_parts: &[&str]) -> bool {
+    for (a, b) in window.iter().zip(pat_parts.iter()) {
+        let matches = a.to_str() == Some(*b) || {
+            #[cfg(target_os = "macos")]
+            {
+                a.to_string_lossy().to_lowercase() == b.to_lowercase()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
+        if !matches {
+            return false;
+        }
+    }
+    true
 }
 
 /// Canonicalize `path` if it exists. If it doesn't, walk up to find the
@@ -218,6 +280,80 @@ mod tests {
         let s = PathSandbox::new(vec!["/etc".to_string()]);
         let r = s.check(Path::new("/etc/new-file-we-are-writing.txt"));
         assert!(r.is_err());
+    }
+
+    /// The old substring match rejected `/home/user/letsencrypt/notes`
+    /// because the substring "etc" appeared in "letsencrypt". Component
+    /// matching gets it right.
+    #[test]
+    fn substring_etc_inside_letsencrypt_is_not_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("letsencrypt");
+        std::fs::create_dir(&dir).unwrap();
+        let f = dir.join("notes.txt");
+        std::fs::write(&f, b"hi").unwrap();
+
+        let s = PathSandbox::new(vec!["/etc".to_string()]);
+        assert!(
+            s.check(&f).is_ok(),
+            "letsencrypt directory must not be confused with /etc"
+        );
+    }
+
+    /// Same shape: `.ssh` should not match `.sshare`.
+    #[test]
+    fn substring_ssh_inside_sshare_is_not_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".sshare");
+        std::fs::create_dir(&dir).unwrap();
+        let f = dir.join("notes.md");
+        std::fs::write(&f, b"hi").unwrap();
+
+        let s = PathSandbox::new(vec![".ssh".to_string()]);
+        assert!(
+            s.check(&f).is_ok(),
+            ".sshare must not be confused with .ssh"
+        );
+    }
+
+    /// `.config/gcloud` should match the directory but NOT `.config/gcloud-tools`
+    /// or `.config/foo/gcloud`.
+    #[test]
+    fn config_gcloud_pattern_is_component_anchored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join(".config");
+        std::fs::create_dir(&cfg).unwrap();
+
+        // True positive: .config/gcloud/auth.json
+        let real = cfg.join("gcloud");
+        std::fs::create_dir(&real).unwrap();
+        let f = real.join("auth.json");
+        std::fs::write(&f, b"hi").unwrap();
+        let s = PathSandbox::new(vec![".config/gcloud".to_string()]);
+        assert!(s.check(&f).is_err());
+
+        // False positive case: .config/gcloud-tool/notes.txt — different
+        // component, must not match.
+        let other = cfg.join("gcloud-tool");
+        std::fs::create_dir(&other).unwrap();
+        let f2 = other.join("notes.txt");
+        std::fs::write(&f2, b"hi").unwrap();
+        assert!(s.check(&f2).is_ok(), "gcloud-tool != gcloud as a component");
+    }
+
+    /// Anchored patterns (starting with `/`) only match from the root.
+    #[test]
+    fn root_anchored_pattern_only_matches_from_root() {
+        let s = PathSandbox::new(vec!["/etc".to_string()]);
+        // /etc/passwd matches.
+        assert!(s.check(Path::new("/etc/passwd")).is_err());
+        // /home/user/etc/notes does NOT match because /etc is anchored.
+        let tmp = tempfile::tempdir().unwrap();
+        let etc_under_home = tmp.path().join("etc");
+        std::fs::create_dir(&etc_under_home).unwrap();
+        let f = etc_under_home.join("notes.txt");
+        std::fs::write(&f, b"hi").unwrap();
+        assert!(s.check(&f).is_ok(), "/etc anchored pattern must not match etc/ deeper in tree");
     }
 
     #[test]
