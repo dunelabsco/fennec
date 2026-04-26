@@ -45,13 +45,18 @@ impl SqliteMemory {
         let conn = Connection::open(&db_path)
             .with_context(|| format!("opening sqlite db at {}", db_path.display()))?;
 
-        // Performance PRAGMAs
+        // Performance + integrity PRAGMAs. `foreign_keys = ON` is
+        // required for `REFERENCES` clauses to actually be enforced —
+        // without it, declared FKs are parsed but ignored, so a bad row
+        // can silently land with a dangling reference (the audit flagged
+        // this for memories.superseded_by).
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA mmap_size = 8388608;
              PRAGMA cache_size = -2000;
-             PRAGMA temp_store = MEMORY;",
+             PRAGMA temp_store = MEMORY;
+             PRAGMA foreign_keys = ON;",
         )
         .context("applying PRAGMAs")?;
 
@@ -222,16 +227,9 @@ fn keyword_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<(String, f64)>> {
-    // Build FTS5 query: wrap each word in quotes, join with OR.
-    let fts_query: String = query
-        .split_whitespace()
-        .map(|w| format!("\"{}\"", w))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-
-    if fts_query.is_empty() {
+    let Some(fts_query) = super::fts::build_match_query(query) else {
         return Ok(vec![]);
-    }
+    };
 
     let mut stmt = conn.prepare(
         "SELECT m.id, bm25(memories_fts) AS score
@@ -667,16 +665,9 @@ impl SqliteMemory {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
 
-            // Build FTS5 query: wrap each word in quotes, join with OR.
-            let fts_query: String = query
-                .split_whitespace()
-                .map(|w| format!("\"{}\"", w))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-
-            if fts_query.is_empty() {
+            let Some(fts_query) = super::fts::build_match_query(&query) else {
                 return Ok(vec![]);
-            }
+            };
 
             let mut stmt = conn.prepare(
                 "SELECT e.id, e.goal, e.context_json, e.attempts_json, e.solution,

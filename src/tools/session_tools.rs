@@ -63,7 +63,7 @@ impl Tool for SessionSearchTool {
 
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
 
-        match self.store.search(&query, limit) {
+        match self.store.search(&query, limit).await {
             Ok(hits) => {
                 if hits.is_empty() {
                     return Ok(ToolResult {
@@ -145,7 +145,7 @@ impl Tool for SessionListTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
 
-        match self.store.list_sessions(limit) {
+        match self.store.list_sessions(limit).await {
             Ok(sessions) => {
                 if sessions.is_empty() {
                     return Ok(ToolResult {
