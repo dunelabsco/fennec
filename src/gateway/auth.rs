@@ -6,6 +6,7 @@ use axum::{
 };
 
 use super::routes::AppState;
+use crate::security::ct::ct_eq_hashed;
 
 /// Middleware that checks `Authorization: Bearer <token>` header.
 ///
@@ -34,7 +35,7 @@ pub async fn auth_middleware(
     match auth_header {
         Some(header) if header.starts_with("Bearer ") => {
             let provided = &header["Bearer ".len()..];
-            if provided == required {
+            if ct_eq_hashed(provided, required) {
                 Ok(next.run(request).await)
             } else {
                 Err(StatusCode::UNAUTHORIZED)

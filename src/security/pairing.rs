@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 /// Guards DM access via a pairing code flow with brute-force lockout.
 ///
@@ -69,15 +70,28 @@ impl PairingGuard {
             }
         }
 
-        let expected = self
-            .code
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("no pairing code has been generated"))?;
+        // Hash the input unconditionally so timing does not distinguish
+        // "no code generated" from "wrong code" cases.
+        let input_hash = Sha256::digest(input.as_bytes());
 
-        // Constant-time comparison via hashing both sides.
-        let input_hash = sha256_hex(input);
-        let expected_hash = sha256_hex(expected);
-        if input_hash != expected_hash {
+        let matched = match self.code.as_deref() {
+            Some(expected) => {
+                let expected_hash = Sha256::digest(expected.as_bytes());
+                // Constant-time compare on the 32-byte digests — short-circuiting
+                // equality on the hex String would leak timing.
+                bool::from(input_hash.as_slice().ct_eq(expected_hash.as_slice()))
+            }
+            None => {
+                // Dummy compare against a fixed digest keeps the timing
+                // profile aligned with the Some branch. The result is
+                // ignored; we still return the distinct error below.
+                let dummy = Sha256::digest(b"");
+                let _ = input_hash.as_slice().ct_eq(dummy.as_slice());
+                return Err(anyhow::anyhow!("no pairing code has been generated"));
+            }
+        };
+
+        if !matched {
             let entry = self
                 .failed_attempts
                 .entry(client_id.to_string())
@@ -179,5 +193,36 @@ mod tests {
         let code = guard.generate_code();
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn verify_without_code_returns_distinct_error() {
+        // When no code has been generated, the error should still be the
+        // specific "no pairing code" message (preserving the existing
+        // contract) — the timing of the work that produced it is now
+        // equalized via a dummy compare, but the user-visible behavior
+        // is unchanged.
+        let mut guard = PairingGuard::new(None);
+        let err = guard.verify_code("x", "123456").unwrap_err().to_string();
+        assert!(
+            err.contains("no pairing code"),
+            "expected 'no pairing code' message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_wrong_code_with_correct_code_set() {
+        let mut guard = PairingGuard::new(None);
+        let code = guard.generate_code();
+        // Pick a deterministically-different wrong code.
+        let wrong = if code == "000000" { "000001" } else { "000000" };
+        let err = guard
+            .verify_code("x", wrong)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid pairing code"),
+            "expected 'invalid pairing code' message, got: {err}"
+        );
     }
 }
