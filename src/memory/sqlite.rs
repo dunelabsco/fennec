@@ -78,6 +78,12 @@ impl SqliteMemory {
 
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
+            -- Session/namespace queries previously table-scanned because no
+            -- index backed these columns. `superseded_by` is touched by
+            -- cleanup queries that look for dangling pointers.
+            CREATE INDEX IF NOT EXISTS idx_memories_session_id ON memories(session_id);
+            CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
+            CREATE INDEX IF NOT EXISTS idx_memories_superseded_by ON memories(superseded_by);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 key, content, content='memories', content_rowid='rowid'
@@ -175,7 +181,24 @@ impl SqliteMemory {
                 VALUES ('delete', old.rowid, old.goal, COALESCE(old.solution, ''));
                 INSERT INTO collective_cache_fts(rowid, goal, solution)
                 VALUES (new.rowid, new.goal, COALESCE(new.solution, ''));
-            END;",
+            END;
+
+            -- Idempotent dedupe of duplicate `original_id` rows before the
+            -- UNIQUE index goes in. Previously cache_result did a
+            -- DELETE + INSERT pair with no constraint, so two concurrent
+            -- callers could land two rows for the same original_id.
+            -- Keeps the row with the smallest rowid per original_id group.
+            DELETE FROM collective_cache
+            WHERE rowid NOT IN (
+                SELECT MIN(rowid) FROM collective_cache GROUP BY original_id
+            );
+
+            -- UNIQUE index on original_id serves two purposes: makes
+            -- subsequent accidental duplicates fail-loud at INSERT time,
+            -- and gives cache_result's new ON CONFLICT upsert a target
+            -- to reference.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_collective_cache_original_id
+                ON collective_cache(original_id);",
         )
         .context("creating schema")?;
 

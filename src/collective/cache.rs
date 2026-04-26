@@ -35,17 +35,31 @@ impl CollectiveCache {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
-            // Use original_id for deduplication: delete any existing entry with same original_id
-            // then insert the new one. This effectively does INSERT OR REPLACE keyed on original_id.
-            conn.execute(
-                "DELETE FROM collective_cache WHERE original_id = ?1",
-                rusqlite::params![original_id],
-            )?;
+            // Single-statement atomic upsert keyed on original_id. The old
+            // implementation was DELETE + INSERT, which (a) wasn't atomic —
+            // two concurrent callers with the same original_id could both
+            // delete, both insert, and land two rows — and (b) discarded
+            // the row's `last_used` history on every re-cache.
+            //
+            // ON CONFLICT targets the UNIQUE index
+            // `idx_collective_cache_original_id` added in the schema. The
+            // DO UPDATE clause intentionally leaves `id`, `original_id`,
+            // and `last_used` untouched so mark_used() history survives.
             conn.execute(
                 "INSERT INTO collective_cache
                  (id, original_id, source_server, goal, solution, gotchas_json,
                   trust_score, relevance_score, outcome_success, outcome_failure, cached_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(original_id) DO UPDATE SET
+                     source_server   = excluded.source_server,
+                     goal            = excluded.goal,
+                     solution        = excluded.solution,
+                     gotchas_json    = excluded.gotchas_json,
+                     trust_score     = excluded.trust_score,
+                     relevance_score = excluded.relevance_score,
+                     outcome_success = excluded.outcome_success,
+                     outcome_failure = excluded.outcome_failure,
+                     cached_at       = excluded.cached_at",
                 rusqlite::params![
                     id,
                     original_id,
@@ -181,5 +195,164 @@ impl CollectiveCache {
             Ok(deleted)
         })
         .await?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collective::traits::OutcomeReports;
+    use crate::memory::embedding::NoopEmbedding;
+    use crate::memory::sqlite::SqliteMemory;
+    use tempfile::TempDir;
+
+    async fn fixture() -> (Arc<SqliteMemory>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("mem.db");
+        let mem = SqliteMemory::new(
+            db_path,
+            0.7,
+            0.3,
+            1024,
+            Arc::new(NoopEmbedding::new(1536)),
+        )
+        .unwrap();
+        (Arc::new(mem), dir)
+    }
+
+    fn mk_result(id: &str, goal: &str) -> CollectiveSearchResult {
+        CollectiveSearchResult {
+            id: id.to_string(),
+            goal: goal.to_string(),
+            solution: Some("sol".to_string()),
+            gotchas: vec![],
+            trust_score: 0.8,
+            relevance_score: 0.9,
+            outcome_reports: OutcomeReports {
+                success: 1,
+                failure: 0,
+            },
+        }
+    }
+
+    /// Regression for T3-F: caching twice with the same original_id
+    /// used to race on DELETE+INSERT and could produce two rows.
+    /// With the UNIQUE index + ON CONFLICT DO UPDATE, the second
+    /// call atomically updates the first row.
+    #[tokio::test]
+    async fn cache_result_twice_leaves_single_row() {
+        let (mem, _dir) = fixture().await;
+        let cache = CollectiveCache::new(Arc::clone(&mem));
+
+        let first = mk_result("same-id", "first goal");
+        let second = mk_result("same-id", "second goal");
+
+        cache.cache_result(&first, "plurum").await.unwrap();
+        cache.cache_result(&second, "plurum").await.unwrap();
+
+        // Exactly one row should exist for this original_id.
+        let conn = mem.connection();
+        let count: i64 = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT COUNT(*) FROM collective_cache WHERE original_id = ?1",
+                rusqlite::params!["same-id"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "expected exactly one row per original_id");
+
+        // And the row should reflect the SECOND call's fields.
+        let conn = mem.connection();
+        let goal: String = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT goal FROM collective_cache WHERE original_id = ?1",
+                rusqlite::params!["same-id"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(goal, "second goal");
+    }
+
+    /// Regression for T3-F: mark_used sets last_used. Re-caching the
+    /// same original_id must NOT reset last_used (the ON CONFLICT
+    /// clause is deliberately selective about which columns to
+    /// overwrite).
+    #[tokio::test]
+    async fn re_cache_preserves_last_used() {
+        let (mem, _dir) = fixture().await;
+        let cache = CollectiveCache::new(Arc::clone(&mem));
+
+        cache.cache_result(&mk_result("k", "g"), "plurum").await.unwrap();
+        cache.mark_used("k").await.unwrap();
+
+        // Grab the last_used timestamp.
+        let conn = mem.connection();
+        let before: Option<String> = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT last_used FROM collective_cache WHERE original_id = ?1",
+                rusqlite::params!["k"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(before.is_some());
+
+        // Re-cache.
+        cache.cache_result(&mk_result("k", "new goal"), "plurum").await.unwrap();
+
+        // last_used must still be the value mark_used set.
+        let conn = mem.connection();
+        let after: Option<String> = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT last_used FROM collective_cache WHERE original_id = ?1",
+                rusqlite::params!["k"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(after, before, "re-cache must not clear last_used");
+    }
+
+    /// Sanity: the UNIQUE index on original_id is in place — a raw
+    /// INSERT with a duplicate must fail. (This guards against future
+    /// schema edits accidentally dropping the index.)
+    #[tokio::test]
+    async fn unique_index_on_original_id_enforced() {
+        let (mem, _dir) = fixture().await;
+        let cache = CollectiveCache::new(Arc::clone(&mem));
+        cache.cache_result(&mk_result("unique-test", "g"), "plurum").await.unwrap();
+
+        // Try to bypass the upsert path and do a raw INSERT — should fail.
+        let conn = mem.connection();
+        let dup_err = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO collective_cache
+                 (id, original_id, source_server, goal, solution, gotchas_json,
+                  trust_score, relevance_score, outcome_success, outcome_failure, cached_at)
+                 VALUES ('another-uuid', 'unique-test', 's', 'g', NULL, '[]', 0.5, NULL, 0, 0, 'now')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            dup_err.is_err(),
+            "raw INSERT with duplicate original_id must fail the UNIQUE index"
+        );
     }
 }

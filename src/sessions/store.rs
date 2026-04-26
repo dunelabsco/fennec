@@ -78,6 +78,14 @@ impl SessionStore {
                 timestamp TEXT NOT NULL
             );
 
+            -- Indexes for per-channel session lookup and for the
+            -- session_id FK join in search. Without these, every
+            -- `list_sessions` scan and every JOIN in search had to
+            -- full-scan.
+            CREATE INDEX IF NOT EXISTS idx_sessions_channel ON sessions(channel);
+            CREATE INDEX IF NOT EXISTS idx_session_messages_session_id
+                ON session_messages(session_id);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(
                 content,
                 content=session_messages,
