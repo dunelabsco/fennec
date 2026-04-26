@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 pub struct CronJob {
     pub id: String,
     pub name: String,
-    /// Schedule expression: "every 30m", "every 1h", "every 24h", "every 7d"
+    /// Schedule expression. Recurring: "every 30m", "every 1h", "every 24h",
+    /// "every 7d". Bare durations ("5m", "1h") are treated as one-shot
+    /// delays — fired once after the delay, then disabled.
     pub schedule: String,
     /// Message to send to the agent when this job fires.
     pub command: String,
@@ -35,28 +37,74 @@ impl JobStore {
         }
     }
 
-    /// Load jobs from the backing file. If the file doesn't exist, start empty.
+    /// Load jobs from the backing file. If the file doesn't exist, start
+    /// empty. If the file exists but is corrupted (not valid JSON / wrong
+    /// shape), rename it to `<path>.bad-<timestamp>` and start empty. The
+    /// old behavior — propagating the parse error — would abort fennec
+    /// startup on a single malformed jobs.json, which is a much worse
+    /// failure mode than losing the one bad file.
     pub fn load(&mut self) -> Result<()> {
         if !self.path.exists() {
             return Ok(());
         }
         let data = std::fs::read_to_string(&self.path)
             .with_context(|| format!("reading job store from {}", self.path.display()))?;
-        self.jobs = serde_json::from_str(&data)
-            .with_context(|| format!("parsing job store from {}", self.path.display()))?;
-        Ok(())
+        match serde_json::from_str::<Vec<CronJob>>(&data) {
+            Ok(jobs) => {
+                self.jobs = jobs;
+                Ok(())
+            }
+            Err(e) => {
+                let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+                let bad_path = self.path.with_extension(format!("bad-{}", ts));
+                let _ = std::fs::rename(&self.path, &bad_path);
+                tracing::warn!(
+                    "Cron job store at {} is corrupted ({}); moved to {}, starting empty",
+                    self.path.display(),
+                    e,
+                    bad_path.display()
+                );
+                self.jobs = Vec::new();
+                Ok(())
+            }
+        }
     }
 
-    /// Persist the current job list to the backing file.
+    /// Persist the current job list to the backing file atomically.
+    ///
+    /// Writes to a sibling tempfile and then `rename(2)`s into place, so a
+    /// crash mid-write never leaves `jobs.json` truncated / empty. The old
+    /// `std::fs::write` truncated the target first and wrote incrementally
+    /// — a crash during that window lost every scheduled job.
     pub fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating parent dir {}", parent.display()))?;
+            }
         }
         let data = serde_json::to_string_pretty(&self.jobs)
             .context("serializing job store")?;
-        std::fs::write(&self.path, data)
-            .with_context(|| format!("writing job store to {}", self.path.display()))?;
-        Ok(())
+
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("jobs.json");
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let tmp_path = parent.join(format!(".{}.tmp.{}", file_name, std::process::id()));
+
+        let result = (|| -> Result<()> {
+            std::fs::write(&tmp_path, &data)
+                .with_context(|| format!("writing tempfile {}", tmp_path.display()))?;
+            std::fs::rename(&tmp_path, &self.path)
+                .with_context(|| format!("renaming {} to {}", tmp_path.display(), self.path.display()))
+        })();
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        result
     }
 
     /// Add a job to the store.
@@ -87,39 +135,67 @@ impl JobStore {
     }
 }
 
-/// Parse a schedule string like "every 30m", "every 1h", "every 7d", or a
-/// bare duration like "5m", "1h" into the interval in seconds.
+/// How a schedule string should be interpreted by the scheduler.
 ///
-/// Bare durations (without the "every " prefix) are treated as one-shot
-/// delays but still return the number of seconds, so that the scheduler
-/// can fire the job once after the given delay.
+/// The old single `Option<u64>` interval lost the distinction between
+/// "fire every N seconds forever" and "fire once N seconds from now",
+/// so bare durations like `"5m"` re-fired on every scheduler tick after
+/// the first — because `elapsed >= interval` stayed true forever. The
+/// scheduler now uses this enum to enforce one-shot semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleKind {
+    /// "every Nu" — fire every interval_secs seconds.
+    Recurring { interval_secs: u64 },
+    /// bare "Nu" — fire once, delay_secs after the job is scheduled.
+    OneShot { delay_secs: u64 },
+}
+
+impl ScheduleKind {
+    pub fn seconds(&self) -> u64 {
+        match self {
+            ScheduleKind::Recurring { interval_secs } => *interval_secs,
+            ScheduleKind::OneShot { delay_secs } => *delay_secs,
+        }
+    }
+}
+
+/// Parse a schedule string into a [`ScheduleKind`].
 ///
-/// Supported units:
-/// - `s` — seconds
-/// - `m` — minutes
-/// - `h` — hours
-/// - `d` — days
+/// Recurring: `"every 30m"`, `"every 1h"`, `"every 24h"`, `"every 7d"`.
+/// One-shot: `"5m"`, `"1h"`, `"30s"` (no `every` prefix — delay-then-fire-once).
 ///
-/// Returns `None` if the format is invalid.
-pub fn parse_schedule(schedule: &str) -> Option<u64> {
+/// Supported units: `s`, `m`, `h`, `d`.
+///
+/// Returns `None` for:
+/// - empty input
+/// - a number with no unit
+/// - zero (would produce a busy-loop in the scheduler)
+/// - arithmetic overflow (very large numbers times large multipliers)
+/// - unknown units
+pub fn parse_schedule_kind(schedule: &str) -> Option<ScheduleKind> {
     let trimmed = schedule.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
 
-    // Strip optional "every " prefix; bare durations are also accepted.
-    let rest = trimmed
-        .strip_prefix("every ")
-        .unwrap_or(trimmed)
-        .trim();
-
+    let (rest, recurring) = match trimmed.strip_prefix("every ") {
+        Some(r) => (r.trim(), true),
+        None => (trimmed, false),
+    };
     if rest.is_empty() {
         return None;
     }
 
-    // Split numeric part from unit suffix.
     let unit_pos = rest.find(|c: char| c.is_alphabetic())?;
     let (num_str, unit) = rest.split_at(unit_pos);
     let num: u64 = num_str.trim().parse().ok()?;
+    // Zero produces a busy-loop in the scheduler — elapsed is always
+    // >= 0, so the job would fire on every tick in a tight loop.
+    if num == 0 {
+        return None;
+    }
 
-    let multiplier = match unit.trim() {
+    let multiplier: u64 = match unit.trim() {
         "s" => 1,
         "m" => 60,
         "h" => 3600,
@@ -127,7 +203,25 @@ pub fn parse_schedule(schedule: &str) -> Option<u64> {
         _ => return None,
     };
 
-    Some(num * multiplier)
+    // checked_mul — prevents u64 overflow panics in debug mode on
+    // absurd inputs like "every 9999999999999999d".
+    let seconds = num.checked_mul(multiplier)?;
+
+    Some(if recurring {
+        ScheduleKind::Recurring {
+            interval_secs: seconds,
+        }
+    } else {
+        ScheduleKind::OneShot {
+            delay_secs: seconds,
+        }
+    })
+}
+
+/// Back-compat wrapper: returns just the seconds, discarding the recurring
+/// vs one-shot distinction. Prefer [`parse_schedule_kind`] in new code.
+pub fn parse_schedule(schedule: &str) -> Option<u64> {
+    parse_schedule_kind(schedule).map(|k| k.seconds())
 }
 
 #[cfg(test)]
@@ -169,5 +263,129 @@ mod tests {
         assert_eq!(parse_schedule("every abc"), None);
         assert_eq!(parse_schedule("every 30x"), None);
         assert_eq!(parse_schedule("abc"), None);
+    }
+
+    #[test]
+    fn parse_schedule_kind_classifies_recurring_vs_oneshot() {
+        assert_eq!(
+            parse_schedule_kind("every 30m"),
+            Some(ScheduleKind::Recurring { interval_secs: 1800 })
+        );
+        assert_eq!(
+            parse_schedule_kind("30m"),
+            Some(ScheduleKind::OneShot { delay_secs: 1800 })
+        );
+    }
+
+    #[test]
+    fn parse_schedule_rejects_zero() {
+        // Without this, "every 0s" would return Some(0) and cause the
+        // scheduler to fire the job on every tick in a tight loop.
+        assert_eq!(parse_schedule("every 0s"), None);
+        assert_eq!(parse_schedule("0m"), None);
+        assert_eq!(parse_schedule("every 0h"), None);
+    }
+
+    #[test]
+    fn parse_schedule_rejects_overflow() {
+        // u64::MAX days would panic in debug / wrap in release without
+        // checked_mul.
+        assert_eq!(parse_schedule("every 9999999999999999d"), None);
+        assert_eq!(parse_schedule("18446744073709551615d"), None);
+    }
+
+    #[test]
+    fn parse_schedule_accepts_large_but_safe() {
+        // Still accepts reasonable large values.
+        assert_eq!(parse_schedule("every 100d"), Some(8_640_000));
+    }
+
+    #[test]
+    fn save_is_atomic_no_tempfile_leaks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("jobs.json");
+        let mut store = JobStore::new(path.clone());
+        store.add_job(CronJob {
+            id: "a".into(),
+            name: "test".into(),
+            schedule: "every 1h".into(),
+            command: "noop".into(),
+            enabled: true,
+            last_run: None,
+            origin_channel: None,
+            origin_chat_id: None,
+        });
+        store.save().unwrap();
+        // After a clean save, the parent directory must contain exactly
+        // the final file — no .tmp.* siblings.
+        let leaks: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.contains(".tmp.")
+            })
+            .collect();
+        assert!(leaks.is_empty(), "tempfiles left behind: {:?}", leaks);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn load_recovers_from_corrupt_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("jobs.json");
+        std::fs::write(&path, b"this is not json at all").unwrap();
+
+        let mut store = JobStore::new(path.clone());
+        // The old implementation would return Err here, aborting fennec
+        // startup. The new load() must succeed with an empty store.
+        store.load().expect("corrupt jobs.json must not block startup");
+        assert!(store.list_jobs().is_empty());
+
+        // The bad file must have been moved aside (with a .bad- extension),
+        // preserving it for post-mortem inspection.
+        let bad_files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".bad-")
+            })
+            .collect();
+        assert_eq!(
+            bad_files.len(),
+            1,
+            "expected exactly one .bad-<ts> file, got: {:?}",
+            bad_files
+        );
+    }
+
+    #[test]
+    fn save_then_load_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("jobs.json");
+        let mut store = JobStore::new(path.clone());
+        store.add_job(CronJob {
+            id: "x".into(),
+            name: "test".into(),
+            schedule: "every 30m".into(),
+            command: "do a thing".into(),
+            enabled: true,
+            last_run: None,
+            origin_channel: Some("telegram".into()),
+            origin_chat_id: Some("123".into()),
+        });
+        store.save().unwrap();
+
+        let mut reloaded = JobStore::new(path);
+        reloaded.load().unwrap();
+        assert_eq!(reloaded.list_jobs().len(), 1);
+        assert_eq!(reloaded.list_jobs()[0].id, "x");
+        assert_eq!(
+            reloaded.list_jobs()[0].origin_channel.as_deref(),
+            Some("telegram")
+        );
     }
 }

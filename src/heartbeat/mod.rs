@@ -46,8 +46,14 @@ impl HeartbeatService {
     }
 
     /// Run the heartbeat loop. This blocks until the task is cancelled.
+    ///
+    /// `MissedTickBehavior::Skip` prevents a rapid-fire catch-up after the
+    /// machine wakes from sleep. With the default `Burst`, a laptop that
+    /// was suspended for 8 hours would immediately fire 16 heartbeats
+    /// back-to-back on wake — which in turn fires 16 LLM calls.
     pub async fn run(&self) {
         let mut interval = tokio::time::interval(Duration::from_secs(self.interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             interval.tick().await;
