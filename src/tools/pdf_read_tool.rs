@@ -10,6 +10,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str};
+
 use super::traits::{Tool, ToolResult};
 
 pub struct PdfReadTool {
@@ -21,10 +23,7 @@ pub struct PdfReadTool {
 
 impl PdfReadTool {
     pub fn new(temp_dir: PathBuf) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .expect("build reqwest client for pdf read");
+        let client = build_guarded_client(std::time::Duration::from_secs(60));
         Self {
             client,
             temp_dir,
@@ -44,12 +43,18 @@ impl PdfReadTool {
     /// Returns (path, is_temp) — caller deletes the file when is_temp=true.
     async fn resolve_to_local(&self, source: &str) -> Result<(PathBuf, bool)> {
         if source.starts_with("http://") || source.starts_with("https://") {
+            validate_url_str(source)?;
             tokio::fs::create_dir_all(&self.temp_dir).await?;
-            let bytes = self.client.get(source).send().await?.bytes().await?;
-            if bytes.len() > self.max_size_bytes {
+            let resp = self.client.get(source).send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("HTTP {} fetching PDF", resp.status());
+            }
+            // Stream with a cap so a 10 GB server response can't OOM the
+            // process before any size check runs.
+            let (bytes, truncated) = read_body_capped(resp, self.max_size_bytes).await?;
+            if truncated {
                 anyhow::bail!(
-                    "PDF too large: {} bytes (max {})",
-                    bytes.len(),
+                    "PDF too large: exceeds max {} bytes",
                     self.max_size_bytes
                 );
             }

@@ -13,7 +13,13 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 
+use crate::security::url_guard::{build_guarded_client, read_body_capped, validate_url_str};
+
 use super::traits::{Tool, ToolResult};
+
+/// Cap on image bytes downloaded for vision analysis. Big enough for any
+/// plausible photo; keeps hostile URLs from OOMing the process.
+const MAX_IMAGE_FETCH_BYTES: usize = 20 * 1024 * 1024;
 
 /// Which vision backend to use (dispatched by provider name).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,10 +64,7 @@ impl VisionTool {
             VisionBackend::Anthropic => "claude-sonnet-4-20250514".to_string(),
             VisionBackend::OpenAi => "gpt-4o".to_string(),
         });
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .expect("build reqwest client for vision tool");
+        let client = build_guarded_client(std::time::Duration::from_secs(60));
         Some(Self {
             backend,
             api_key,
@@ -76,14 +79,24 @@ impl VisionTool {
     /// fetched via reqwest; paths are read from disk.
     async fn load_image(&self, source: &str) -> Result<(Vec<u8>, String)> {
         if source.starts_with("http://") || source.starts_with("https://") {
+            validate_url_str(source)?;
             let resp = self.client.get(source).send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("HTTP {} fetching image", resp.status());
+            }
             let mime = resp
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
                 .unwrap_or_else(|| "image/jpeg".to_string());
-            let bytes = resp.bytes().await?.to_vec();
+            let (bytes, truncated) = read_body_capped(resp, MAX_IMAGE_FETCH_BYTES).await?;
+            if truncated {
+                anyhow::bail!(
+                    "image too large: exceeds max {} bytes",
+                    MAX_IMAGE_FETCH_BYTES
+                );
+            }
             Ok((bytes, mime))
         } else {
             let bytes = tokio::fs::read(source).await?;
