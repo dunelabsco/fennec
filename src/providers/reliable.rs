@@ -207,37 +207,92 @@ impl Provider for ReliableProvider {
         &self,
         request: ChatRequest<'_>,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        // Mirror the retry+backoff+deadline structure from `chat()`. The
+        // original `chat_stream` failover gave each provider exactly one
+        // shot before moving on, with no backoff between providers and
+        // no per-provider retry — so a single transient hiccup
+        // (network blip, 502 from Cloudflare) on the first provider
+        // bypassed retries entirely. Streaming and non-streaming
+        // callers should get the same reliability profile.
         let start = Instant::now();
         let mut last_error: Option<anyhow::Error> = None;
 
         for (index, provider) in self.providers.iter().enumerate() {
             if start.elapsed() >= self.max_total_duration {
+                tracing::warn!(
+                    "ReliableProvider::chat_stream: deadline {:?} exceeded before trying {} more provider(s)",
+                    self.max_total_duration,
+                    self.providers.len().saturating_sub(index)
+                );
                 break;
             }
+
             if self.is_on_cooldown(index) {
+                tracing::debug!(
+                    "Skipping streaming provider {} (index {}): on cooldown",
+                    provider.name(),
+                    index
+                );
                 continue;
             }
 
-            let req = ChatRequest {
-                system: request.system,
-                messages: request.messages,
-                tools: request.tools,
-                max_tokens: request.max_tokens,
-                temperature: request.temperature,
-            };
+            for attempt in 0..self.max_retries {
+                if start.elapsed() >= self.max_total_duration {
+                    break;
+                }
 
-            match provider.chat_stream(req).await {
-                Ok(rx) => return Ok(rx),
-                Err(err) => {
-                    if Self::is_rate_limit_error(&err) {
-                        self.mark_rate_limited(index);
+                let req = ChatRequest {
+                    system: request.system,
+                    messages: request.messages,
+                    tools: request.tools,
+                    max_tokens: request.max_tokens,
+                    temperature: request.temperature,
+                };
+
+                match provider.chat_stream(req).await {
+                    Ok(rx) => return Ok(rx),
+                    Err(err) => {
+                        if Self::is_rate_limit_error(&err) {
+                            tracing::warn!(
+                                "Streaming provider {} rate limited, applying cooldown",
+                                provider.name()
+                            );
+                            self.mark_rate_limited(index);
+                            last_error = Some(err);
+                            break; // Move to next provider.
+                        }
+
+                        tracing::warn!(
+                            "Streaming provider {} attempt {}/{} failed: {}",
+                            provider.name(),
+                            attempt + 1,
+                            self.max_retries,
+                            err
+                        );
+                        last_error = Some(err);
+
+                        if attempt + 1 < self.max_retries {
+                            let base = Duration::from_secs(1 << attempt);
+                            let jittered = Self::jitter(base);
+                            let remaining =
+                                self.max_total_duration.saturating_sub(start.elapsed());
+                            let sleep_for = jittered.min(remaining);
+                            if sleep_for.is_zero() {
+                                break;
+                            }
+                            tokio::time::sleep(sleep_for).await;
+                        }
                     }
-                    last_error = Some(err);
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no providers available for streaming")))
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "ReliableProvider::chat_stream: deadline of {:?} exceeded with no providers available",
+                self.max_total_duration
+            )
+        }))
     }
 }
 
