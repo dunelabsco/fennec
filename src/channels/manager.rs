@@ -43,14 +43,26 @@ impl ChannelManager {
             let bus = self.bus.clone();
 
             let handle = tokio::spawn(async move {
-                let mut backoff_ms: u64 = 1_000;
+                // Crash-loop guard. We retry up to `max_restarts` times in
+                // *quick succession* — but if a listener has been running
+                // for `STABLE_RUN_SECS` before it failed, we treat it as
+                // "had a stable connection that just dropped" and reset the
+                // counter. Without this reset, channels whose normal
+                // operation involves periodic reconnect (Slack Socket Mode
+                // rotates its WebSocket roughly every 60 minutes by
+                // design) would permanently die after ~`max_restarts`
+                // hours regardless of how stable each individual run was.
+                let initial_backoff_ms: u64 = 1_000;
                 let max_backoff_ms: u64 = 60_000;
                 let max_restarts: u32 = 10;
+                const STABLE_RUN_SECS: u64 = 60;
+                let mut backoff_ms: u64 = initial_backoff_ms;
                 let mut restarts: u32 = 0;
 
                 loop {
                     let tx = bus.inbound_sender();
                     let name = channel.name().to_string();
+                    let started_at = std::time::Instant::now();
 
                     match channel.listen(tx).await {
                         Ok(()) => {
@@ -58,18 +70,36 @@ impl ChannelManager {
                             break;
                         }
                         Err(e) => {
+                            // If the listener ran long enough to be
+                            // considered "stable" before failing, treat
+                            // this as a fresh fault — not part of a crash
+                            // loop. Reset counters before counting this
+                            // failure.
+                            let was_stable = started_at.elapsed()
+                                >= std::time::Duration::from_secs(STABLE_RUN_SECS);
+                            if was_stable {
+                                tracing::debug!(
+                                    "Channel '{}' was stable for {}s; resetting crash-loop counters",
+                                    name,
+                                    started_at.elapsed().as_secs()
+                                );
+                                restarts = 0;
+                                backoff_ms = initial_backoff_ms;
+                            }
+
                             restarts += 1;
                             tracing::error!(
-                                "Channel '{}' listener crashed (attempt {}/{}): {}",
+                                "Channel '{}' listener crashed (attempt {}/{}, ran {}s): {}",
                                 name,
                                 restarts,
                                 max_restarts,
+                                started_at.elapsed().as_secs(),
                                 e
                             );
 
                             if restarts >= max_restarts {
                                 tracing::error!(
-                                    "Channel '{}' exceeded max restarts ({}), giving up",
+                                    "Channel '{}' exceeded max restarts ({}) without a stable run, giving up",
                                     name,
                                     max_restarts,
                                 );
