@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
+use super::sse::SseBuffer;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent, ToolCall, UsageInfo,
 };
@@ -21,6 +24,15 @@ pub struct AnthropicProvider {
     auth: AnthropicAuthMode,
     client: reqwest::Client,
     default_model: String,
+}
+
+/// What kind of content block occupies a particular `index` in the
+/// streaming response. We remember this so `content_block_stop` can tell
+/// which block types deserve a `ToolCallEnd` event.
+#[derive(Debug, Clone)]
+enum ToolBlockInfo {
+    ToolUse(String),
+    Other,
 }
 
 impl AnthropicProvider {
@@ -182,58 +194,88 @@ impl AnthropicProvider {
         body
     }
 
-    /// Parse a single SSE line from Anthropic's streaming API and emit
+    /// Parse a single SSE event from Anthropic's streaming API and emit
     /// [`StreamEvent`]s on the provided sender.
+    ///
+    /// `index_to_tool` maps each `content_block_*` event's `index` to the
+    /// `tool_use_id` advertised at `content_block_start`. Without this
+    /// mapping, `input_json_delta` events (which carry only an index) and
+    /// `content_block_stop` events can't be correlated back to the right
+    /// tool call. Text blocks are tracked with a sentinel so we know NOT
+    /// to emit a spurious `ToolCallEnd` for them.
     async fn handle_sse_event(
         event_type: &str,
         data: &Value,
         tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+        index_to_tool: &mut HashMap<u64, ToolBlockInfo>,
     ) {
         match event_type {
             "content_block_start" => {
-                if let Some(block) = data.get("content_block") {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let Some(block) = data.get("content_block") else { return };
+                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match block_type {
+                    "tool_use" => {
+                        let id = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = block
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        index_to_tool.insert(idx, ToolBlockInfo::ToolUse(id.clone()));
                         let _ = tx.send(StreamEvent::ToolCallStart { id, name }).await;
+                    }
+                    _ => {
+                        // Text (or future block types) — remember it's NOT a
+                        // tool_use so the matching stop doesn't emit ToolCallEnd.
+                        index_to_tool.insert(idx, ToolBlockInfo::Other);
                     }
                 }
             }
             "content_block_delta" => {
-                if let Some(delta) = data.get("delta") {
-                    match delta.get("type").and_then(|t| t.as_str()) {
-                        Some("text_delta") => {
-                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                let _ = tx.send(StreamEvent::Delta(text.to_string())).await;
-                            }
+                let Some(delta) = data.get("delta") else { return };
+                match delta.get("type").and_then(|t| t.as_str()) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                            let _ = tx.send(StreamEvent::Delta(text.to_string())).await;
                         }
-                        Some("input_json_delta") => {
-                            if let Some(partial) = delta.get("partial_json").and_then(|t| t.as_str()) {
-                                // We need the index to map to the tool call id.
-                                // The index comes from the content_block_start; for
-                                // simplicity we use the index as a stand-in id here.
-                                let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let _ = tx
-                                    .send(StreamEvent::ToolCallDelta {
-                                        id: idx.to_string(),
-                                        arguments_delta: partial.to_string(),
-                                    })
-                                    .await;
-                            }
-                        }
-                        _ => {}
                     }
+                    Some("input_json_delta") => {
+                        if let Some(partial) =
+                            delta.get("partial_json").and_then(|t| t.as_str())
+                        {
+                            let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                            // Resolve index → real tool_use_id.
+                            let Some(ToolBlockInfo::ToolUse(id)) = index_to_tool.get(&idx)
+                            else {
+                                // Delta for a block we never saw a tool_use start
+                                // for — drop it rather than emit with a wrong id.
+                                return;
+                            };
+                            let _ = tx
+                                .send(StreamEvent::ToolCallDelta {
+                                    id: id.clone(),
+                                    arguments_delta: partial.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                    _ => {}
                 }
             }
             "content_block_stop" => {
                 let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                // We emit ToolCallEnd for every block stop; consumers that
-                // track tool calls by id can use this.
-                let _ = tx
-                    .send(StreamEvent::ToolCallEnd {
-                        id: idx.to_string(),
-                    })
-                    .await;
+                // Only emit ToolCallEnd for tool_use blocks. Text blocks
+                // have their own completion signaled by the absence of
+                // further text_deltas; surfacing a phantom ToolCallEnd for
+                // them confuses consumers tracking tool state by id.
+                if let Some(ToolBlockInfo::ToolUse(id)) = index_to_tool.remove(&idx) {
+                    let _ = tx.send(StreamEvent::ToolCallEnd { id }).await;
+                }
             }
             "message_stop" => {
                 let _ = tx.send(StreamEvent::Done).await;
@@ -341,21 +383,34 @@ impl Provider for AnthropicProvider {
             .await
             .context("sending request to Anthropic API")?;
 
+        // Read raw bytes first so a non-JSON error body (e.g. a proxy/gateway
+        // 502 HTML page) doesn't lose the real HTTP status context. The old
+        // order — .json() first, then check status — produced a cryptic
+        // "parsing Anthropic API response" failure with no status/body info.
         let status = response.status();
-        let response_body: Value = response
-            .json()
+        let raw_body = response
+            .bytes()
             .await
-            .context("parsing Anthropic API response")?;
+            .context("reading Anthropic API response body")?;
 
         if !status.is_success() {
-            let error_msg = response_body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
+            let error_msg = serde_json::from_slice::<Value>(&raw_body)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| {
+                    let preview = String::from_utf8_lossy(&raw_body);
+                    preview.chars().take(200).collect::<String>()
+                });
             anyhow::bail!("Anthropic API error ({}): {}", status, error_msg);
         }
 
+        let response_body: Value = serde_json::from_slice(&raw_body)
+            .context("parsing Anthropic API response as JSON")?;
         Self::parse_response(&response_body)
     }
 
@@ -392,15 +447,25 @@ impl Provider for AnthropicProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let response_body: Value = response
-                .json()
+            // Defensive body-read: non-streaming 4xx/5xx may not be JSON.
+            let raw_body = response
+                .bytes()
                 .await
-                .context("parsing Anthropic streaming error response")?;
-            let error_msg = response_body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
+                .context("reading Anthropic streaming error body")?;
+            let error_msg = serde_json::from_slice::<Value>(&raw_body)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| {
+                    String::from_utf8_lossy(&raw_body)
+                        .chars()
+                        .take(200)
+                        .collect()
+                });
             anyhow::bail!("Anthropic API error ({}): {}", status, error_msg);
         }
 
@@ -408,8 +473,9 @@ impl Provider for AnthropicProvider {
         let mut byte_stream = response.bytes_stream();
 
         tokio::spawn(async move {
-            let mut buffer = String::new();
+            let mut sse = SseBuffer::new();
             let mut current_event_type = String::new();
+            let mut index_to_tool: HashMap<u64, ToolBlockInfo> = HashMap::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -419,16 +485,17 @@ impl Provider for AnthropicProvider {
                         return;
                     }
                 };
+                sse.extend(&chunk);
 
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                // Process complete lines from the SSE stream.
-                while let Some(newline_pos) = buffer.find('\n') {
-                    let line = buffer[..newline_pos].trim_end().to_string();
-                    buffer = buffer[newline_pos + 1..].to_string();
+                while let Some(line_bytes) = sse.next_line() {
+                    // Decode once we have a complete line — safe from the
+                    // UTF-8-split-across-chunks bug.
+                    let line = match std::str::from_utf8(&line_bytes) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
 
                     if line.is_empty() {
-                        // Empty line = end of event.
                         current_event_type.clear();
                         continue;
                     }
@@ -437,7 +504,13 @@ impl Provider for AnthropicProvider {
                         current_event_type = evt.to_string();
                     } else if let Some(data_str) = line.strip_prefix("data: ") {
                         if let Ok(data) = serde_json::from_str::<Value>(data_str) {
-                            Self::handle_sse_event(&current_event_type, &data, &tx).await;
+                            Self::handle_sse_event(
+                                &current_event_type,
+                                &data,
+                                &tx,
+                                &mut index_to_tool,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -448,5 +521,196 @@ impl Provider for AnthropicProvider {
         });
 
         Ok(rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// Drive `handle_sse_event` against a fixed sequence of events and
+    /// return every emitted StreamEvent. Verifies the index→id stitching.
+    async fn replay(events: Vec<(&str, Value)>) -> Vec<StreamEvent> {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut map: HashMap<u64, ToolBlockInfo> = HashMap::new();
+        for (ty, data) in events {
+            AnthropicProvider::handle_sse_event(ty, &data, &tx, &mut map).await;
+        }
+        drop(tx);
+        let mut out = Vec::new();
+        while let Some(e) = rx.recv().await {
+            out.push(e);
+        }
+        out
+    }
+
+    fn is_tool_call_delta_for(e: &StreamEvent, expected_id: &str) -> bool {
+        matches!(
+            e,
+            StreamEvent::ToolCallDelta { id, .. } if id == expected_id
+        )
+    }
+
+    #[tokio::test]
+    async fn tool_call_delta_uses_real_id_not_index() {
+        // Event shape from Anthropic:
+        //   content_block_start  index=1, content_block={type: tool_use, id: "toolu_abc", name: "read_file"}
+        //   content_block_delta  index=1, delta={type: input_json_delta, partial_json: "{\"pat"}
+        //   content_block_delta  index=1, delta={type: input_json_delta, partial_json: "h\":\"/tmp\"}"}
+        //   content_block_stop   index=1
+        let events = vec![
+            (
+                "content_block_start",
+                json!({
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_abc",
+                        "name": "read_file"
+                    }
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "index": 1,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": "{\"pat"
+                    }
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "index": 1,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": "h\":\"/tmp\"}"
+                    }
+                }),
+            ),
+            ("content_block_stop", json!({ "index": 1 })),
+        ];
+
+        let out = replay(events).await;
+
+        // Should emit: Start{id=toolu_abc}, Delta{id=toolu_abc}, Delta{id=toolu_abc}, End{id=toolu_abc}
+        assert_eq!(out.len(), 4, "events: {:?}", out);
+        assert!(matches!(&out[0], StreamEvent::ToolCallStart { id, name }
+            if id == "toolu_abc" && name == "read_file"));
+        assert!(is_tool_call_delta_for(&out[1], "toolu_abc"));
+        assert!(is_tool_call_delta_for(&out[2], "toolu_abc"));
+        assert!(matches!(&out[3], StreamEvent::ToolCallEnd { id } if id == "toolu_abc"));
+    }
+
+    #[tokio::test]
+    async fn text_block_stop_does_not_emit_tool_call_end() {
+        // Text block at index 0 should NOT produce a ToolCallEnd at stop.
+        // Previous implementation emitted ToolCallEnd { id: "0" } which
+        // confused consumers tracking tool state.
+        let events = vec![
+            (
+                "content_block_start",
+                json!({
+                    "index": 0,
+                    "content_block": { "type": "text", "text": "" }
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": "Hello" }
+                }),
+            ),
+            ("content_block_stop", json!({ "index": 0 })),
+        ];
+
+        let out = replay(events).await;
+
+        // Only one emission expected: the Delta.
+        assert_eq!(out.len(), 1, "events: {:?}", out);
+        assert!(matches!(&out[0], StreamEvent::Delta(t) if t == "Hello"));
+    }
+
+    #[tokio::test]
+    async fn mixed_text_and_tool_blocks_stitch_correctly() {
+        // Realistic: text at index 0, tool_use at index 1 (with different id),
+        // interleaved deltas. Ids must never get confused.
+        let events = vec![
+            (
+                "content_block_start",
+                json!({
+                    "index": 0,
+                    "content_block": { "type": "text", "text": "" }
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({ "index": 0, "delta": { "type": "text_delta", "text": "Let me " } }),
+            ),
+            (
+                "content_block_start",
+                json!({
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_xyz",
+                        "name": "search"
+                    }
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({ "index": 0, "delta": { "type": "text_delta", "text": "search." } }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "index": 1,
+                    "delta": { "type": "input_json_delta", "partial_json": "{\"q\":\"x\"}" }
+                }),
+            ),
+            ("content_block_stop", json!({ "index": 0 })),
+            ("content_block_stop", json!({ "index": 1 })),
+            ("message_stop", json!({})),
+        ];
+
+        let out = replay(events).await;
+
+        // Expect: tool Start, text Delta, text Delta, tool Delta, tool End, Done.
+        // The text block stop must NOT produce a ToolCallEnd.
+        let tool_ends: Vec<&StreamEvent> = out
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallEnd { .. }))
+            .collect();
+        assert_eq!(tool_ends.len(), 1, "expected exactly 1 ToolCallEnd, got {:?}", tool_ends);
+        let StreamEvent::ToolCallEnd { id } = tool_ends[0] else { unreachable!() };
+        assert_eq!(id, "toolu_xyz");
+
+        // And every ToolCallDelta uses toolu_xyz.
+        for e in &out {
+            if let StreamEvent::ToolCallDelta { id, .. } = e {
+                assert_eq!(id, "toolu_xyz", "unexpected tool delta id");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delta_without_prior_start_is_dropped() {
+        // If we somehow see a delta for an index we never saw start, we
+        // must NOT emit with an incorrect id (the old code would emit
+        // with id=index_as_string). Dropping is the safe choice.
+        let events = vec![(
+            "content_block_delta",
+            json!({
+                "index": 42,
+                "delta": { "type": "input_json_delta", "partial_json": "{}" }
+            }),
+        )];
+        let out = replay(events).await;
+        assert!(out.is_empty(), "orphan delta should be dropped: {:?}", out);
     }
 }
