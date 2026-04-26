@@ -194,15 +194,31 @@ fn parse_guard_action(action: &str) -> GuardAction {
 
 /// Build an Agent from configuration. Shared by both `run_agent` and `run_gateway`.
 ///
-/// Returns `(agent, memory, cron_origin_handle)`. The cron origin handle is
-/// an `Arc<Mutex<Option<CronOrigin>>>` that the gateway sets before each
-/// agent turn so the CronTool knows the originating channel/chat.
+/// Returns `(agent, memory, cron_origin_handle, pending_replies, chat_directory)`.
+/// The latter two are used by the gateway's inbound dispatch:
+///
+///   - `pending_replies` lets `ask_user`-style tools register a wait
+///     for the next inbound from a specific chat. The gateway's main
+///     loop must call `take_and_deliver` *before* forwarding to the
+///     agent; if a waiter is registered, the message is consumed by
+///     the tool and not turned into a fresh agent turn.
+///   - `chat_directory` is the source of truth for the `send_message`
+///     tool's `list` action and for resolving "send to telegram" without
+///     an explicit chat_id. The gateway's main loop must call
+///     `record(channel, chat_id)` on every inbound (including those
+///     consumed by pending replies, so the directory stays up to date).
 async fn build_agent(
     config: &FennecConfig,
     home_dir: &std::path::Path,
     model_override: Option<String>,
     channel_map: Option<ChannelMapHandle>,
-) -> Result<(fennec::agent::Agent, Arc<dyn Memory>, Arc<Mutex<Option<CronOrigin>>>)> {
+) -> Result<(
+    fennec::agent::Agent,
+    Arc<dyn Memory>,
+    Arc<Mutex<Option<CronOrigin>>>,
+    fennec::bus::PendingReplies,
+    fennec::bus::ChatDirectory,
+)> {
     // Create SecretStore.
     let secret_store =
         SecretStore::new(home_dir.to_path_buf()).context("creating secret store")?;
@@ -359,7 +375,9 @@ async fn build_agent(
         _ => tracing::debug!("Voice tools disabled: no OpenAI API key"),
     }
 
-    // Create CronTool with shared origin handle.
+    // Create CronTool with shared origin handle. The same handle is
+    // reused by AskUserTool so it knows the (channel, chat_id) the
+    // current turn came from.
     let cron_origin: Arc<Mutex<Option<CronOrigin>>> = Arc::new(Mutex::new(None));
     let cron_tool = CronTool::new(
         home_dir.join("cron_jobs.json"),
@@ -462,16 +480,71 @@ async fn build_agent(
         builder = builder.tool(Box::new(t));
     }
 
-    // Add send_message tool when running in gateway mode (bus available via channel_map).
-    if let Some(ref ch_map) = channel_map {
-        builder = builder.tool(Box::new(SendMessageTool::new(Arc::clone(ch_map))));
-    }
+    // Shared turn-context handles. These are returned from build_agent so
+    // the gateway's inbound dispatch can keep them populated.
+    let pending_replies = fennec::bus::PendingReplies::new();
+    let chat_directory = fennec::bus::ChatDirectory::new();
 
-    // Add ask_user tool when running in gateway mode (channel map available).
+    // Add send_message + ask_user tools when running in gateway mode
+    // (channel map and turn-origin available).
     if let Some(ref ch_map) = channel_map {
-        // Default to "telegram" — the most common gateway channel.
-        let default_ch = "telegram".to_string();
-        builder = builder.tool(Box::new(AskUserTool::new(Arc::clone(ch_map), default_ch)));
+        // Pull each enabled channel's home_chat_id from config so the
+        // send_message tool can route default-target sends ("send to
+        // telegram") without the LLM having to know the chat_id.
+        let mut home_chats: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if config.channels.telegram.enabled
+            && !config.channels.telegram.home_chat_id.is_empty()
+        {
+            home_chats.insert(
+                "telegram".to_string(),
+                config.channels.telegram.home_chat_id.clone(),
+            );
+        }
+        if config.channels.discord.enabled
+            && !config.channels.discord.home_chat_id.is_empty()
+        {
+            home_chats.insert(
+                "discord".to_string(),
+                config.channels.discord.home_chat_id.clone(),
+            );
+        }
+        if config.channels.slack.enabled
+            && !config.channels.slack.home_chat_id.is_empty()
+        {
+            home_chats.insert(
+                "slack".to_string(),
+                config.channels.slack.home_chat_id.clone(),
+            );
+        }
+        if config.channels.whatsapp.enabled
+            && !config.channels.whatsapp.home_chat_id.is_empty()
+        {
+            home_chats.insert(
+                "whatsapp".to_string(),
+                config.channels.whatsapp.home_chat_id.clone(),
+            );
+        }
+        if config.channels.email.enabled
+            && !config.channels.email.home_chat_id.is_empty()
+        {
+            home_chats.insert(
+                "email".to_string(),
+                config.channels.email.home_chat_id.clone(),
+            );
+        }
+
+        builder = builder.tool(Box::new(SendMessageTool::new(
+            Arc::clone(ch_map),
+            chat_directory.clone(),
+            home_chats,
+        )));
+
+        builder = builder.tool(Box::new(AskUserTool::new(
+            Arc::clone(ch_map),
+            Arc::clone(&cron_origin),
+            pending_replies.clone(),
+        )));
     }
 
     // Add collective tools if enabled.
@@ -557,7 +630,7 @@ async fn build_agent(
         .build()
         .context("building agent")?;
 
-    Ok((agent, memory, cron_origin))
+    Ok((agent, memory, cron_origin, pending_replies, chat_directory))
 }
 
 async fn run_agent(
@@ -566,7 +639,11 @@ async fn run_agent(
     message: Option<String>,
     model: Option<String>,
 ) -> Result<()> {
-    let (mut agent, memory, _cron_origin) = build_agent(&config, &home_dir, model, None).await?;
+    // CLI mode doesn't run the gateway, so the channel-aware handles are
+    // unused here. We still need to bind them to suppress unused-let
+    // warnings without losing the build_agent return-shape.
+    let (mut agent, memory, _cron_origin, _pending_replies, _chat_directory) =
+        build_agent(&config, &home_dir, model, None).await?;
 
     if let Some(msg) = message {
         // Single-shot mode.
@@ -646,7 +723,8 @@ async fn run_gateway(
     let channel_map = new_channel_map();
 
     // 2. Build Agent (pass channel map so ask_user tool can reach channels).
-    let (agent, _memory, cron_origin) = build_agent(&config, &home_dir, None, Some(channel_map.clone())).await?;
+    let (agent, _memory, cron_origin, pending_replies, chat_directory) =
+        build_agent(&config, &home_dir, None, Some(channel_map.clone())).await?;
     let agent = Arc::new(tokio::sync::Mutex::new(agent));
 
     // 3. Build channel list from config.
@@ -773,8 +851,44 @@ async fn run_gateway(
         let bus = bus.clone();
         let manager_ref = Arc::new(manager);
         let cron_origin = Arc::clone(&cron_origin);
+        let pending_replies = pending_replies.clone();
+        let chat_directory = chat_directory.clone();
         tokio::spawn(async move {
             while let Some(msg) = receiver.inbound_rx.recv().await {
+                // Always record the (channel, chat_id) pair in the
+                // directory, even for messages we'll consume via a
+                // pending reply or treat as a /reset command. This
+                // keeps the directory's "recently seen" view honest.
+                chat_directory.record(&msg.channel, &msg.chat_id);
+
+                // Cron-fired messages carry `metadata["source"] = "cron"`
+                // and represent the agent's own scheduled prompt, not a
+                // user reply. They must not be redirected to a pending
+                // ask_user wait (a cron output happening to land while
+                // the agent is mid-question would otherwise be consumed
+                // as the user's "answer"). Skip the pending check for
+                // anything sourced internally.
+                let is_user_initiated = msg
+                    .metadata
+                    .get("source")
+                    .map(|s| s.as_str() != "cron")
+                    .unwrap_or(true);
+
+                if is_user_initiated {
+                    let pending_origin = fennec::bus::TurnOrigin {
+                        channel: msg.channel.clone(),
+                        chat_id: msg.chat_id.clone(),
+                    };
+                    if pending_replies.take_and_deliver(&pending_origin, msg.clone()) {
+                        tracing::debug!(
+                            "Inbound from {}:{} consumed by pending tool reply",
+                            msg.channel,
+                            msg.chat_id,
+                        );
+                        continue;
+                    }
+                }
+
                 // Handle /new and /reset commands: clear agent history and
                 // send a confirmation instead of running a full agent turn.
                 if msg.metadata.get("command").map(|s| s.as_str()) == Some("reset") {

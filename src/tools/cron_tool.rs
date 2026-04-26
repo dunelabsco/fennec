@@ -4,20 +4,20 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::cron::jobs::{parse_schedule, CronJob, JobStore};
 
 use super::traits::{Tool, ToolResult};
 
-/// Origin information captured from the current message context so that
-/// cron-fired results can be routed back to the correct channel/chat.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CronOrigin {
-    pub channel: String,
-    pub chat_id: String,
-}
+/// Backwards-compatible alias for [`crate::bus::TurnOrigin`].
+///
+/// Originally defined here when only the cron tool needed this concept;
+/// now `ask_user_tool` and `send_message_tool` also need to know which
+/// `(channel, chat_id)` triggered the current turn, so the canonical
+/// definition has moved to `bus::turn_context`. Re-exported here so
+/// existing downstream callers keep compiling unchanged.
+pub type CronOrigin = crate::bus::TurnOrigin;
 
 /// LLM-callable tool for creating, listing, and removing scheduled tasks.
 pub struct CronTool {
