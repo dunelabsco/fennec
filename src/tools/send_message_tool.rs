@@ -199,14 +199,18 @@ impl SendMessageTool {
                 }));
         }
         let mut channels = serde_json::Map::new();
-        // Include every configured channel, even those with no recent
-        // inbound, so the agent sees the full set.
+        // Include every configured channel, every channel with a home_chat
+        // pin, AND every channel that has a recorded entry. The third
+        // chain matters: a recording for a channel name that isn't in the
+        // configured map (e.g. test fixture, late-bound channel) would
+        // otherwise be silently dropped from the listing.
         let known_channels: std::collections::BTreeSet<String> = self
             .channels
             .read()
             .keys()
             .cloned()
             .chain(self.home_chats.keys().cloned())
+            .chain(by_channel.keys().cloned())
             .collect();
         for name in known_channels {
             let recent = by_channel.remove(&name).unwrap_or_default();
