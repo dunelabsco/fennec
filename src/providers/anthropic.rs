@@ -226,7 +226,7 @@ impl AnthropicProvider {
         match event_type {
             "content_block_start" => {
                 let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                let Some(block) = data.get("content_block") else { return };
+                let Some(block) = data.get("content_block") else { return false };
                 let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match block_type {
                     "tool_use" => {
@@ -251,7 +251,7 @@ impl AnthropicProvider {
                 }
             }
             "content_block_delta" => {
-                let Some(delta) = data.get("delta") else { return };
+                let Some(delta) = data.get("delta") else { return false };
                 match delta.get("type").and_then(|t| t.as_str()) {
                     Some("text_delta") => {
                         if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
@@ -268,7 +268,7 @@ impl AnthropicProvider {
                             else {
                                 // Delta for a block we never saw a tool_use start
                                 // for — drop it rather than emit with a wrong id.
-                                return;
+                                return false;
                             };
                             let _ = tx
                                 .send(StreamEvent::ToolCallDelta {
