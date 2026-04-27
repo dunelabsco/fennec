@@ -700,6 +700,7 @@ mod tests {
             tools: None,
             max_tokens: 1234,
             temperature: 0.42,
+            thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
         let (_, body) = p.build_request_body(&req, false);
         assert_eq!(body["max_tokens"], 1234);
@@ -716,6 +717,7 @@ mod tests {
             tools: None,
             max_tokens: 1234,
             temperature: 0.42,
+            thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
         let (_, body) = p.build_request_body(&req, false);
         assert_eq!(body["max_completion_tokens"], 1234);
@@ -733,6 +735,7 @@ mod tests {
             tools: None,
             max_tokens: 100,
             temperature: 0.7,
+            thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
         let (_, body) = p.build_request_body(&req, false);
         assert_eq!(body["max_completion_tokens"], 100);
