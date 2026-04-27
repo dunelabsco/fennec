@@ -87,6 +87,7 @@ impl MemoryConsolidator {
             tools: None,
             max_tokens: 1024,
             temperature: 0.0,
+            thinking_level: crate::agent::thinking::ThinkingLevel::Off,
         };
 
         let response = self

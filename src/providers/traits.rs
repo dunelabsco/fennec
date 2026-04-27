@@ -85,6 +85,12 @@ pub struct ChatRequest<'a> {
     pub tools: Option<&'a [crate::tools::traits::ToolSpec]>,
     pub max_tokens: usize,
     pub temperature: f64,
+    /// Reasoning / extended-thinking effort the agent has selected for this
+    /// turn (via `/think:<level>` directives or programmatic config).
+    /// Providers that support extended thinking (Anthropic, OpenAI o-series,
+    /// OpenRouter) translate this to their native parameters via
+    /// [`crate::agent::thinking::apply_thinking_params`]; others ignore it.
+    pub thinking_level: crate::agent::thinking::ThinkingLevel,
 }
 
 /// The response from the chat API.

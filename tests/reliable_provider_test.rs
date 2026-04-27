@@ -157,6 +157,7 @@ fn make_request() -> ChatRequest<'static> {
         tools: None,
         max_tokens: 1024,
         temperature: 0.7,
+        thinking_level: fennec::agent::thinking::ThinkingLevel::Off,
     }
 }
 

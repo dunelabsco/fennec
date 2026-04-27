@@ -172,10 +172,10 @@ impl Agent {
             // Execute each tool call and push results.
             for tc in &response.tool_calls {
                 tracing::info!(tool = %tc.name, "Executing tool call");
-                let result = self.execute_tool(&tc.name, &tc.arguments).await;
-                tracing::info!(tool = %tc.name, success = %!result.contains("error"), "Tool call complete");
+                let (output, success) = self.execute_tool(&tc.name, &tc.arguments).await;
+                tracing::info!(tool = %tc.name, success = %success, "Tool call complete");
                 self.history
-                    .push(ChatMessage::tool_result(&tc.id, &result));
+                    .push(ChatMessage::tool_result(&tc.id, &output));
             }
         }
 
@@ -187,10 +187,24 @@ impl Agent {
     /// Returns a receiver of [`StreamEvent`]s. Text deltas are forwarded in
     /// real-time while tool calls are processed internally (their results are
     /// *not* streamed back; only the final text response is).
+    ///
+    /// Brings the same setup work as [`Self::turn`] to bear: parses
+    /// `/think:<level>` directives, runs the prompt guard, injects
+    /// collective-search context, builds the system prompt on first call.
+    /// The caller is responsible for recording the final assistant text via
+    /// [`Self::record_streamed_response`] once the stream drains.
     pub async fn turn_streamed(
         &mut self,
         user_message: &str,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        // Parse thinking directive before any other processing — same as turn().
+        let (thinking_override, user_message) = thinking::parse_thinking_directive(user_message);
+        if let Some(level) = thinking_override {
+            self.thinking_level = level;
+            tracing::info!(?level, "Thinking level set via /think directive (stream)");
+        }
+        let user_message: &str = &user_message;
+
         // Prompt guard scan.
         if let Some(ref guard) = self.prompt_guard {
             match guard.scan(user_message) {
@@ -208,6 +222,27 @@ impl Agent {
             }
         }
 
+        // Search collective for relevant experiences (mirrors turn()).
+        let collective_context = if let Some(ref collective) = self.collective {
+            match collective.search(user_message, 3).await {
+                Ok(result) => match result.confidence {
+                    SearchConfidence::High => Some(
+                        self.format_collective_results(&result.experiences, true),
+                    ),
+                    SearchConfidence::Partial => Some(
+                        self.format_collective_results(&result.experiences, false),
+                    ),
+                    SearchConfidence::None => None,
+                },
+                Err(e) => {
+                    tracing::warn!("Collective search failed (stream): {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Build system prompt on first turn.
         if self.system_prompt.is_none() {
             let memory_context = self.load_memory_context(user_message).await?;
@@ -220,8 +255,15 @@ impl Agent {
             self.system_prompt = Some(prompt);
         }
 
+        // Inject collective context into user message if available.
+        let effective_message = if let Some(ref ctx) = collective_context {
+            format!("[Collective matches]\n{ctx}\n[User message]\n{user_message}")
+        } else {
+            user_message.to_string()
+        };
+
         // Push user message to history.
-        self.history.push(ChatMessage::user(user_message));
+        self.history.push(ChatMessage::user(&effective_message));
 
         // Get streaming receiver from provider.
         let system = self.system_prompt.as_deref();
@@ -237,10 +279,20 @@ impl Agent {
             tools,
             max_tokens: self.max_tokens,
             temperature: self.temperature,
+            thinking_level: self.thinking_level,
         };
 
         let rx = self.provider.chat_stream(request).await?;
         Ok(rx)
+    }
+
+    /// Record the final assistant text after a [`Self::turn_streamed`]
+    /// receiver has drained, so the next turn sees it in history. Callers
+    /// that drive `turn_streamed` must invoke this once the stream's
+    /// [`StreamEvent::Done`] arrives — `turn_streamed` itself can't capture
+    /// the final text because it returns before the model has finished.
+    pub fn record_streamed_response(&mut self, text: impl Into<String>) {
+        self.history.push(ChatMessage::assistant(text.into()));
     }
 
     /// Call the provider with the current history and system prompt.
@@ -258,31 +310,37 @@ impl Agent {
             tools,
             max_tokens: self.max_tokens,
             temperature: self.temperature,
+            thinking_level: self.thinking_level,
         };
 
         self.provider.chat(request).await
     }
 
     /// Find a tool by name and execute it. Returns the formatted output string
-    /// with credentials scrubbed.
-    async fn execute_tool(&self, name: &str, args: &serde_json::Value) -> String {
-        let raw = match self.tools.iter().find(|t| t.name() == name) {
+    /// with credentials scrubbed, plus the structured success flag from the
+    /// tool itself (`true` only when the tool reported success — tool output
+    /// containing the substring "error" must not be confused with failure).
+    async fn execute_tool(&self, name: &str, args: &serde_json::Value) -> (String, bool) {
+        let (raw, success) = match self.tools.iter().find(|t| t.name() == name) {
             Some(t) => match t.execute(args.clone()).await {
                 Ok(result) => {
                     if result.success {
-                        result.output
+                        (result.output, true)
                     } else {
-                        format!(
-                            "Error: {}",
-                            result.error.unwrap_or_else(|| "unknown error".to_string())
+                        (
+                            format!(
+                                "Error: {}",
+                                result.error.unwrap_or_else(|| "unknown error".to_string())
+                            ),
+                            false,
                         )
                     }
                 }
-                Err(e) => format!("Tool execution failed: {e}"),
+                Err(e) => (format!("Tool execution failed: {e}"), false),
             },
-            None => format!("Unknown tool: {name}"),
+            None => (format!("Unknown tool: {name}"), false),
         };
-        scrub::scrub_credentials(&raw)
+        (scrub::scrub_credentials(&raw), success)
     }
 
     /// Load memory context for the given query.

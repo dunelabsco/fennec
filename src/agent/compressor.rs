@@ -96,6 +96,7 @@ impl ContextCompressor {
                     tools: None,
                     max_tokens: 1024,
                     temperature: 0.3,
+                    thinking_level: crate::agent::thinking::ThinkingLevel::Off,
                 };
 
                 if let Ok(response) = provider.chat(request).await {
