@@ -106,13 +106,7 @@ impl SlackChannel {
             let status = resp.status();
 
             if status.as_u16() == 429 && attempt < MAX_RETRY_AFTER_ATTEMPTS {
-                let retry_after = resp
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(1)
-                    .min(RETRY_AFTER_CAP_SECS);
+                let retry_after = parse_retry_after_header(&resp);
                 tracing::warn!(
                     "Slack 429 on {}: sleeping {}s (attempt {}/{})",
                     method,
@@ -130,12 +124,31 @@ impl SlackChannel {
                 anyhow::bail!("Slack {} returned {}: {}", method, status, text);
             }
 
+            // Slack also returns rate-limit errors as HTTP 200 with
+            // `{ok: false, error: "ratelimited"}` in the body, sometimes
+            // with `Retry-After` in headers. Without checking the body
+            // we'd treat this as a hard failure and drop the request.
+            // Capture the Retry-After header BEFORE moving the response
+            // into `.json()`, since `resp.json()` consumes `resp`.
+            let retry_after_header = parse_retry_after_header(&resp);
             let data: Value = resp
                 .json()
                 .await
                 .with_context(|| format!("Slack {} parse failed", method))?;
             if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
                 let err = data.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                if err == "ratelimited" && attempt < MAX_RETRY_AFTER_ATTEMPTS {
+                    tracing::warn!(
+                        "Slack ratelimited (200 body) on {}: sleeping {}s (attempt {}/{})",
+                        method,
+                        retry_after_header,
+                        attempt + 1,
+                        MAX_RETRY_AFTER_ATTEMPTS
+                    );
+                    tokio::time::sleep(Duration::from_secs(retry_after_header)).await;
+                    attempt += 1;
+                    continue;
+                }
                 anyhow::bail!("Slack {} error: {}", method, err);
             }
             return Ok(data);
@@ -185,6 +198,20 @@ impl SlackChannel {
     pub fn ack_envelope(envelope_id: &str) -> String {
         serde_json::json!({ "envelope_id": envelope_id }).to_string()
     }
+}
+
+/// Read `Retry-After` from a Slack response and clamp it. Used in two
+/// retry paths: HTTP 429 and HTTP 200 with `error: "ratelimited"`.
+/// Defaults to 1s if missing or unparseable; caps at
+/// `RETRY_AFTER_CAP_SECS` so a hostile/bug-y header can't pin us in
+/// a multi-minute sleep.
+fn parse_retry_after_header(resp: &reqwest::Response) -> u64 {
+    resp.headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1)
+        .min(RETRY_AFTER_CAP_SECS)
 }
 
 #[async_trait]
@@ -302,7 +329,16 @@ impl Channel for SlackChannel {
             }
         }
 
-        Ok(())
+        // The `while let Some(msg) = ws_rx.next().await` loop exits to
+        // here when the WebSocket stream returns `None` — the server
+        // closed the underlying TCP without sending a Close frame
+        // (network blip, server hiccup, Socket Mode 60-min rotation).
+        // Returning `Ok(())` here would tell the supervisor "channel
+        // exited cleanly, do not restart" — Slack would then go quiet
+        // until the user notices and bounces the process. Surfacing
+        // this as an error lets the supervisor's retry-with-backoff
+        // path take over.
+        anyhow::bail!("Slack WebSocket closed unexpectedly (no close frame); restarting")
     }
 
     fn supports_streaming(&self) -> bool {
