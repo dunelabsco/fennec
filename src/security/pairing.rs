@@ -1,21 +1,36 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use super::fs::write_secure;
+
 /// Guards DM access via a pairing code flow with brute-force lockout.
 ///
 /// A 6-digit numeric code is generated server-side. Clients present the code
 /// to receive a token (`fc_<64-hex>`). The token hash is stored; raw tokens
 /// are never persisted.
+///
+/// Persistence covers everything that needs to survive a restart:
+/// - `allowed_users` — IDs the operator has explicitly allowed.
+/// - `paired_token_hashes` — without this, every paired client has to
+///   re-pair after a restart.
+/// - `failed_attempts` — without this, an attacker who scripts the
+///   pairing endpoint can bounce the process after every 5 wrong codes
+///   to reset the lockout. We persist `(count, since_epoch_secs)` so
+///   the lockout window survives. `Instant` is monotonic and not
+///   serializable, so we convert to/from `SystemTime` at the persistence
+///   boundary; the in-memory representation stays `Instant` for the
+///   monotonic-clock guarantees.
 pub struct PairingGuard {
     code: Option<String>,
     allowed_users: HashSet<String>,
     paired_token_hashes: HashSet<String>,
-    failed_attempts: HashMap<String, (u32, std::time::Instant)>,
+    failed_attempts: HashMap<String, (u32, Instant)>,
     persist_path: Option<PathBuf>,
     max_failures: u32,
     lockout_secs: u64,
@@ -95,10 +110,14 @@ impl PairingGuard {
             let entry = self
                 .failed_attempts
                 .entry(client_id.to_string())
-                .or_insert((0, std::time::Instant::now()));
+                .or_insert((0, Instant::now()));
             entry.0 += 1;
             // Reset the clock on each failure.
-            entry.1 = std::time::Instant::now();
+            entry.1 = Instant::now();
+            // Persist failed attempts so a process restart doesn't reset
+            // the lockout counter — without this, an attacker who can
+            // bounce the process clears the brute-force window.
+            let _ = self.save();
             anyhow::bail!("invalid pairing code");
         }
 
@@ -117,6 +136,10 @@ impl PairingGuard {
 
         // Clear failed attempts for this client.
         self.failed_attempts.remove(client_id);
+
+        // Persist the new token hash + cleared attempts so paired
+        // clients survive a restart.
+        let _ = self.save();
 
         Ok(token)
     }
@@ -139,21 +162,53 @@ impl PairingGuard {
         self.allowed_users.contains("*") || self.allowed_users.contains(user_id)
     }
 
-    /// Persist the allowed-users set to a JSON file.
+    /// Persist the full guard state to a JSON file.
+    ///
+    /// We use `write_secure` (0600 perms) because the file contains
+    /// token hashes. The hashes are SHA-256 over fresh 32-byte tokens
+    /// so they're not directly recoverable, but the file is still
+    /// security-adjacent — it should not be world-readable.
     pub fn save(&self) -> Result<()> {
         let path = self
             .persist_path
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no persist path configured"))?;
+
+        // Convert in-memory `Instant` timestamps to wall-clock seconds
+        // for serialization. `Instant` is monotonic (better for
+        // in-memory comparisons) but not portable across restarts; we
+        // store the elapsed-vs-now offset as a SystemTime epoch.
+        let now_inst = Instant::now();
+        let now_sys_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let failed_attempts: Vec<serde_json::Value> = self
+            .failed_attempts
+            .iter()
+            .map(|(client, (count, since))| {
+                let since_secs_ago = now_inst.saturating_duration_since(*since).as_secs();
+                let since_epoch = now_sys_epoch.saturating_sub(since_secs_ago);
+                serde_json::json!({
+                    "client": client,
+                    "count": count,
+                    "since_epoch_secs": since_epoch,
+                })
+            })
+            .collect();
+
         let data = serde_json::json!({
             "allowed_users": self.allowed_users.iter().collect::<Vec<_>>(),
+            "paired_token_hashes": self.paired_token_hashes.iter().collect::<Vec<_>>(),
+            "failed_attempts": failed_attempts,
         });
-        let json = serde_json::to_string_pretty(&data).context("serializing allowed users")?;
-        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+        let json = serde_json::to_string_pretty(&data).context("serializing pairing state")?;
+        write_secure(path, json.as_bytes())
+            .with_context(|| format!("writing pairing state to {}", path.display()))?;
         Ok(())
     }
 
-    /// Load the allowed-users set from the JSON file.
+    /// Load the full guard state from the JSON file.
     pub fn load(&mut self) -> Result<()> {
         let path = self
             .persist_path
@@ -165,12 +220,55 @@ impl PairingGuard {
         let json = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
         let data: serde_json::Value =
-            serde_json::from_str(&json).context("parsing allowed users JSON")?;
+            serde_json::from_str(&json).context("parsing pairing state JSON")?;
+
         if let Some(users) = data.get("allowed_users").and_then(|v| v.as_array()) {
             self.allowed_users = users
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
+        }
+
+        if let Some(hashes) = data
+            .get("paired_token_hashes")
+            .and_then(|v| v.as_array())
+        {
+            self.paired_token_hashes = hashes
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
+
+        if let Some(attempts) = data
+            .get("failed_attempts")
+            .and_then(|v| v.as_array())
+        {
+            // Convert persisted (epoch_secs) back into `Instant` by
+            // taking the offset from "now" in both clocks. If the
+            // persisted timestamp is in the future relative to now
+            // (clock skew between processes / timezone weirdness),
+            // anchor at "now" so the lockout window starts fresh
+            // rather than being interpreted as a negative duration.
+            let now_inst = Instant::now();
+            let now_sys_epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            for entry in attempts {
+                let client = entry.get("client").and_then(|v| v.as_str());
+                let count = entry.get("count").and_then(|v| v.as_u64());
+                let since_epoch = entry.get("since_epoch_secs").and_then(|v| v.as_u64());
+                if let (Some(client), Some(count), Some(since_epoch)) =
+                    (client, count, since_epoch)
+                {
+                    let since_secs_ago = now_sys_epoch.saturating_sub(since_epoch);
+                    let since = now_inst
+                        .checked_sub(Duration::from_secs(since_secs_ago))
+                        .unwrap_or(now_inst);
+                    self.failed_attempts
+                        .insert(client.to_string(), (count as u32, since));
+                }
+            }
         }
         Ok(())
     }
@@ -223,6 +321,41 @@ mod tests {
         assert!(
             err.contains("invalid pairing code"),
             "expected 'invalid pairing code' message, got: {err}"
+        );
+    }
+
+    /// Persistence round-trip: paired token hashes and failed-attempt
+    /// counters must survive a restart. Without this, every paired client
+    /// has to re-pair on restart and an attacker who can bounce the
+    /// process resets the brute-force lockout window.
+    #[test]
+    fn save_load_round_trips_full_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pairing.json");
+
+        // First instance: pair a client AND rack up some failed attempts
+        // for a different client.
+        let token = {
+            let mut g = PairingGuard::new(Some(path.clone()));
+            let code = g.generate_code();
+            let success_token = g.verify_code("alice", &code).unwrap();
+            // Now generate a new code and fail it once for "bob".
+            let new_code = g.generate_code();
+            // Pick a string that's deterministically NOT the new code.
+            let wrong = if new_code == "000000" { "000001" } else { "000000" };
+            let _ = g.verify_code("bob", wrong);
+            g.add_allowed_user("alice");
+            success_token
+        };
+
+        // Second instance: should see alice's token still authorized
+        // and bob's failed-attempt counter persisted.
+        let g2 = PairingGuard::new(Some(path));
+        assert!(g2.is_authorized(&token), "alice's token must survive restart");
+        assert!(g2.is_allowed("alice"), "alice must still be in allowed_users");
+        assert!(
+            g2.failed_attempts.contains_key("bob"),
+            "bob's failed-attempt counter must survive restart"
         );
     }
 }
