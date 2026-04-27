@@ -39,12 +39,14 @@ impl AnthropicProvider {
     /// Create a new Anthropic provider using an API key.
     ///
     /// - `api_key`: Anthropic API key.
-    /// - `model`: Override the default model. Defaults to `claude-sonnet-4-20250514`.
+    /// - `model`: Override the default model. Defaults to `claude-sonnet-4-6`
+    ///   (Sonnet 4.6 alias). The previous default `claude-sonnet-4-20250514`
+    ///   is deprecated by Anthropic and retires June 15, 2026.
     pub fn new(api_key: String, model: Option<String>) -> Self {
         Self {
             auth: AnthropicAuthMode::ApiKey(api_key),
             client: reqwest::Client::new(),
-            default_model: model.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string()),
+            default_model: model.unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
         }
     }
 
@@ -53,7 +55,7 @@ impl AnthropicProvider {
         Self {
             auth: AnthropicAuthMode::OAuthBearer(token),
             client: reqwest::Client::new(),
-            default_model: model.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string()),
+            default_model: model.unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
         }
     }
 

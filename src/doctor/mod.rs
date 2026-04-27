@@ -400,7 +400,7 @@ mod tests {
         let mut cfg = FennecConfig::default();
         cfg.identity.name = "Fennec".to_string();
         cfg.provider.name = "anthropic".to_string();
-        cfg.provider.model = "claude-sonnet-4-20250514".to_string();
+        cfg.provider.model = "claude-sonnet-4-6".to_string();
         let r = check_config(&cfg);
         assert_eq!(r.status, CheckStatus::Pass);
         assert!(r.detail.contains("Fennec"));

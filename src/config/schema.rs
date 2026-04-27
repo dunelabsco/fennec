@@ -90,7 +90,7 @@ impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             name: "anthropic".to_string(),
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             api_key: String::new(),
             base_url: String::new(),
             temperature: 0.7,
