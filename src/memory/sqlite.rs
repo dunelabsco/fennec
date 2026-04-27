@@ -19,7 +19,10 @@ pub struct SqliteMemory {
     db_path: PathBuf,
     vector_weight: f32,
     keyword_weight: f32,
-    #[allow(dead_code)]
+    /// Cap on `embedding_cache` row count. The cache table is bounded
+    /// by LRU eviction in [`Memory::store`] — when an insert pushes
+    /// the row count past `cache_max`, the oldest rows by
+    /// `accessed_at` are deleted. `0` is treated as "unlimited".
     cache_max: usize,
     embedder: Arc<dyn EmbeddingProvider>,
 }
@@ -364,48 +367,105 @@ impl Memory for SqliteMemory {
 
     async fn store(&self, entry: MemoryEntry) -> Result<()> {
         // Compute embedding if the embedder is not noop.
+        //
+        // The cache lookup and accessed_at update — both blocking
+        // SQLite calls — used to run inline on the async runtime
+        // thread. Under any concurrent load that serialised every
+        // other async task behind a lock+query+update cycle. Now both
+        // sides of the cache cycle run inside `spawn_blocking` so the
+        // executor stays free.
+        //
+        // The accessed_at update doubles as the LRU touch for the
+        // cache_max enforcement at insert-time below: rows that
+        // haven't been accessed recently get evicted first.
         let embedding_blob = if self.embedder.name() != "noop" {
-            // Check cache first using SHA-256 hash of content.
             let content_hash = {
                 let mut hasher = Sha256::new();
                 hasher.update(entry.content.as_bytes());
                 hex::encode(hasher.finalize())
             };
 
-            let cached = {
-                let conn = self.conn.lock();
+            // Phase 1: cache lookup + accessed_at touch. Returns the
+            // cached blob if present, or None to signal "embed it".
+            let cache_arc = Arc::clone(&self.conn);
+            let hash_for_lookup = content_hash.clone();
+            let cached: Option<Vec<u8>> = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+                let conn = cache_arc.lock();
                 let mut stmt = conn.prepare(
                     "SELECT embedding FROM embedding_cache WHERE content_hash = ?1",
                 )?;
-                let mut rows = stmt.query(rusqlite::params![content_hash])?;
+                let mut rows = stmt.query(rusqlite::params![hash_for_lookup])?;
                 if let Some(row) = rows.next()? {
                     let blob: Vec<u8> = row.get(0)?;
-                    Some(blob)
+                    drop(rows);
+                    drop(stmt);
+                    let now = chrono::Utc::now().to_rfc3339();
+                    conn.execute(
+                        "UPDATE embedding_cache SET accessed_at = ?1 WHERE content_hash = ?2",
+                        rusqlite::params![now, hash_for_lookup],
+                    )?;
+                    Ok(Some(blob))
                 } else {
-                    None
+                    Ok(None)
                 }
-            };
+            })
+            .await??;
 
             if let Some(blob) = cached {
-                // Update accessed_at in cache.
-                let now = chrono::Utc::now().to_rfc3339();
-                let conn = self.conn.lock();
-                conn.execute(
-                    "UPDATE embedding_cache SET accessed_at = ?1 WHERE content_hash = ?2",
-                    rusqlite::params![now, content_hash],
-                )?;
                 Some(blob)
             } else {
+                // Compute embedding (the only legitimately-async step
+                // — the embedder calls a remote API).
                 let vec = self.embedder.embed(&entry.content).await?;
                 let blob = serialize_embedding(&vec);
-                // Store in cache.
-                let now = chrono::Utc::now().to_rfc3339();
-                let conn = self.conn.lock();
-                conn.execute(
-                    "INSERT OR REPLACE INTO embedding_cache (content_hash, embedding, created_at, accessed_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![content_hash, blob, now, now],
-                )?;
+
+                // Phase 2: cache insert + LRU eviction. Run as one
+                // blocking task so we don't take/release the conn
+                // lock between the insert and the size check.
+                let cache_arc = Arc::clone(&self.conn);
+                let cache_max = self.cache_max;
+                let blob_for_cache = blob.clone();
+                let hash_for_insert = content_hash.clone();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let conn = cache_arc.lock();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    conn.execute(
+                        "INSERT OR REPLACE INTO embedding_cache \
+                         (content_hash, embedding, created_at, accessed_at) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![hash_for_insert, blob_for_cache, now, now],
+                    )?;
+
+                    // LRU enforcement: if the cache exceeded its
+                    // configured cap, delete the least-recently-used
+                    // rows. `cache_max == 0` is treated as "unlimited"
+                    // for back-compat with callers that don't care.
+                    if cache_max > 0 {
+                        let count: i64 = conn.query_row(
+                            "SELECT COUNT(*) FROM embedding_cache",
+                            [],
+                            |r| r.get(0),
+                        )?;
+                        if (count as usize) > cache_max {
+                            let to_delete = (count as usize) - cache_max;
+                            // ORDER BY accessed_at ASC LIMIT N gives us
+                            // the oldest N rows. Delete them in a
+                            // single statement so we hold the conn
+                            // lock once.
+                            conn.execute(
+                                "DELETE FROM embedding_cache \
+                                 WHERE content_hash IN ( \
+                                     SELECT content_hash FROM embedding_cache \
+                                     ORDER BY accessed_at ASC LIMIT ?1 \
+                                 )",
+                                rusqlite::params![to_delete as i64],
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await??;
+
                 Some(blob)
             }
         } else {

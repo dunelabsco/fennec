@@ -49,9 +49,33 @@ pub async fn export_snapshot(memory: &dyn Memory, path: &Path) -> Result<usize> 
         }
     }
 
-    tokio::fs::write(path, md.as_bytes())
+    // Atomic write: write to a sibling temp file, then `rename` it on
+    // top of `path`. POSIX rename(2) is atomic — no observer can see a
+    // partially-written snapshot, even if the process crashes during
+    // `tokio::fs::write`. The previous direct `tokio::fs::write` would
+    // truncate the existing snapshot on open and then write incrementally;
+    // a crash mid-write left zero bytes on disk, silently destroying
+    // the user's memory snapshot.
+    let tmp_path = match path.file_name() {
+        Some(name) => {
+            // Same directory as `path` so `rename` stays on the same
+            // filesystem (otherwise it falls back to copy+delete which
+            // is no longer atomic).
+            let mut tmp = name.to_os_string();
+            tmp.push(".tmp");
+            path.with_file_name(tmp)
+        }
+        // Defensive fallback for paths without a filename component
+        // (shouldn't happen for snapshots, but `path.with_file_name`
+        // would otherwise panic on '.' or '/').
+        None => path.with_extension("tmp"),
+    };
+    tokio::fs::write(&tmp_path, md.as_bytes())
         .await
-        .context("writing snapshot file")?;
+        .context("writing snapshot tempfile")?;
+    tokio::fs::rename(&tmp_path, path)
+        .await
+        .context("renaming snapshot tempfile into place")?;
 
     Ok(entries.len())
 }
