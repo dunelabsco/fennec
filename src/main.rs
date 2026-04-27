@@ -99,6 +99,38 @@ enum Commands {
     Doctor,
 }
 
+/// Decrypt a channel-config secret through the [`SecretStore`], matching
+/// the fail-closed pattern used for `provider.api_key` and
+/// `collective.api_key`.
+///
+/// Return values:
+/// * `Some(String::new())` — the field was empty in config (caller should
+///   skip the channel via existing enabled+non-empty guards).
+/// * `Some(plaintext)` — successfully decrypted (or plaintext passthrough
+///   for legacy non-`enc2:` configs; `SecretStore` logs a warn).
+/// * `None` — the field was non-empty but decryption failed. The caller
+///   MUST treat the channel as disabled rather than handing the
+///   ciphertext to the vendor as if it were a live token.
+fn decrypt_channel_secret(
+    secret_store: &SecretStore,
+    raw: &str,
+    field_name: &str,
+) -> Option<String> {
+    if raw.is_empty() {
+        return Some(String::new());
+    }
+    match secret_store.decrypt(raw) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::error!(
+                "Failed to decrypt {field_name}: {e}; disabling associated channel \
+                 (set a fresh encrypted value or paste plaintext)"
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the API key from config or provider-specific environment variable.
 fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<String> {
     // Try config value first.
@@ -758,73 +790,150 @@ async fn run_gateway(
     let agent = Arc::new(tokio::sync::Mutex::new(agent));
 
     // 3. Build channel list from config.
+    //
+    // Each channel's secret fields (Telegram bot token, Discord bot token,
+    // Slack bot/app tokens, WhatsApp access/verify/app_secret, Email IMAP
+    // and SMTP passwords) is routed through `SecretStore::decrypt` so that
+    // `enc2:`-prefixed values from `fennec encrypt` round-trip to plaintext
+    // before being handed to the channel constructor — matching the
+    // `provider.api_key` and `collective.api_key` paths.
+    let secret_store =
+        SecretStore::new(home_dir.clone()).context("creating secret store for channel tokens")?;
     let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
 
     let ch_config = &config.channels;
 
     if ch_config.telegram.enabled && !ch_config.telegram.token.is_empty() {
-        let ch = fennec::channels::TelegramChannel::new(
-            ch_config.telegram.token.clone(),
-            ch_config.telegram.allowed_users.clone(),
-        );
-        channels.push(Arc::new(ch));
-        tracing::info!("Telegram channel enabled");
+        if let Some(token) = decrypt_channel_secret(
+            &secret_store,
+            &ch_config.telegram.token,
+            "channels.telegram.token",
+        )
+        .filter(|t| !t.is_empty())
+        {
+            let ch = fennec::channels::TelegramChannel::new(
+                token,
+                ch_config.telegram.allowed_users.clone(),
+            );
+            channels.push(Arc::new(ch));
+            tracing::info!("Telegram channel enabled");
+        }
     }
 
     if ch_config.discord.enabled && !ch_config.discord.token.is_empty() {
-        let ch = fennec::channels::DiscordChannel::new(
-            ch_config.discord.token.clone(),
-            ch_config.discord.allowed_users.clone(),
-        );
-        channels.push(Arc::new(ch));
-        tracing::info!("Discord channel enabled");
+        if let Some(token) = decrypt_channel_secret(
+            &secret_store,
+            &ch_config.discord.token,
+            "channels.discord.token",
+        )
+        .filter(|t| !t.is_empty())
+        {
+            let ch = fennec::channels::DiscordChannel::new(
+                token,
+                ch_config.discord.allowed_users.clone(),
+            );
+            channels.push(Arc::new(ch));
+            tracing::info!("Discord channel enabled");
+        }
     }
 
     if ch_config.slack.enabled
         && !ch_config.slack.bot_token.is_empty()
         && !ch_config.slack.app_token.is_empty()
     {
-        let ch = fennec::channels::SlackChannel::new(
-            ch_config.slack.bot_token.clone(),
-            ch_config.slack.app_token.clone(),
-            ch_config.slack.allowed_users.clone(),
+        let bot_token = decrypt_channel_secret(
+            &secret_store,
+            &ch_config.slack.bot_token,
+            "channels.slack.bot_token",
         );
-        channels.push(Arc::new(ch));
-        tracing::info!("Slack channel enabled");
+        let app_token = decrypt_channel_secret(
+            &secret_store,
+            &ch_config.slack.app_token,
+            "channels.slack.app_token",
+        );
+        if let (Some(bot), Some(app)) = (bot_token, app_token) {
+            if !bot.is_empty() && !app.is_empty() {
+                let ch = fennec::channels::SlackChannel::new(
+                    bot,
+                    app,
+                    ch_config.slack.allowed_users.clone(),
+                );
+                channels.push(Arc::new(ch));
+                tracing::info!("Slack channel enabled");
+            }
+        }
     }
 
     if ch_config.whatsapp.enabled && !ch_config.whatsapp.access_token.is_empty() {
-        let ch = fennec::channels::WhatsAppChannel::new(
-            ch_config.whatsapp.phone_number_id.clone(),
-            ch_config.whatsapp.access_token.clone(),
-            ch_config.whatsapp.verify_token.clone(),
-            ch_config.whatsapp.webhook_port,
-            ch_config.whatsapp.allowed_users.clone(),
-            ch_config.whatsapp.app_secret.clone(),
+        let access_token = decrypt_channel_secret(
+            &secret_store,
+            &ch_config.whatsapp.access_token,
+            "channels.whatsapp.access_token",
         );
-        channels.push(Arc::new(ch));
-        tracing::info!("WhatsApp channel enabled");
+        let verify_token = decrypt_channel_secret(
+            &secret_store,
+            &ch_config.whatsapp.verify_token,
+            "channels.whatsapp.verify_token",
+        );
+        let app_secret = decrypt_channel_secret(
+            &secret_store,
+            &ch_config.whatsapp.app_secret,
+            "channels.whatsapp.app_secret",
+        );
+        // verify_token / app_secret can be empty (existing behavior — only
+        // access_token is required by the outer guard) but if the user
+        // *did* configure them as encrypted blobs that fail to decrypt we
+        // refuse to construct the channel rather than handing a ciphertext
+        // string into webhook signature checks.
+        if let (Some(access), Some(verify), Some(secret)) =
+            (access_token, verify_token, app_secret)
+        {
+            if !access.is_empty() {
+                let ch = fennec::channels::WhatsAppChannel::new(
+                    ch_config.whatsapp.phone_number_id.clone(),
+                    access,
+                    verify,
+                    ch_config.whatsapp.webhook_port,
+                    ch_config.whatsapp.allowed_users.clone(),
+                    secret,
+                );
+                channels.push(Arc::new(ch));
+                tracing::info!("WhatsApp channel enabled");
+            }
+        }
     }
 
     if ch_config.email.enabled
         && !ch_config.email.smtp_host.is_empty()
         && !ch_config.email.imap_host.is_empty()
     {
-        let ch = fennec::channels::EmailChannel::new(
-            ch_config.email.imap_host.clone(),
-            ch_config.email.imap_port,
-            ch_config.email.imap_user.clone(),
-            ch_config.email.imap_password.clone(),
-            ch_config.email.smtp_host.clone(),
-            ch_config.email.smtp_port,
-            ch_config.email.smtp_user.clone(),
-            ch_config.email.smtp_password.clone(),
-            ch_config.email.from_address.clone(),
-            ch_config.email.allowed_senders.clone(),
-            ch_config.email.poll_interval_secs,
+        let imap_password = decrypt_channel_secret(
+            &secret_store,
+            &ch_config.email.imap_password,
+            "channels.email.imap_password",
         );
-        channels.push(Arc::new(ch));
-        tracing::info!("Email channel enabled");
+        let smtp_password = decrypt_channel_secret(
+            &secret_store,
+            &ch_config.email.smtp_password,
+            "channels.email.smtp_password",
+        );
+        if let (Some(imap_pw), Some(smtp_pw)) = (imap_password, smtp_password) {
+            let ch = fennec::channels::EmailChannel::new(
+                ch_config.email.imap_host.clone(),
+                ch_config.email.imap_port,
+                ch_config.email.imap_user.clone(),
+                imap_pw,
+                ch_config.email.smtp_host.clone(),
+                ch_config.email.smtp_port,
+                ch_config.email.smtp_user.clone(),
+                smtp_pw,
+                ch_config.email.from_address.clone(),
+                ch_config.email.allowed_senders.clone(),
+                ch_config.email.poll_interval_secs,
+            );
+            channels.push(Arc::new(ch));
+            tracing::info!("Email channel enabled");
+        }
     }
 
     // 3a. Populate the channel map so tools (e.g. ask_user) can reach channels.
