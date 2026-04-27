@@ -40,10 +40,7 @@ impl ImageGenTool {
         if api_key.is_empty() {
             return None;
         }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("build reqwest client for image gen");
+        let client = super::http::shared_client();
         Some(Self {
             api_key,
             output_dir,
@@ -136,6 +133,7 @@ impl Tool for ImageGenTool {
             .post("https://api.openai.com/v1/images/generations")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
+            .timeout(std::time::Duration::from_secs(120))
             .json(&body)
             .send()
             .await

@@ -53,10 +53,7 @@ impl TranscribeAudioTool {
         if api_key.is_empty() {
             return None;
         }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("build reqwest client for transcribe");
+        let client = super::http::shared_client();
         Some(Self {
             api_key,
             client,
@@ -157,6 +154,7 @@ impl Tool for TranscribeAudioTool {
             .client
             .post("https://api.openai.com/v1/audio/transcriptions")
             .header("Authorization", format!("Bearer {}", self.api_key))
+            .timeout(std::time::Duration::from_secs(120))
             .multipart(form)
             .send()
             .await
@@ -232,10 +230,7 @@ impl TextToSpeechTool {
         if api_key.is_empty() {
             return None;
         }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("build reqwest client for tts");
+        let client = super::http::shared_client();
         Some(Self {
             api_key,
             client,
@@ -324,6 +319,7 @@ impl Tool for TextToSpeechTool {
             .post("https://api.openai.com/v1/audio/speech")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
+            .timeout(std::time::Duration::from_secs(120))
             .json(&body)
             .send()
             .await
