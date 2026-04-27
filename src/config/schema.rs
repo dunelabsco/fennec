@@ -213,15 +213,25 @@ impl Default for ChannelsConfig {
 }
 
 /// Generic channel entry (Telegram, Discord).
+///
+/// `home_chat_id`, when set, is the default destination the agent uses
+/// when it calls `send_message` without an explicit chat_id (e.g. the
+/// LLM asks to "send a reminder to telegram"). Empty string means no
+/// home chat is configured; the tool then falls back to the most
+/// recently-seen chat on this channel, or refuses if nothing has been
+/// seen yet.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ChannelEntry {
     pub enabled: bool,
     pub token: String,
     pub allowed_users: Vec<String>,
+    pub home_chat_id: String,
 }
 
 /// Slack-specific channel entry (requires bot_token + app_token).
+///
+/// See [`ChannelEntry::home_chat_id`] for the role of `home_chat_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SlackChannelEntry {
@@ -229,6 +239,7 @@ pub struct SlackChannelEntry {
     pub bot_token: String,
     pub app_token: String,
     pub allowed_users: Vec<String>,
+    pub home_chat_id: String,
 }
 
 /// WhatsApp Cloud API channel entry.
@@ -247,6 +258,8 @@ pub struct WhatsAppChannelEntry {
     pub app_secret: String,
     pub webhook_port: u16,
     pub allowed_users: Vec<String>,
+    /// See [`ChannelEntry::home_chat_id`] for semantics.
+    pub home_chat_id: String,
 }
 
 impl Default for WhatsAppChannelEntry {
@@ -259,11 +272,15 @@ impl Default for WhatsAppChannelEntry {
             app_secret: String::new(),
             webhook_port: 9443,
             allowed_users: Vec::new(),
+            home_chat_id: String::new(),
         }
     }
 }
 
 /// Email channel entry (IMAP polling + SMTP sending).
+///
+/// See [`ChannelEntry::home_chat_id`] for the role of `home_chat_id` —
+/// for email this is typically the user's own email address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmailChannelEntry {
@@ -279,6 +296,7 @@ pub struct EmailChannelEntry {
     pub from_address: String,
     pub allowed_senders: Vec<String>,
     pub poll_interval_secs: u64,
+    pub home_chat_id: String,
 }
 
 impl Default for EmailChannelEntry {
@@ -296,6 +314,7 @@ impl Default for EmailChannelEntry {
             from_address: String::new(),
             allowed_senders: Vec::new(),
             poll_interval_secs: 30,
+            home_chat_id: String::new(),
         }
     }
 }
