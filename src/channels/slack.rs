@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -14,6 +14,18 @@ use crate::bus::InboundMessage;
 
 use super::traits::{Channel, SendMessage};
 
+/// Hard cap on the number of per-channel entries in
+/// [`SlackChannel::last_edit`] / [`SlackChannel::chat_threads`]. When
+/// exceeded, the oldest entry is evicted on insert.
+const MAX_TRACKED_CHANNELS: usize = 1024;
+
+/// Maximum number of times a request will retry on 429 (Too Many Requests)
+/// before bailing.
+const MAX_RETRY_AFTER_ATTEMPTS: u32 = 3;
+
+/// Cap on `Retry-After` honored from a 429 response.
+const RETRY_AFTER_CAP_SECS: u64 = 60;
+
 /// Slack channel using Socket Mode (WebSocket) for events and Web API for
 /// sending messages. Hand-rolled with `tokio-tungstenite` and `reqwest`.
 pub struct SlackChannel {
@@ -23,6 +35,10 @@ pub struct SlackChannel {
     allowed_users: Vec<String>,
     /// Per-channel timestamp of the last edit, used for rate-limiting streaming deltas.
     last_edit: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Per-channel most-recent inbound `thread_ts`. When the user messages
+    /// inside a thread, we cache it so outbound replies (regular and
+    /// streaming) land in the same thread instead of at top level.
+    chat_threads: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl SlackChannel {
@@ -33,13 +49,106 @@ impl SlackChannel {
             client: reqwest::Client::new(),
             allowed_users,
             last_edit: Arc::new(Mutex::new(HashMap::new())),
+            chat_threads: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Insert into `last_edit` with LRU-style eviction at capacity.
+    fn last_edit_insert(&self, chat_id: String, when: Instant) {
+        let mut map = self.last_edit.lock();
+        if map.len() >= MAX_TRACKED_CHANNELS && !map.contains_key(&chat_id) {
+            if let Some(oldest_key) = map
+                .iter()
+                .min_by_key(|(_, v)| *v)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest_key);
+            }
+        }
+        map.insert(chat_id, when);
+    }
+
+    /// Record the most recent thread_ts seen on `chat_id`. Bounded by
+    /// `MAX_TRACKED_CHANNELS`; oldest entry by insertion order is dropped
+    /// when at capacity. Insertion order is approximated by iteration order
+    /// of `HashMap`, which is non-deterministic — fine for our use, since
+    /// stale thread mappings just mean a reply lands at top level instead
+    /// of a thread.
+    fn remember_thread(&self, chat_id: String, thread_ts: String) {
+        let mut map = self.chat_threads.lock();
+        if map.len() >= MAX_TRACKED_CHANNELS && !map.contains_key(&chat_id) {
+            if let Some(any_key) = map.keys().next().cloned() {
+                map.remove(&any_key);
+            }
+        }
+        map.insert(chat_id, thread_ts);
+    }
+
+    fn thread_for(&self, chat_id: &str) -> Option<String> {
+        self.chat_threads.lock().get(chat_id).cloned()
+    }
+
+    /// POST to the Slack Web API honoring 429 `Retry-After`. Returns the
+    /// parsed JSON body. Bails after `MAX_RETRY_AFTER_ATTEMPTS` retries or
+    /// on any non-success status that isn't 429.
+    async fn post_web_api(&self, method: &str, body: &Value, token: &str) -> Result<Value> {
+        let url = format!("https://slack.com/api/{}", method);
+        let mut attempt: u32 = 0;
+        loop {
+            let resp = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(body)
+                .send()
+                .await
+                .with_context(|| format!("Slack {} request failed", method))?;
+            let status = resp.status();
+
+            if status.as_u16() == 429 && attempt < MAX_RETRY_AFTER_ATTEMPTS {
+                let retry_after = resp
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(1)
+                    .min(RETRY_AFTER_CAP_SECS);
+                tracing::warn!(
+                    "Slack 429 on {}: sleeping {}s (attempt {}/{})",
+                    method,
+                    retry_after,
+                    attempt + 1,
+                    MAX_RETRY_AFTER_ATTEMPTS
+                );
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                attempt += 1;
+                continue;
+            }
+
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Slack {} returned {}: {}", method, status, text);
+            }
+
+            let data: Value = resp
+                .json()
+                .await
+                .with_context(|| format!("Slack {} parse failed", method))?;
+            if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                let err = data.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                anyhow::bail!("Slack {} error: {}", method, err);
+            }
+            return Ok(data);
         }
     }
 
     /// Parse a Slack Socket Mode events_api envelope. Returns
-    /// (envelope_id, user, text, channel) if the envelope is a valid
-    /// non-bot message event.
-    pub fn parse_event_envelope(payload: &Value) -> Option<(String, String, String, String)> {
+    /// (envelope_id, user, text, channel, thread_ts) if the envelope is a
+    /// valid non-bot message event. `thread_ts` is `Some` when the message
+    /// was posted inside a thread.
+    pub fn parse_event_envelope(
+        payload: &Value,
+    ) -> Option<(String, String, String, String, Option<String>)> {
         let envelope_type = payload.get("type")?.as_str()?;
         if envelope_type != "events_api" {
             return None;
@@ -64,8 +173,12 @@ impl SlackChannel {
         let user = event.get("user")?.as_str()?.to_string();
         let text = event.get("text")?.as_str()?.to_string();
         let channel = event.get("channel")?.as_str()?.to_string();
+        let thread_ts = event
+            .get("thread_ts")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
-        Some((envelope_id, user, text, channel))
+        Some((envelope_id, user, text, channel, thread_ts))
     }
 
     /// Build the acknowledgement JSON for a Socket Mode envelope.
@@ -81,46 +194,26 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "channel": message.recipient,
             "text": message.content,
         });
-        let resp = self
-            .client
-            .post("https://slack.com/api/chat.postMessage")
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(&body)
-            .send()
-            .await
-            .context("Slack chat.postMessage request failed")?;
-        let data: Value = resp.json().await.context("Slack chat.postMessage parse failed")?;
-        if data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let err = data.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-            anyhow::bail!("Slack chat.postMessage error: {}", err);
+        if let Some(thread_ts) = self.thread_for(&message.recipient) {
+            body["thread_ts"] = Value::String(thread_ts);
         }
+        self.post_web_api("chat.postMessage", &body, &self.bot_token).await?;
         Ok(())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<InboundMessage>) -> Result<()> {
         // 1. Open a Socket Mode connection
-        let open_resp = self
-            .client
-            .post("https://slack.com/api/apps.connections.open")
-            .header("Authorization", format!("Bearer {}", self.app_token))
-            .send()
-            .await
-            .context("Slack apps.connections.open request failed")?;
-        let open_data: Value = open_resp
-            .json()
-            .await
-            .context("Slack apps.connections.open parse failed")?;
-        if open_data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            let err = open_data
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            anyhow::bail!("Slack apps.connections.open error: {}", err);
-        }
+        let open_data = self
+            .post_web_api(
+                "apps.connections.open",
+                &serde_json::json!({}),
+                &self.app_token,
+            )
+            .await?;
         let ws_url = open_data
             .get("url")
             .and_then(|v| v.as_str())
@@ -162,7 +255,7 @@ impl Channel for SlackChannel {
             }
 
             // Try to parse as an events_api message
-            if let Some((envelope_id, user, content, channel)) =
+            if let Some((envelope_id, user, content, channel, thread_ts)) =
                 Self::parse_event_envelope(&payload)
             {
                 // Send acknowledgement immediately
@@ -179,6 +272,18 @@ impl Channel for SlackChannel {
                     .unwrap_or_default()
                     .as_secs();
 
+                // Cache thread_ts so outbound replies (regular and streaming)
+                // land in the same thread the user posted in.
+                let mut metadata = HashMap::new();
+                if let Some(ts) = &thread_ts {
+                    metadata.insert("thread_ts".to_string(), ts.clone());
+                    self.remember_thread(channel.clone(), ts.clone());
+                } else {
+                    // User posted at top level — clear any stale thread mapping
+                    // so we don't accidentally reply into an old thread.
+                    self.chat_threads.lock().remove(&channel);
+                }
+
                 let msg = InboundMessage {
                     id: uuid::Uuid::new_v4().to_string(),
                     sender: user,
@@ -187,7 +292,7 @@ impl Channel for SlackChannel {
                     chat_id: channel,
                     timestamp: now,
                     reply_to: None,
-                    metadata: HashMap::new(),
+                    metadata,
                 };
 
                 if tx.send(msg).await.is_err() {
@@ -205,19 +310,14 @@ impl Channel for SlackChannel {
     }
 
     async fn send_streaming_start(&self, chat_id: &str) -> Result<Option<String>> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "channel": chat_id,
             "text": "...",
         });
-        let resp = self
-            .client
-            .post("https://slack.com/api/chat.postMessage")
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(&body)
-            .send()
-            .await
-            .context("Slack streaming start failed")?;
-        let data: Value = resp.json().await.context("Slack streaming start parse failed")?;
+        if let Some(thread_ts) = self.thread_for(chat_id) {
+            body["thread_ts"] = Value::String(thread_ts);
+        }
+        let data = self.post_web_api("chat.postMessage", &body, &self.bot_token).await?;
         // Slack returns the message timestamp as `ts` which serves as the message ID.
         let ts = data.get("ts").and_then(|v| v.as_str()).map(String::from);
         Ok(ts)
@@ -244,18 +344,9 @@ impl Channel for SlackChannel {
             "ts": message_id,
             "text": full_text,
         });
-        self.client
-            .post("https://slack.com/api/chat.update")
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(&body)
-            .send()
-            .await
-            .context("Slack streaming delta failed")?;
+        self.post_web_api("chat.update", &body, &self.bot_token).await?;
 
-        {
-            let mut map = self.last_edit.lock();
-            map.insert(chat_id.to_string(), Instant::now());
-        }
+        self.last_edit_insert(chat_id.to_string(), Instant::now());
 
         Ok(())
     }
@@ -271,13 +362,7 @@ impl Channel for SlackChannel {
             "ts": message_id,
             "text": full_text,
         });
-        self.client
-            .post("https://slack.com/api/chat.update")
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(&body)
-            .send()
-            .await
-            .context("Slack streaming end failed")?;
+        self.post_web_api("chat.update", &body, &self.bot_token).await?;
 
         {
             let mut map = self.last_edit.lock();

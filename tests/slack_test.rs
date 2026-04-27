@@ -19,11 +19,34 @@ fn parse_event_envelope_valid_message() {
 
     let result = SlackDirect::parse_event_envelope(&payload);
     assert!(result.is_some());
-    let (envelope_id, user, text, channel) = result.unwrap();
+    let (envelope_id, user, text, channel, thread_ts) = result.unwrap();
     assert_eq!(envelope_id, "env-abc-123");
     assert_eq!(user, "U12345");
     assert_eq!(text, "Hello Fennec!");
     assert_eq!(channel, "C67890");
+    assert!(thread_ts.is_none(), "top-level message has no thread_ts");
+}
+
+#[test]
+fn parse_event_envelope_threaded_message_captures_thread_ts() {
+    let payload = serde_json::json!({
+        "type": "events_api",
+        "envelope_id": "env-thread-1",
+        "payload": {
+            "event": {
+                "type": "message",
+                "user": "U12345",
+                "text": "reply in thread",
+                "channel": "C67890",
+                "ts": "1700000010.000200",
+                "thread_ts": "1700000000.000100"
+            }
+        }
+    });
+
+    let (_, _, _, _, thread_ts) =
+        SlackDirect::parse_event_envelope(&payload).expect("should parse");
+    assert_eq!(thread_ts.as_deref(), Some("1700000000.000100"));
 }
 
 #[test]
