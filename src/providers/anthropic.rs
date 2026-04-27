@@ -212,12 +212,17 @@ impl AnthropicProvider {
     /// `content_block_stop` events can't be correlated back to the right
     /// tool call. Text blocks are tracked with a sentinel so we know NOT
     /// to emit a spurious `ToolCallEnd` for them.
+    /// Returns `true` if this event ended the stream (i.e. emitted
+    /// `StreamEvent::Done`). The caller uses this flag to suppress the
+    /// post-loop "Done anyway" fallback, which previously ran
+    /// unconditionally and produced duplicate `Done` events on every
+    /// successful stream.
     async fn handle_sse_event(
         event_type: &str,
         data: &Value,
         tx: &tokio::sync::mpsc::Sender<StreamEvent>,
         index_to_tool: &mut HashMap<u64, ToolBlockInfo>,
-    ) {
+    ) -> bool {
         match event_type {
             "content_block_start" => {
                 let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -288,6 +293,7 @@ impl AnthropicProvider {
             }
             "message_stop" => {
                 let _ = tx.send(StreamEvent::Done).await;
+                return true;
             }
             "error" => {
                 let msg = data
@@ -296,9 +302,15 @@ impl AnthropicProvider {
                     .and_then(|m| m.as_str())
                     .unwrap_or("unknown streaming error");
                 let _ = tx.send(StreamEvent::Error(msg.to_string())).await;
+                // Surface the error as a terminal event too so consumers
+                // that wait for `Done` don't hang when the server emits
+                // `error` instead. Treat error as the terminator.
+                let _ = tx.send(StreamEvent::Done).await;
+                return true;
             }
             _ => { /* message_start, ping, etc. — ignore */ }
         }
+        false
     }
 
     /// Parse the Anthropic response JSON into our ChatResponse.
@@ -485,12 +497,22 @@ impl Provider for AnthropicProvider {
             let mut sse = SseBuffer::new();
             let mut current_event_type = String::new();
             let mut index_to_tool: HashMap<u64, ToolBlockInfo> = HashMap::new();
+            // Tracks whether `handle_sse_event` already emitted Done (via
+            // `message_stop` or `error`). Without this, the post-loop
+            // "Done anyway" fallback fires on every successful stream too,
+            // and consumers receive `Done` twice.
+            let mut done_sent = false;
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                        // Surface a terminator after the error so consumers
+                        // waiting for `Done` don't hang.
+                        if !done_sent {
+                            let _ = tx.send(StreamEvent::Done).await;
+                        }
                         return;
                     }
                 };
@@ -513,20 +535,29 @@ impl Provider for AnthropicProvider {
                         current_event_type = evt.to_string();
                     } else if let Some(data_str) = line.strip_prefix("data: ") {
                         if let Ok(data) = serde_json::from_str::<Value>(data_str) {
-                            Self::handle_sse_event(
+                            let terminated = Self::handle_sse_event(
                                 &current_event_type,
                                 &data,
                                 &tx,
                                 &mut index_to_tool,
                             )
                             .await;
+                            if terminated {
+                                done_sent = true;
+                            }
                         }
                     }
                 }
             }
 
-            // If we exit without a message_stop, send Done anyway.
-            let _ = tx.send(StreamEvent::Done).await;
+            // Fallback: if we drained the byte stream without ever seeing a
+            // `message_stop` or `error` SSE event (e.g. server closed the
+            // connection mid-stream), surface a single Done so consumers
+            // don't hang. If `done_sent` is already true, do nothing —
+            // consumers have already received their terminator.
+            if !done_sent {
+                let _ = tx.send(StreamEvent::Done).await;
+            }
         });
 
         Ok(rx)
@@ -721,5 +752,41 @@ mod tests {
         )];
         let out = replay(events).await;
         assert!(out.is_empty(), "orphan delta should be dropped: {:?}", out);
+    }
+
+    /// Regression: previously the SSE handler emitted `Done` on
+    /// `message_stop` AND the post-loop fallback also unconditionally
+    /// emitted `Done`, so consumers saw Done twice on every successful
+    /// stream. With `handle_sse_event` returning `bool` and the post-
+    /// loop checking the flag, exactly one Done should be emitted from
+    /// the handler when `message_stop` arrives.
+    #[tokio::test]
+    async fn message_stop_emits_done_exactly_once() {
+        let out = replay(vec![("message_stop", json!({}))]).await;
+        let dones = out
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Done))
+            .count();
+        assert_eq!(dones, 1, "expected exactly one Done, got {:?}", out);
+    }
+
+    /// `error` SSE event must surface both `Error` (so the consumer
+    /// knows what went wrong) and `Done` (as a terminator so any
+    /// `await`-on-Done loop terminates). It must NOT depend on the
+    /// post-loop fallback for the terminator.
+    #[tokio::test]
+    async fn error_event_emits_error_then_done() {
+        let out = replay(vec![(
+            "error",
+            json!({"error": {"message": "boom"}}),
+        )])
+        .await;
+        let mut iter = out.iter();
+        match iter.next() {
+            Some(StreamEvent::Error(m)) => assert_eq!(m, "boom"),
+            other => panic!("expected Error first, got {:?}", other),
+        }
+        assert!(matches!(iter.next(), Some(StreamEvent::Done)));
+        assert!(iter.next().is_none(), "no events should follow Done");
     }
 }
