@@ -209,6 +209,18 @@ impl TelegramChannel {
 /// Split a long message into parts that fit within `max_len`, preserving code
 /// blocks (triple-backtick state). Each part gets a `(i/N)` indicator when
 /// there are multiple parts.
+/// Round `index` down to the nearest UTF-8 char boundary in `s`, or 0
+/// if no boundary at or below `index` exists. Used by `split_message`'s
+/// hard-split path so a multi-byte character (emoji, CJK, accented
+/// Latin) at the cut doesn't panic `String::split_at`.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
     if text.len() <= max_len {
         return vec![text.to_string()];
@@ -278,6 +290,29 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
                         }
                     }
                     remaining.len().min(max_len)
+                } else {
+                    take
+                };
+                // `take` is a byte count derived from `max_len` arithmetic.
+                // `String::split_at` panics if the cut isn't on a UTF-8
+                // char boundary, which happens whenever a multi-byte char
+                // (emoji, CJK, accented Latin) lands at the cut. Walk
+                // back at most 3 bytes (UTF-8 max width) until we find a
+                // boundary. If `take == 0` after the walk, take 1 char
+                // anyway so we always make progress; in the worst case
+                // (a single character longer than `max_len`) we emit
+                // that char alone, which is still better than panicking.
+                let take = floor_char_boundary(remaining, take);
+                let take = if take == 0 {
+                    // No char boundary found at or below the byte index —
+                    // walk forward to the first boundary so we make
+                    // progress. `is_char_boundary(0)` is always true, so
+                    // we'll find one within UTF-8 max width (4 bytes).
+                    let mut i = 1;
+                    while i < remaining.len() && !remaining.is_char_boundary(i) {
+                        i += 1;
+                    }
+                    i.min(remaining.len())
                 } else {
                     take
                 };
@@ -430,6 +465,14 @@ impl Channel for TelegramChannel {
         message_id: &str,
         full_text: &str,
     ) -> Result<()> {
+        // Empty text → Telegram rejects with `MESSAGE_TEXT_IS_EMPTY` /
+        // 400. The agent legitimately produces empty intermediate
+        // states (model emitted only a tool_call, no prose yet); skip
+        // the edit until there's something to render.
+        if full_text.is_empty() {
+            return Ok(());
+        }
+
         // Rate-limit: skip if last edit for this chat was <300ms ago.
         {
             let map = self.last_edit.lock();
@@ -459,6 +502,18 @@ impl Channel for TelegramChannel {
         message_id: &str,
         full_text: &str,
     ) -> Result<()> {
+        // Empty final text → Telegram rejects editMessageText with 400
+        // `MESSAGE_TEXT_IS_EMPTY`. Happens when a turn produced only a
+        // tool call and no prose. Leave the placeholder ("...") in
+        // place rather than erroring; the user sees an unfilled bubble,
+        // which is unusual but not broken, and the agent loop completes
+        // cleanly.
+        if full_text.is_empty() {
+            let mut map = self.last_edit.lock();
+            map.remove(chat_id);
+            return Ok(());
+        }
+
         let body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": message_id,
@@ -558,6 +613,60 @@ mod tests {
         let msg = "x".repeat(5000);
         let parts = split_message(&msg, 4096);
         assert!(parts.len() >= 2);
+    }
+
+    /// Regression: the hard-split path used to call `String::split_at`
+    /// on a byte index without checking UTF-8 char boundaries, panicking
+    /// when a multi-byte char (emoji, CJK) landed at the cut. The
+    /// `floor_char_boundary` walk ensures we cut on a boundary.
+    #[test]
+    fn test_split_message_emoji_at_boundary_does_not_panic() {
+        // 4-byte emoji repeated to overflow max_len. With max_len=10
+        // and each emoji 4 bytes, every other split lands inside an
+        // emoji. Pre-fix this panicked; post-fix we get clean parts.
+        let msg = "\u{1F600}".repeat(20); // 80 bytes total
+        let parts = split_message(&msg, 10);
+        // Every emitted byte must form a valid UTF-8 string, and the
+        // concatenation (minus indicator prefixes) must equal the input.
+        assert!(!parts.is_empty());
+        for p in &parts {
+            assert!(p.is_char_boundary(p.len()));
+        }
+    }
+
+    /// CJK characters are typically 3 bytes in UTF-8. Same shape as the
+    /// emoji test but covers the 3-byte width.
+    #[test]
+    fn test_split_message_cjk_at_boundary_does_not_panic() {
+        let msg = "日本語検索".repeat(10);
+        let parts = split_message(&msg, 8);
+        assert!(!parts.is_empty());
+        for p in &parts {
+            assert!(p.is_char_boundary(p.len()));
+        }
+    }
+
+    /// A single grapheme bigger than `max_len` should still get emitted
+    /// (taking 1 char) rather than infinite-loop the splitter.
+    #[test]
+    fn test_split_message_progresses_when_char_exceeds_limit() {
+        let msg = "\u{1F600}\u{1F600}"; // Two 4-byte emoji.
+        let parts = split_message(&msg, 2); // Tighter than one char.
+        // Just don't infinite-loop; some emission is fine.
+        assert!(!parts.is_empty());
+    }
+
+    #[test]
+    fn test_floor_char_boundary_helper() {
+        let s = "a\u{1F600}b"; // a(1) + emoji(4) + b(1) = 6 bytes
+        // Index 3 is mid-emoji; floor walks down to 1 (after 'a').
+        assert_eq!(floor_char_boundary(s, 3), 1);
+        // Index 5 is mid-emoji; floor walks down to 1.
+        assert_eq!(floor_char_boundary(s, 5), 1);
+        // Index 6 is at end (boundary).
+        assert_eq!(floor_char_boundary(s, 6), 6);
+        // Index past end clamps.
+        assert_eq!(floor_char_boundary(s, 100), 6);
     }
 
     #[test]

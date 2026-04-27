@@ -495,6 +495,14 @@ impl Channel for DiscordChannel {
         message_id: &str,
         full_text: &str,
     ) -> Result<()> {
+        // Empty content → Discord rejects PATCH /messages with 400
+        // (code 50006: "cannot send empty message"). Skip until there's
+        // something to render. The placeholder from `send_streaming_start`
+        // remains visible to the user until the next non-empty delta.
+        if full_text.is_empty() {
+            return Ok(());
+        }
+
         // Rate-limit: skip if last edit was <300ms ago.
         {
             let map = self.last_edit.lock();
@@ -533,15 +541,32 @@ impl Channel for DiscordChannel {
         message_id: &str,
         full_text: &str,
     ) -> Result<()> {
+        // Empty final text → PATCH /messages with empty content is a
+        // 400 (code 50006). Happens when a turn produced only a tool
+        // call and no prose. Leave the start-of-stream placeholder
+        // ("...") in place rather than erroring; the user sees an
+        // unfilled bubble, which is unusual but not broken.
+        if full_text.is_empty() {
+            let mut map = self.last_edit.lock();
+            map.remove(chat_id);
+            return Ok(());
+        }
+
         // Split honoring 2000-char limit and code-block boundaries.
         let parts = split_message(full_text, DISCORD_MAX_CONTENT);
-        // First chunk PATCHes the existing message; subsequent chunks are
-        // POSTed as new messages so the entire response is preserved.
+        // `split_message` of a non-empty string always returns ≥1
+        // element, so `first` will be Some — but defensively, skip a
+        // zero-length first chunk so we don't reintroduce the empty-
+        // PATCH crash via an unforeseen splitter edge case.
         if let Some(first) = parts.first() {
-            self.patch_message(chat_id, message_id, first).await?;
+            if !first.is_empty() {
+                self.patch_message(chat_id, message_id, first).await?;
+            }
         }
         for part in parts.iter().skip(1) {
-            self.post_message(chat_id, part).await?;
+            if !part.is_empty() {
+                self.post_message(chat_id, part).await?;
+            }
         }
 
         {
