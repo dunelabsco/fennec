@@ -1,6 +1,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,29 +37,19 @@ fn compute_challenge(verifier: &str) -> String {
     base64url_encode(&hash)
 }
 
-/// Base64url-encode without padding (RFC 7636).
+/// Base64url-encode without padding (RFC 7636 §4.2).
+///
+/// Was a hand-rolled implementation that had two issues:
+///   1. Subtle padding bug at certain input lengths (worked at the
+///      32-byte verifier length we use today, but a foot-gun if we
+///      ever change input sizes).
+///   2. The `replace('+', "-").replace('/', "_")` post-pass walks the
+///      string twice, allocating each time.
+///
+/// Now delegated to the `base64` crate's `URL_SAFE_NO_PAD` engine —
+/// same RFC 7636 output, well-tested, no allocator sins.
 fn base64url_encode(input: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::new();
-    let len = input.len();
-    let mut i = 0;
-    while i < len {
-        let b0 = input[i] as u32;
-        let b1 = if i + 1 < len { input[i + 1] as u32 } else { 0 };
-        let b2 = if i + 2 < len { input[i + 2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        s.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        s.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if i + 1 < len {
-            s.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        }
-        if i + 2 < len {
-            s.push(CHARS[(triple & 0x3F) as usize] as char);
-        }
-        i += 3;
-    }
-    // Convert to url-safe alphabet.
-    s.replace('+', "-").replace('/', "_")
+    URL_SAFE_NO_PAD.encode(input)
 }
 
 /// Open a URL in the user's default browser.
@@ -136,6 +128,30 @@ pub fn run_oauth_login(fennec_home: &Path) -> Result<OAuthCredentials> {
     let parts: Vec<&str> = raw_input.splitn(2, '#').collect();
     let code = parts[0];
     let state = if parts.len() > 1 { parts[1] } else { "" };
+
+    // CSRF protection: the `state` we sent in the auth URL is the PKCE
+    // verifier (Anthropic's required form). The callback hands us back
+    // `code#state` — we must reject if the state doesn't match what we
+    // sent, otherwise an attacker who tricked the user into pasting a
+    // `code#state` from a different OAuth flow could redeem the code
+    // through our running `run_oauth_login`. PKCE alone protects token
+    // redemption (the verifier is needed for the token exchange) but
+    // state-binding is the standard CSRF anchor and is cheap to add.
+    if state.is_empty() {
+        anyhow::bail!(
+            "Missing state in pasted authorization code. Make sure you \
+             pasted the FULL string from the Anthropic callback page — it \
+             should look like 'CODE#STATE' (the part after '#' is required \
+             for CSRF protection)."
+        );
+    }
+    if state != verifier {
+        anyhow::bail!(
+            "OAuth state mismatch: the callback's state did not match the \
+             value we sent. This usually means the code was pasted from a \
+             different login attempt. Restart the login flow."
+        );
+    }
 
     // 4. Exchange code for tokens — must include User-Agent matching Claude CLI.
     let client = reqwest::blocking::Client::new();
@@ -243,10 +259,62 @@ pub fn load_oauth_token(fennec_home: &Path) -> Result<Option<String>> {
 }
 
 /// Refresh an OAuth token using the refresh_token grant.
+///
+/// Wraps the read-check-refresh-write cycle in an advisory file lock
+/// (`<fennec_home>/.anthropic_oauth.lock`) so two Fennec processes
+/// (e.g. CLI + gateway daemon) sharing the same `fennec_home` don't
+/// race on refresh. Anthropic rotates the refresh token on each use,
+/// so without the lock the second-to-finish process saves a stale
+/// refresh_token and the next refresh from that process fails.
 pub fn refresh_oauth_token(
     fennec_home: &Path,
     refresh_token: &str,
 ) -> Result<OAuthCredentials> {
+    use fs2::FileExt;
+
+    std::fs::create_dir_all(fennec_home)
+        .context("creating fennec home for oauth lock")?;
+    let lock_path = fennec_home.join(".anthropic_oauth.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening oauth lock at {}", lock_path.display()))?;
+
+    // Block until we can acquire the exclusive lock. Concurrent processes
+    // wait here; we hold the lock for the duration of the refresh round
+    // trip and the credentials write, then release on file drop at the
+    // end of this function.
+    lock_file
+        .lock_exclusive()
+        .context("acquiring exclusive oauth refresh lock")?;
+
+    // Re-read the credentials after acquiring the lock — another process
+    // may have refreshed while we were waiting, in which case OUR
+    // refresh_token is now stale and we should hand back the freshly-
+    // refreshed credentials instead of trying to redeem a stale token.
+    let path = fennec_home.join(TOKEN_FILE);
+    if path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(creds) = serde_json::from_str::<OAuthCredentials>(&data) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if creds.expires_at > now + 60 && creds.refresh_token != refresh_token {
+                    // Another process refreshed; use their result.
+                    tracing::debug!(
+                        "OAuth credentials were refreshed by another process \
+                         while we waited for the lock; using their result"
+                    );
+                    return Ok(creds);
+                }
+            }
+        }
+    }
+
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(TOKEN_ENDPOINT)
