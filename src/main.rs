@@ -869,8 +869,30 @@ async fn run_gateway(
 
     let gateway = GatewayServer::new(addr);
     let gateway_agent = Arc::clone(&agent);
+    // Channel used to ask the gateway to stop accepting new connections
+    // and drain in-flight requests. The shutdown handler at the bottom
+    // of this function sends `true` here on Ctrl-C; the gateway's
+    // `with_graceful_shutdown` future awaits it. We await the gateway's
+    // JoinHandle (with a small grace timeout) instead of `.abort()`-ing
+    // it, so a request that's mid-turn doesn't lose its agent lock or
+    // its outbound publish.
+    let (gateway_shutdown_tx, mut gateway_shutdown_rx) =
+        tokio::sync::watch::channel::<bool>(false);
     let gateway_handle = tokio::spawn(async move {
-        if let Err(e) = gateway.run(gateway_agent, auth_token).await {
+        let shutdown_signal = async move {
+            // Wait until the watch value flips to `true`. If the sender
+            // is dropped before that (e.g. main panics), `changed()`
+            // returns Err — treat as shutdown so we don't dangle.
+            while gateway_shutdown_rx.changed().await.is_ok() {
+                if *gateway_shutdown_rx.borrow() {
+                    break;
+                }
+            }
+        };
+        if let Err(e) = gateway
+            .run_with_shutdown(gateway_agent, auth_token, shutdown_signal)
+            .await
+        {
             tracing::error!("Gateway server error: {e}");
         }
     });
@@ -1070,8 +1092,34 @@ async fn run_gateway(
     tokio::signal::ctrl_c().await?;
     tracing::info!("Received SIGINT, shutting down...");
 
-    // Abort tasks.
-    gateway_handle.abort();
+    // Tell the gateway to stop accepting new connections and drain.
+    // `send` only fails if all receivers have been dropped, which would
+    // already mean the gateway task ended; either way, ignore the result
+    // and proceed with the rest of shutdown.
+    let _ = gateway_shutdown_tx.send(true);
+
+    // Give the gateway up to 30s to drain. Most in-flight requests
+    // complete within seconds; the per-request 10-minute hard cap means
+    // even a stuck request can't block this forever, but the request
+    // timeout would extend shutdown to ~10 minutes worst-case which is
+    // unfriendly. Cap the drain wait so a stuck request doesn't hold
+    // the whole process. If drain takes longer than the cap, we abort.
+    let gateway_shutdown_grace = std::time::Duration::from_secs(30);
+    match tokio::time::timeout(gateway_shutdown_grace, gateway_handle).await {
+        Ok(Ok(())) => tracing::info!("Gateway drained cleanly"),
+        Ok(Err(e)) => tracing::warn!("Gateway task ended with error: {}", e),
+        Err(_) => {
+            tracing::warn!(
+                "Gateway didn't drain within {:?}; some in-flight requests \
+                 may have been cut off",
+                gateway_shutdown_grace,
+            );
+        }
+    }
+
+    // Abort the rest of the supervised tasks. These don't have graceful
+    // shutdown wired yet; that's a separate concern (see audit punch list
+    // for bus + shutdown lifecycle).
     agent_loop.abort();
     if let Some(h) = _cron_handle {
         h.abort();

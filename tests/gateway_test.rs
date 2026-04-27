@@ -96,6 +96,46 @@ async fn test_health_no_auth_needed_even_when_token_set() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+/// When the stub provider's `chat()` errors, the handler must NOT echo
+/// the error string verbatim to the client. Instead it should return a
+/// 500 with a generic message + a request_id that operators can grep
+/// the server logs by.
+#[tokio::test]
+async fn test_chat_error_is_masked_with_request_id() {
+    // No auth so we reach the handler.
+    let state = build_test_state(None);
+    let app = fennec::gateway::routes::build_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer unused")
+        .body(Body::from(r#"{"message":"hello"}"#))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Generic top-level error string — no leaked internals.
+    let err_msg = json["error"].as_str().unwrap();
+    assert_eq!(err_msg, "internal error processing chat request");
+    assert!(
+        !err_msg.contains("stub provider"),
+        "stub provider error string must not leak to client: {}",
+        err_msg
+    );
+
+    // request_id present and non-empty for log correlation.
+    let request_id = json["request_id"].as_str().unwrap();
+    assert!(!request_id.is_empty());
+    // UUID-simple form is 32 hex chars.
+    assert_eq!(request_id.len(), 32, "request_id should be uuid-simple: {}", request_id);
+}
+
 #[tokio::test]
 async fn test_chat_request_response_serde() {
     // Verify the request/response types serialize/deserialize correctly.
