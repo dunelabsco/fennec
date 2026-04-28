@@ -1,0 +1,113 @@
+# Continuous integration for Fennec.
+#
+# Runs on every push to `main` and every pull request targeting `main`.
+# All jobs run on `ubuntu-latest` against stable Rust to keep wall-clock
+# fast and minutes-cost low. Adding macOS / additional toolchains is a
+# follow-up; the current target audience for the CI signal is "did I
+# break the build / tests" rather than "does this work on every
+# platform we ever support."
+#
+# Job blocking policy:
+#
+# * `test` and `fmt` are strictly blocking. Tests must pass; formatter
+#   diffs are cheap to fix locally.
+# * `clippy` is intentionally non-blocking on the first deployment.
+#   Existing code may have lint findings that nobody has cleared yet,
+#   and we don't want the first PR after this lands to be hostage to
+#   a yak-shave. Once the codebase is clippy-clean, flip
+#   `continue-on-error: false` (and consider removing the line).
+# * `audit` is non-blocking because RustSec advisories arrive at their
+#   own schedule and the failure should be visible (info) without
+#   blocking unrelated PRs. Treat it as a notification feed.
+#
+# When tightening any of these to blocking, do it as its own PR so the
+# tightening is reviewable in isolation.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-flight run if a new commit lands on the same ref —
+# saves minutes on rapid iteration; the latest commit is what matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target dir
+        uses: Swatinem/rust-cache@v2
+
+      # `--locked` fails fast if Cargo.lock is out of sync with
+      # Cargo.toml — catches the case where someone bumped a version
+      # without running cargo build locally.
+      - name: cargo test
+        run: cargo test --workspace --locked --all-features
+
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain (with rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Non-blocking until the existing codebase is clippy-clean. See the
+    # comment block at the top of this file for the policy.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain (with clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target dir
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Non-blocking: surface RustSec advisories as info, don't gate PRs
+    # on them. See policy block at top.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # Uses the official rustsec audit-check action which posts findings
+      # as PR comments. Reads the GITHUB_TOKEN that's auto-provisioned.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
