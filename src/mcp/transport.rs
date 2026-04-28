@@ -205,18 +205,21 @@ impl HttpTransport {
     /// Create a new HTTP transport pointing at the given URL.
     ///
     /// The reqwest client has a 30s overall timeout so a hung server
-    /// can't make the call hang indefinitely (the old
-    /// `reqwest::Client::new()` had no timeout).
-    pub fn new(url: impl Into<String>) -> Self {
+    /// can't make the call hang indefinitely. Returns `Err` instead of
+    /// panicking on TLS / proxy / DNS-resolver build failure (the old
+    /// `.expect("build reqwest client...")` would crash the whole
+    /// process at MCP-server connect time, which on a misconfigured
+    /// rustls install meant Fennec wouldn't start at all).
+    pub fn new(url: impl Into<String>) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .build()
-            .expect("build reqwest client for MCP HTTP transport");
-        Self {
+            .context("building reqwest client for MCP HTTP transport")?;
+        Ok(Self {
             client,
             url: url.into(),
             next_id: AtomicU64::new(1),
-        }
+        })
     }
 }
 
