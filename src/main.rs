@@ -430,9 +430,22 @@ async fn build_agent(
             } else {
                 Some(config.collective.base_url.clone())
             };
-            let client = PlurumlClient::new(collective_api_key, base_url);
-            tracing::info!("Collective intelligence enabled (Plurum remote)");
-            Some(Arc::new(client))
+            // Failing to build the Plurum reqwest client (broken TLS
+            // roots, proxy config, etc.) used to panic the process at
+            // startup. Treat it as "remote disabled" instead — local
+            // collective still works.
+            match PlurumlClient::new(collective_api_key, base_url) {
+                Ok(client) => {
+                    tracing::info!("Collective intelligence enabled (Plurum remote)");
+                    Some(Arc::new(client))
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to build Plurum client: {e}; running collective in local-only mode"
+                    );
+                    None
+                }
+            }
         } else {
             tracing::info!("Collective intelligence enabled (local only, no API key)");
             None
@@ -597,7 +610,18 @@ async fn build_agent(
                 } else {
                     Some(config.collective.base_url.clone())
                 };
-                Arc::new(PlurumlClient::new(collective_api_key, base_url))
+                // Same fallback as the search-layer constructor above:
+                // a Plurum reqwest-build failure now degrades to
+                // MockCollective rather than panicking the process.
+                match PlurumlClient::new(collective_api_key, base_url) {
+                    Ok(client) => Arc::new(client) as Arc<dyn CollectiveLayer>,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to build Plurum publish client: {e}; using MockCollective"
+                        );
+                        Arc::new(MockCollective::new())
+                    }
+                }
             } else {
                 Arc::new(MockCollective::new())
             };
@@ -950,8 +974,14 @@ async fn run_gateway(
 
                 // Set the CronTool's origin so any jobs created during this
                 // turn know which channel/chat to deliver results to.
+                // Recover from a poisoned mutex via `into_inner` so that a
+                // single panic-while-locked elsewhere can't kill all
+                // subsequent inbound turns. (Same recovery pattern as the
+                // CronTool::execute lock site.)
                 {
-                    let mut origin = cron_origin.lock().unwrap();
+                    let mut origin = cron_origin
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
                     *origin = Some(CronOrigin {
                         channel: msg.channel.clone(),
                         chat_id: msg.chat_id.clone(),

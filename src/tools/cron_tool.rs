@@ -99,9 +99,26 @@ impl CronTool {
         };
 
         // Read origin from shared state.
-        let origin = self.default_origin.lock().unwrap().clone();
+        //
+        // `unwrap_or_else(|p| p.into_inner())` recovers from a poisoned
+        // mutex: the previous `.lock().unwrap()` would panic for every
+        // future cron call after any single panic-while-locked. The
+        // locked region here is just a `clone()` of an `Option<CronOrigin>`
+        // so it can't itself panic — but a panic from an unrelated
+        // holder (gateway agent loop sets the origin in main.rs:953)
+        // would cascade. Recover the inner data and continue.
+        let origin = self
+            .default_origin
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
 
-        let job_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        // Full UUID v4 — the previous 8-hex-char truncation produces
+        // birthday collisions at ~64K jobs and shows up as
+        // "job not found" failures for whichever colliding entry got
+        // overwritten. Job IDs are LLM-facing identifiers, not
+        // human-typed: full length is fine.
+        let job_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
         let next_run = now + chrono::Duration::seconds(interval_secs as i64);
 
