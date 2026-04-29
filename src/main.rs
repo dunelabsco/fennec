@@ -377,8 +377,15 @@ async fn build_agent(
     // Voice tools (transcription + TTS). Both use OpenAI; shared key
     // resolution with the image gen tool.
     let voice_key = voice_resolve_openai_key(&config.provider.name, &img_config_key);
+    // Wire memory into the transcribe tool so the agent can opt into
+    // FTS5-indexing transcripts via the new `index` param. Existing
+    // transcription calls without `index=true` behave identically.
+    let transcribe_memory: Arc<dyn Memory> = memory.clone();
     let transcribe_tool = TranscribeAudioTool::new_with_key(voice_key.clone(), None)
-        .map(|t| t.with_sandbox(Arc::clone(&path_sandbox)));
+        .map(|t| {
+            t.with_sandbox(Arc::clone(&path_sandbox))
+                .with_memory(Arc::clone(&transcribe_memory))
+        });
     let tts_tool = TextToSpeechTool::new_with_key(
         voice_key,
         default_tts_output_dir(home_dir),
