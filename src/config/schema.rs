@@ -48,11 +48,158 @@ impl FennecConfig {
             .join(".fennec")
     }
 
+    /// Resolve the home directory for a named profile.
+    ///
+    /// Profiles are a friendly convention layered on top of
+    /// [`Self::resolve_home`]: instead of typing the full
+    /// `--config-dir ~/.fennec/profiles/work` every time, the user
+    /// types `--profile work` and we resolve the same path. The base
+    /// directory follows the normal `$FENNEC_HOME` / `~/.fennec`
+    /// resolution; the profile name is appended under a `profiles/`
+    /// subdirectory.
+    ///
+    /// `name` is validated to keep it usable as a directory component
+    /// — alphanumeric plus `-` and `_`, length 1-64. This rejects
+    /// path-traversal attempts (`..`, `/foo`), surprising whitespace,
+    /// and other shenanigans before we ever touch the filesystem.
+    /// Returns `Err` with a clear message on rejection.
+    pub fn resolve_profile_home(name: &str) -> Result<PathBuf> {
+        validate_profile_name(name)?;
+        let base = Self::resolve_home(None);
+        Ok(base.join("profiles").join(name))
+    }
+
     /// Load configuration from a TOML file at `path`.
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let config: FennecConfig = toml::from_str(&contents)?;
         Ok(config)
+    }
+}
+
+/// Profile name validation. Accepts ASCII alphanumeric + `-` + `_`,
+/// 1-64 characters. Rejects everything else with a contextual error.
+///
+/// The constraints exist for two reasons:
+///
+/// 1. **Path safety.** A profile name is interpolated into a directory
+///    path. Without validation, `--profile ../../../etc` would resolve
+///    to a path outside `~/.fennec/profiles/` and we'd happily try to
+///    write a `.key` file there. Restricting to `[A-Za-z0-9_-]` makes
+///    every accepted name a valid single path component on every
+///    supported platform, with no separator characters and no parent
+///    references.
+/// 2. **Predictability across shells.** Profile names show up in
+///    shell history, scripts, and systemd unit names. Disallowing
+///    spaces and quote characters means an operator can copy-paste
+///    a profile name into any context without quoting hazards.
+///
+/// The 64-char cap is well above any realistic profile name and well
+/// below any path-length limit. Empty names are rejected because they
+/// would resolve to `~/.fennec/profiles/`, which is the parent of all
+/// profile dirs and not a valid state directory itself.
+fn validate_profile_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("profile name cannot be empty");
+    }
+    if name.len() > 64 {
+        anyhow::bail!(
+            "profile name '{}' is too long ({} chars; max 64)",
+            name,
+            name.len()
+        );
+    }
+    for (i, ch) in name.chars().enumerate() {
+        let ok = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_';
+        if !ok {
+            anyhow::bail!(
+                "profile name '{}' contains invalid character '{}' at position {}; \
+                 allowed: ASCII letters, digits, '-', '_'",
+                name,
+                ch,
+                i
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn validates_simple_name() {
+        assert!(validate_profile_name("work").is_ok());
+        assert!(validate_profile_name("personal").is_ok());
+        assert!(validate_profile_name("test-1").is_ok());
+        assert!(validate_profile_name("user_2").is_ok());
+        assert!(validate_profile_name("a").is_ok());
+        assert!(validate_profile_name("ABC123").is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        let err = validate_profile_name("").unwrap_err().to_string();
+        assert!(err.contains("empty"), "expected 'empty' in: {}", err);
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        // Both `..` and slash-bearing names must be rejected — these are
+        // the realistic attack shapes against an unvalidated profile name.
+        assert!(validate_profile_name("..").is_err());
+        assert!(validate_profile_name("../../etc").is_err());
+        assert!(validate_profile_name("foo/bar").is_err());
+        assert!(validate_profile_name("/absolute").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace_and_quotes() {
+        assert!(validate_profile_name("with space").is_err());
+        assert!(validate_profile_name("with\ttab").is_err());
+        assert!(validate_profile_name("with'quote").is_err());
+        assert!(validate_profile_name("with\"dquote").is_err());
+    }
+
+    #[test]
+    fn rejects_overlong_name() {
+        let long = "a".repeat(65);
+        let err = validate_profile_name(&long).unwrap_err().to_string();
+        assert!(err.contains("too long"), "expected 'too long' in: {}", err);
+        // Boundary: exactly 64 chars is fine.
+        let limit = "a".repeat(64);
+        assert!(validate_profile_name(&limit).is_ok());
+    }
+
+    #[test]
+    fn rejects_dotfiles() {
+        // A leading dot would create a hidden profile dir which conflicts
+        // with the convention that everything visible under
+        // `profiles/` is a real profile. Rejected by the alphanumeric
+        // rule (`.` isn't alphanumeric or `-`/`_`).
+        assert!(validate_profile_name(".hidden").is_err());
+    }
+
+    #[test]
+    fn resolve_profile_home_appends_under_profiles() {
+        // We don't assert the absolute base here because it depends on
+        // $HOME / $FENNEC_HOME at test time; we just check the relative
+        // shape: <base>/profiles/<name>.
+        let resolved = FennecConfig::resolve_profile_home("work").unwrap();
+        let s = resolved.to_string_lossy();
+        assert!(
+            s.ends_with("/profiles/work"),
+            "expected path to end with /profiles/work, got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn resolve_profile_home_rejects_invalid_name() {
+        assert!(FennecConfig::resolve_profile_home("..").is_err());
+        assert!(FennecConfig::resolve_profile_home("with/slash").is_err());
+        assert!(FennecConfig::resolve_profile_home("").is_err());
     }
 }
 

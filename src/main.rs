@@ -59,8 +59,21 @@ use fennec::tools::traits::Tool;
 #[derive(Parser, Debug)]
 #[command(name = "fennec", version, about = "The fastest personal AI agent with collective intelligence")]
 struct Cli {
+    /// Override the Fennec home directory directly. Use this when you
+    /// want full control over the path; otherwise prefer `--profile`.
+    /// Mutually exclusive with `--profile`.
     #[arg(long, global = true)]
     config_dir: Option<String>,
+
+    /// Run against a named profile under `~/.fennec/profiles/<name>/`.
+    /// Each profile gets its own config, memory, secrets key, cron
+    /// jobs, and OAuth tokens — fully isolated from every other
+    /// profile and from the default `~/.fennec/` install.
+    ///
+    /// Names are restricted to `[A-Za-z0-9_-]` (1-64 chars).
+    /// Mutually exclusive with `--config-dir`.
+    #[arg(long, global = true)]
+    profile: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -1088,8 +1101,26 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Load config: try from config dir, fall back to defaults.
-    let home_dir = FennecConfig::resolve_home(cli.config_dir.as_deref());
+    // Resolve the Fennec home directory from the flags.
+    //
+    // `--config-dir` and `--profile` are mutually exclusive: each is a
+    // way of choosing the same thing (where state lives), and accepting
+    // both at once would force an arbitrary precedence rule that's
+    // easy to misremember. Reject the combination with a clear error
+    // rather than silently picking one. When neither is set we fall
+    // back to the historical default (`$FENNEC_HOME` or `~/.fennec/`),
+    // so existing installs are byte-identical.
+    let home_dir = match (cli.config_dir.as_deref(), cli.profile.as_deref()) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!(
+                "--config-dir and --profile are mutually exclusive; use one or the other"
+            );
+        }
+        (Some(path), None) => FennecConfig::resolve_home(Some(path)),
+        (None, Some(name)) => FennecConfig::resolve_profile_home(name)
+            .with_context(|| format!("resolving profile '{}'", name))?,
+        (None, None) => FennecConfig::resolve_home(None),
+    };
     let config_path = home_dir.join("config.toml");
     let config = if config_path.exists() {
         FennecConfig::load(&config_path)
