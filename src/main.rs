@@ -648,6 +648,26 @@ async fn build_agent(
         delegate_subagent_tools,
     )));
 
+    // Plugin system. Bundled plugins (compiled into the binary via
+    // the `inventory` crate) are scanned here and any whose name
+    // appears in `[plugins].enabled` is activated. The default
+    // `enabled = []` skips the activation path entirely so installs
+    // that never opt in have zero behavioural change. WASM-loaded
+    // user plugins (`~/.fennec/plugins/<name>/<name>.wasm`) will
+    // arrive in a later phase using the same registry.
+    let mut plugin_registry = fennec::plugins::PluginRegistry::new();
+    if let Err(e) = plugin_registry.load_bundled(&config.plugins.enabled) {
+        // load_bundled() is "ok-even-if-some-fail" by design — this
+        // arm only fires on a structural failure. Don't abort agent
+        // startup; log and continue with no plugins.
+        tracing::error!(
+            "Plugin registry failed to load: {e}; continuing without plugins"
+        );
+    }
+    for plugin_tool in plugin_registry.into_tools() {
+        builder = builder.tool(plugin_tool);
+    }
+
     let agent = builder
         .identity_name(&config.identity.name)
         .identity_persona(&config.identity.persona)

@@ -53,6 +53,11 @@ url = "2.5"
 # Maintained fork of the (now unmaintained) serde_yaml crate. Used for
 # parsing YAML frontmatter in skill files.
 serde_yaml_ng = "0.10"
+# Compile-time plugin registration. Bundled plugins (in src/plugins/)
+# call `inventory::submit!` at module scope to register themselves; the
+# loader iterates `inventory::iter::<PluginEntry>()` at startup. This is
+# the same mechanism `clap`, `rkyv`, and many other crates use.
+inventory = "0.3"
 
 [dev-dependencies]
 tempfile = "3.15"
