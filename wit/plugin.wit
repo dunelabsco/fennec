@@ -1,0 +1,300 @@
+// Fennec plugin interface (WIT — WebAssembly Interface Types).
+//
+// This file is the contract between the Fennec runtime and any
+// `.wasm` plugin dropped into `~/.fennec/plugins/<name>/`. Plugin
+// authors implement the `fennec-plugin` world below; the Fennec
+// host implements the `host` interface that plugins import.
+//
+// To author a plugin in Rust:
+//   1. Add `wit-bindgen = "0.x"` to your plugin's Cargo.toml
+//   2. Place a copy of this file at `wit/plugin.wit` in your project
+//   3. Use `wit_bindgen::generate!` to produce typed bindings
+//   4. Implement the `Guest` trait on your plugin type
+//   5. Build with `cargo build --target wasm32-wasip2 --release`
+//   6. Drop the resulting `.wasm` and a `plugin.toml` into
+//      `~/.fennec/plugins/<your-plugin-name>/`
+//
+// The host import surface starts deliberately small (C2a). Future
+// PRs add channel send, sub-tool invocation, more memory ops, and
+// config read.
+
+package fennec:plugin@0.1.0;
+
+// What the host (Fennec) provides to plugins.
+interface host {
+    // Log levels matching `tracing` macros.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    // Emit a log message via the host's `tracing` subscriber.
+    // Logged under the target `fennec::plugin::<plugin-name>`.
+    log: func(level: log-level, message: string);
+
+    // Current Unix time in milliseconds since the epoch.
+    // Provided so plugins don't need a wasi-clocks dependency for
+    // simple timestamp use.
+    now-millis: func() -> u64;
+
+    // Errors from any host function are returned as a single string;
+    // plugins can match on substrings to distinguish kinds, but the
+    // canonical interface is opaque.
+    record host-error {
+        message: string,
+    }
+
+    // ---- HTTP -------------------------------------------------------
+    //
+    // Goes through the host's URL guard. Calls to private IPs
+    // (RFC 1918, link-local, loopback) and non-http(s) schemes are
+    // rejected with an error. Body size capped at 10 MiB.
+
+    record http-header {
+        name: string,
+        value: string,
+    }
+
+    record http-req {
+        method: string,            // "GET" / "POST" / "PUT" / "PATCH" / "DELETE" / "HEAD"
+        url: string,
+        headers: list<http-header>,
+        body: option<list<u8>>,    // raw bytes; UTF-8 if you want a string
+    }
+
+    record http-resp {
+        status: u16,
+        headers: list<http-header>,
+        body: list<u8>,
+    }
+
+    http-request: func(req: http-req) -> result<http-resp, host-error>;
+
+    // ---- Filesystem -------------------------------------------------
+    //
+    // All paths are evaluated against the host's PathSandbox. Reads
+    // and writes outside the configured whitelist return an error.
+    // The plugin sees what the agent itself sees; plugins are not a
+    // privilege escalation.
+
+    read-file: func(path: string) -> result<list<u8>, host-error>;
+    write-file: func(path: string, contents: list<u8>) -> result<_, host-error>;
+
+    // ---- Memory -----------------------------------------------------
+    //
+    // Light wrapper around the host's Memory trait. Plugins can
+    // recall and store entries in the same SQLite store the agent
+    // uses. Entries land in a category derived from the plugin name
+    // by default, so plugins can't pollute Core/Daily/Conversation
+    // categories without explicit category override (which the host
+    // gates).
+
+    record memory-entry {
+        key: string,
+        content: string,
+        category: string,
+        created-at: string,        // RFC3339
+    }
+
+    memory-recall: func(query: string, limit: u32) -> result<list<memory-entry>, host-error>;
+    memory-store: func(key: string, content: string) -> result<_, host-error>;
+
+    // Direct lookup of a single entry by key. Returns `none` if no
+    // entry exists. Reads are unrestricted — plugins can see any
+    // memory entry, same as the agent's memory_recall tool.
+    memory-get: func(key: string) -> result<option<memory-entry>, host-error>;
+
+    // Delete a memory entry. Only entries written by this plugin can
+    // be deleted (entries whose category is `plugin:<this-plugin>`).
+    // Attempting to delete an entry from another category is a no-op
+    // — the host returns Ok(false) without raising an error so
+    // plugins can call this idempotently. Returns true if a deletion
+    // actually happened.
+    memory-forget: func(key: string) -> result<bool, host-error>;
+
+    // ---- Config -----------------------------------------------------
+    //
+    // Plugins can declare their own config under
+    // `[plugins.settings.<name>]` in `~/.fennec/config.toml` and read
+    // those values at runtime. The host scopes lookups to the
+    // current plugin — plugins cannot read each other's settings or
+    // any other Fennec config sections.
+
+    config-get-string: func(key: string) -> option<string>;
+
+    // ---- Channels ---------------------------------------------------
+    //
+    // Send a message to a configured channel. Only available when
+    // Fennec is running in gateway mode (channels are wired up); in
+    // CLI mode this returns an error.
+
+    channel-send: func(channel: string, chat-id: string, content: string)
+        -> result<_, host-error>;
+}
+
+// What plugins implement.
+interface plugin {
+    // A tool the plugin contributes to the agent. The host wraps
+    // each spec in a `Tool` that calls back into the plugin's
+    // `invoke` when the agent fires the tool.
+    record tool-spec {
+        // Tool name as the LLM sees it. Must be unique across the
+        // agent's tool list; the host rejects duplicates at load.
+        name: string,
+        // One-line description shown to the LLM in the tool list.
+        description: string,
+        // JSON Schema (as a JSON-encoded string) describing the
+        // tool's parameter shape.
+        parameters-schema-json: string,
+    }
+
+    // Called once at plugin load. Returns the list of tools this
+    // plugin contributes. An empty list is valid (a plugin that only
+    // observes lifecycle hooks — a future extension).
+    register: func() -> list<tool-spec>;
+
+    // Called by the host whenever the agent invokes one of this
+    // plugin's tools. `args-json` is the JSON-encoded argument
+    // object; the plugin returns either a JSON-encoded result string
+    // (success) or an error message.
+    invoke: func(tool-name: string, args-json: string) -> result<string, string>;
+
+    // ---- Lifecycle hooks --------------------------------------------
+    //
+    // The host calls each of these hooks at the matching agent
+    // lifecycle point. Plugins can implement zero or more of them;
+    // the host catches any trap or panic, logs it, and continues
+    // with the remaining hooks (one bad hook does not abort the
+    // agent turn).
+    //
+    // Tool hooks return an action so plugins can influence flow:
+    //
+    // - `pre-tool-call-action::%continue` — proceed normally
+    // - `pre-tool-call-action::skip(reason)` — abort the call. The
+    //   tool result becomes "[skipped by plugin: <reason>]" so the
+    //   LLM sees something coherent.
+    // - `pre-tool-call-action::rewrite(args-json)` — replace the
+    //   tool's arguments. Subsequent hooks see the rewritten args.
+    //
+    // Multi-plugin ordering: hooks fire in plugin registration
+    // order. The first `skip` wins (subsequent hooks not fired).
+    // `rewrite` actions chain — each plugin sees the previous one's
+    // modifications.
+    //
+    // LLM and session hooks are observer-only. "Skip the LLM call"
+    // or "skip session start" don't have coherent semantics, so
+    // those hooks have no return value.
+
+    variant pre-tool-call-action {
+        %continue,
+        skip(string),
+        rewrite(string),
+    }
+
+    record post-rewrite {
+        output: string,
+        success: bool,
+    }
+
+    variant post-tool-call-action {
+        %continue,
+        rewrite(post-rewrite),
+    }
+
+    on-pre-tool-call: func(tool-name: string, args-json: string) -> pre-tool-call-action;
+    on-post-tool-call: func(tool-name: string, args-json: string, output: string, success: bool) -> post-tool-call-action;
+
+    // Observer hooks. JSON payloads are stable across versions: the
+    // host serialises a small fixed shape so plugins built against
+    // an older WIT keep parsing what they care about.
+    on-pre-llm-call: func(messages-json: string);
+    on-post-llm-call: func(response-json: string);
+
+    on-session-start: func(session-id: string);
+    on-session-end: func(session-id: string);
+
+    // ---- Memory provider exports ------------------------------------
+    //
+    // Plugins that want to act as the agent's external memory
+    // provider implement these. The host-side
+    // `WasmMemoryProvider` wraps the wasm exports as a Rust
+    // `MemoryProvider` trait impl.
+    //
+    // Plugins that do NOT want to be memory providers should
+    // simply return `false` from `memory-is-available()`. The
+    // remaining memory-* exports must still exist (WIT requires
+    // every interface function be exported), but they will never
+    // be called when the plugin is unavailable. Stub them with
+    // trivial bodies (`memory-prefetch` returning "", etc.).
+
+    record memory-tool-schema {
+        name: string,
+        description: string,
+        parameters-schema-json: string,
+    }
+
+    record memory-tool-result {
+        success: bool,
+        output: string,
+        error: option<string>,
+    }
+
+    record memory-init-context {
+        session-id: string,
+        fennec-home: string,    // absolute path to active home / profile dir
+        platform: string,       // "cli", "telegram", "discord", "gateway", ...
+    }
+
+    enum memory-write-action {
+        store,
+        forget,
+    }
+
+    memory-is-available: func() -> bool;
+    memory-initialize: func(ctx: memory-init-context) -> result<_, string>;
+    memory-system-prompt-block: func() -> string;
+    memory-prefetch: func(query: string) -> result<string, string>;
+    memory-sync-turn: func(user-message: string, assistant-message: string) -> result<_, string>;
+    memory-tool-schemas: func() -> list<memory-tool-schema>;
+    memory-handle-tool-call: func(name: string, args-json: string) -> result<memory-tool-result, string>;
+    memory-shutdown: func() -> result<_, string>;
+    memory-on-turn-start: func(user-message: string) -> result<_, string>;
+    memory-on-pre-compress: func(messages-json: string) -> result<string, string>;
+    memory-on-memory-write: func(action: memory-write-action, key: string, content: string) -> result<_, string>;
+
+    // ---- CLI subcommands --------------------------------------------
+    //
+    // Plugins can contribute top-level subcommands to the `fennec`
+    // binary. Discovery is metadata-driven: the `cli_commands`
+    // field of `plugin.toml` declares names + descriptions, the
+    // host wires those into clap at startup, and dispatch routes
+    // matched commands to `cli-execute` below.
+    //
+    // The `cli-execute` export receives:
+    //
+    //   - `name`: the matched command name (in case the plugin
+    //     declared multiple commands and shares one handler).
+    //   - `args`: the args following `fennec <name>`, NOT including
+    //     `name` itself. So `fennec spotify play "Bohemian Rhapsody"`
+    //     gives the plugin `args = ["play", "Bohemian Rhapsody"]`.
+    //
+    // The return value is a Unix-style exit code.
+    //
+    // Plugins that don't contribute CLI commands should still
+    // export this function (WIT requires every interface function
+    // be exported). A trivial body returning 0 is fine — the
+    // export is only called for commands the plugin's
+    // `plugin.toml` actually declares.
+
+    cli-execute: func(name: string, args: list<string>) -> s32;
+}
+
+// The plugin world wires the two interfaces together: plugins
+// implement `plugin` and may import functions from `host`.
+world fennec-plugin {
+    import host;
+    export plugin;
+}

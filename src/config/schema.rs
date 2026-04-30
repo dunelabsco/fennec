@@ -15,6 +15,7 @@ pub struct FennecConfig {
     pub gateway: GatewayConfig,
     pub cron: CronConfig,
     pub collective: CollectiveConfig,
+    pub plugins: PluginsConfig,
 }
 
 impl Default for FennecConfig {
@@ -29,6 +30,54 @@ impl Default for FennecConfig {
             gateway: GatewayConfig::default(),
             cron: CronConfig::default(),
             collective: CollectiveConfig::default(),
+            plugins: PluginsConfig::default(),
+        }
+    }
+}
+
+/// Plugin-system configuration.
+///
+/// Bundled plugins ship in the binary but stay dormant until they
+/// appear in `enabled`. The default empty list preserves the
+/// pre-plugin behaviour byte-for-byte: no plugins activate, no tool
+/// list changes, no startup overhead beyond a single
+/// `inventory::iter` walk that finds nothing to do.
+///
+/// Names in `enabled` are matched against the `name` field returned
+/// by each plugin's `Plugin::manifest()`. A name in this list that
+/// doesn't correspond to any installed plugin produces a startup
+/// warning (likely a typo) but does not abort startup.
+///
+/// In a future phase this struct will gain a `disabled` deny-list
+/// (currently `enabled` is the single allowlist axis).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginsConfig {
+    /// Names of plugins that should be activated at startup.
+    /// Default: empty (no plugins active).
+    pub enabled: Vec<String>,
+    /// Per-plugin string settings. Top-level key is plugin name;
+    /// inner map is the plugin's own key/value space. A plugin
+    /// reads its own settings via the `config-get-string` host
+    /// import, which scopes reads to the current plugin — plugins
+    /// cannot read each other's settings.
+    ///
+    /// Example `config.toml` shape:
+    /// ```toml
+    /// [plugins.settings.spotify]
+    /// market = "US"
+    /// default_device = "kitchen"
+    /// ```
+    /// Inside the spotify plugin, `config-get-string("market")`
+    /// returns `Some("US")`.
+    pub settings: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Vec::new(),
+            settings: std::collections::HashMap::new(),
         }
     }
 }
@@ -113,6 +162,20 @@ pub struct MemoryConfig {
     pub embedding_provider: String,
     pub embedding_api_key: String,
     pub consolidation_enabled: bool,
+    /// Optional external memory provider plugin to run alongside
+    /// the always-on built-in SQLite store. Default `"builtin"` (or
+    /// empty) means built-in memory is the only memory layer
+    /// active — current behavior of pre-C3 Fennec.
+    ///
+    /// Set this to a registered plugin's name (e.g.
+    /// `provider = "honcho"`) to run that plugin's
+    /// [`MemoryProvider`](crate::plugins::MemoryProvider)
+    /// alongside the built-in store. The provider augments — it
+    /// does NOT replace local SQLite. Your data stays local.
+    ///
+    /// Names that don't resolve to a registered provider produce
+    /// a startup warning and fall back to builtin-only.
+    pub provider: String,
 }
 
 impl Default for MemoryConfig {
@@ -127,6 +190,7 @@ impl Default for MemoryConfig {
             embedding_provider: "noop".to_string(),
             embedding_api_key: String::new(),
             consolidation_enabled: true,
+            provider: "builtin".to_string(),
         }
     }
 }
