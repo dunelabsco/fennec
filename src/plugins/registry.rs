@@ -55,6 +55,12 @@ pub struct PluginRegistry {
     loaded: Vec<LoadedPlugin>,
     tools: Vec<Box<dyn Tool>>,
     hooks: HookRegistry,
+    /// Memory providers contributed by plugins, keyed by their
+    /// `name()`. The agent picks at most one based on
+    /// `[memory] provider = "<name>"`. The registry stores all of
+    /// them so a future PR (or a `fennec memory list` command) can
+    /// enumerate available choices.
+    memory_providers: std::collections::HashMap<String, Arc<dyn super::memory_provider::MemoryProvider>>,
 }
 
 impl PluginRegistry {
@@ -63,6 +69,7 @@ impl PluginRegistry {
             loaded: Vec::new(),
             tools: Vec::new(),
             hooks: HookRegistry::new(),
+            memory_providers: std::collections::HashMap::new(),
         }
     }
 
@@ -153,6 +160,21 @@ impl PluginRegistry {
                     }
                     for h in parts.on_session_end_hooks {
                         self.hooks.register_on_session_end(h);
+                    }
+                    for provider in parts.memory_providers {
+                        let pname = provider.name().to_string();
+                        if let Some(existing) =
+                            self.memory_providers.insert(pname.clone(), provider)
+                        {
+                            tracing::warn!(
+                                duplicate = %pname,
+                                "Memory provider name collision: '{}' from plugin '{}' \
+                                 overwrites a previously-registered provider with the \
+                                 same name. The last registration wins.",
+                                existing.name(),
+                                manifest.name
+                            );
+                        }
                     }
                     self.loaded.push(LoadedPlugin {
                         manifest,
@@ -324,6 +346,30 @@ impl PluginRegistry {
             // no-op for observer hooks).
             register_wasm_hooks(&mut self.hooks, Arc::clone(&instance), &resources.rt_handle);
 
+            // Register the plugin as a memory-provider candidate.
+            // Whether it ACTUALLY activates depends on
+            // `[memory] provider = "<this-name>"` in config AND the
+            // plugin's `memory_is_available()` returning true. So
+            // installing the plugin doesn't automatically replace
+            // the user's memory layer.
+            let wasm_provider: Arc<dyn super::memory_provider::MemoryProvider> =
+                Arc::new(super::wasm::memory_provider::WasmMemoryProvider::new(
+                    name.clone(),
+                    Arc::clone(&instance),
+                    resources.rt_handle.clone(),
+                ));
+            if let Some(existing) =
+                self.memory_providers.insert(name.clone(), wasm_provider)
+            {
+                tracing::warn!(
+                    duplicate = %name,
+                    "Memory provider name collision: WASM provider '{}' overwrote \
+                     a previously-registered provider with the same name. Last \
+                     registration wins.",
+                    existing.name(),
+                );
+            }
+
             tracing::info!(
                 plugin = %name,
                 version = %d.manifest.version,
@@ -371,6 +417,100 @@ impl PluginRegistry {
     pub fn into_tools_and_hooks(self) -> (Vec<Box<dyn Tool>>, HookRegistry) {
         (self.tools, self.hooks)
     }
+
+    /// Drain the registry into all four things the agent builder
+    /// can consume: tools, hooks, the resolved memory manager, and
+    /// the names of every loaded plugin (for diagnostics). The
+    /// memory manager is built from `memory_provider_name`:
+    ///
+    /// - `"builtin"` (or empty) → no external; built-in memory only.
+    /// - any other name → look it up in registered providers; if
+    ///   found, run [`MemoryProvider::is_available`] gate; if it
+    ///   passes, activate.
+    /// - missing or unavailable → warn log; fall back to built-in.
+    ///
+    /// This is the canonical "drain and configure" call. Existing
+    /// callers using `into_tools_and_hooks` keep working — the new
+    /// method is the recommended path.
+    pub fn into_runtime(
+        self,
+        memory_provider_name: &str,
+    ) -> RegistryRuntime {
+        let manager = resolve_memory_manager(
+            memory_provider_name,
+            &self.memory_providers,
+        );
+        RegistryRuntime {
+            tools: self.tools,
+            hooks: self.hooks,
+            memory_manager: manager,
+            loaded_plugin_names: self
+                .loaded
+                .iter()
+                .map(|p| p.manifest.name.clone())
+                .collect(),
+        }
+    }
+
+    /// Names of memory providers that registered. Useful for
+    /// `fennec doctor` and for surfacing typos in
+    /// `[memory].provider`.
+    pub fn memory_provider_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.memory_providers.keys().cloned().collect();
+        names.sort();
+        names
+    }
+}
+
+/// Bundle the agent builder consumes from `PluginRegistry::into_runtime`.
+pub struct RegistryRuntime {
+    pub tools: Vec<Box<dyn Tool>>,
+    pub hooks: HookRegistry,
+    pub memory_manager: super::memory_manager::MemoryManager,
+    pub loaded_plugin_names: Vec<String>,
+}
+
+/// Resolve the configured memory provider name to a
+/// [`MemoryManager`]. `"builtin"` and the empty string both yield
+/// `MemoryManager::empty()` — built-in memory is always running, the
+/// manager is just the *augmentation* slot.
+fn resolve_memory_manager(
+    name: &str,
+    registered: &std::collections::HashMap<String, Arc<dyn super::memory_provider::MemoryProvider>>,
+) -> super::memory_manager::MemoryManager {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == "builtin" {
+        tracing::debug!(
+            "Memory provider: builtin only (no external configured)"
+        );
+        return super::memory_manager::MemoryManager::empty();
+    }
+
+    let Some(provider) = registered.get(trimmed) else {
+        tracing::warn!(
+            requested = %trimmed,
+            available = ?registered.keys().collect::<Vec<_>>(),
+            "Configured memory.provider not found among registered providers; \
+             falling back to builtin only"
+        );
+        return super::memory_manager::MemoryManager::empty();
+    };
+
+    if !provider.is_available() {
+        tracing::warn!(
+            provider = %trimmed,
+            "Memory provider '{}' is not available (missing config or deps); \
+             falling back to builtin only",
+            trimmed
+        );
+        return super::memory_manager::MemoryManager::empty();
+    }
+
+    tracing::info!(
+        provider = %trimmed,
+        "Memory provider activated alongside built-in"
+    );
+    super::memory_manager::MemoryManager::with_provider(Arc::clone(provider))
 }
 
 /// Register lifecycle hooks that route into a single WASM plugin
@@ -587,5 +727,38 @@ mod tests {
         let tools = reg.into_tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "echo");
+    }
+
+    /// `into_runtime("builtin")` (the default) yields an empty
+    /// `MemoryManager` — no external provider, builtin-only memory.
+    /// This is the path 100% of installs hit by default; verify it
+    /// is in fact a no-op.
+    #[test]
+    fn into_runtime_builtin_yields_empty_manager() {
+        let reg = PluginRegistry::new();
+        let runtime = reg.into_runtime("builtin");
+        assert!(!runtime.memory_manager.has_external());
+        assert_eq!(runtime.memory_manager.active_name(), "builtin");
+    }
+
+    /// `into_runtime("")` (also the default for an unset config
+    /// field) is treated identically to `"builtin"`.
+    #[test]
+    fn into_runtime_empty_string_yields_empty_manager() {
+        let reg = PluginRegistry::new();
+        let runtime = reg.into_runtime("");
+        assert!(!runtime.memory_manager.has_external());
+    }
+
+    /// `into_runtime("unknown-plugin")` falls back to builtin with
+    /// a warn log (verified manually) when the requested provider
+    /// isn't registered. The agent should not abort — typos in
+    /// `[memory] provider` shouldn't break startup.
+    #[test]
+    fn into_runtime_unknown_provider_falls_back() {
+        let reg = PluginRegistry::new();
+        let runtime = reg.into_runtime("definitely-not-real");
+        assert!(!runtime.memory_manager.has_external());
+        assert_eq!(runtime.memory_manager.active_name(), "builtin");
     }
 }

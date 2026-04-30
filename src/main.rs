@@ -691,11 +691,17 @@ async fn build_agent(
         );
     }
 
-    let (plugin_tools, plugin_hooks) = plugin_registry.into_tools_and_hooks();
-    for plugin_tool in plugin_tools {
+    // Resolve plugin runtime: tools, hooks, and the memory manager
+    // (built from `[memory] provider = "<name>"`). Default
+    // `provider = "builtin"` yields an empty manager — built-in
+    // SQLite memory remains the only memory layer, behavior
+    // unchanged.
+    let runtime = plugin_registry.into_runtime(&config.memory.provider);
+    for plugin_tool in runtime.tools {
         builder = builder.tool(plugin_tool);
     }
-    builder = builder.hooks(Arc::new(plugin_hooks));
+    builder = builder.hooks(Arc::new(runtime.hooks));
+    builder = builder.memory_manager(Arc::new(runtime.memory_manager));
 
     let agent = builder
         .identity_name(&config.identity.name)

@@ -61,6 +61,8 @@ mod context;
 mod demo;
 mod hooks;
 mod manifest;
+mod memory_manager;
+mod memory_provider;
 mod registry;
 mod traits;
 pub mod wasm;
@@ -73,7 +75,11 @@ pub use hooks::{
     PreToolCallEvent, PreToolCallHook, PreToolResolution, SessionEvent,
 };
 pub use manifest::{PluginKind, PluginManifest};
-pub use registry::{LoadedPlugin, PluginRegistry, WasmHostResources};
+pub use memory_manager::MemoryManager;
+pub use memory_provider::{
+    MemoryProvider, MemoryProviderContext, MemoryToolResult, MemoryWriteAction,
+};
+pub use registry::{LoadedPlugin, PluginRegistry, RegistryRuntime, WasmHostResources};
 pub use traits::{Plugin, PluginEntry};
 
 /// Re-export the inventory crate so plugin authors don't have to add it

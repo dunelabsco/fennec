@@ -162,6 +162,20 @@ pub struct MemoryConfig {
     pub embedding_provider: String,
     pub embedding_api_key: String,
     pub consolidation_enabled: bool,
+    /// Optional external memory provider plugin to run alongside
+    /// the always-on built-in SQLite store. Default `"builtin"` (or
+    /// empty) means built-in memory is the only memory layer
+    /// active — current behavior of pre-C3 Fennec.
+    ///
+    /// Set this to a registered plugin's name (e.g.
+    /// `provider = "honcho"`) to run that plugin's
+    /// [`MemoryProvider`](crate::plugins::MemoryProvider)
+    /// alongside the built-in store. The provider augments — it
+    /// does NOT replace local SQLite. Your data stays local.
+    ///
+    /// Names that don't resolve to a registered provider produce
+    /// a startup warning and fall back to builtin-only.
+    pub provider: String,
 }
 
 impl Default for MemoryConfig {
@@ -176,6 +190,7 @@ impl Default for MemoryConfig {
             embedding_provider: "noop".to_string(),
             embedding_api_key: String::new(),
             consolidation_enabled: true,
+            provider: "builtin".to_string(),
         }
     }
 }
