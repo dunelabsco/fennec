@@ -222,11 +222,15 @@ fn parse_guard_action(action: &str) -> GuardAction {
 ///     an explicit chat_id. The gateway's main loop must call
 ///     `record(channel, chat_id)` on every inbound (including those
 ///     consumed by pending replies, so the directory stays up to date).
+// `plugin_bus` is the bus handle plumbed into WASM plugin host
+// imports. `None` in CLI mode (no channels); `Some(bus.clone())` in
+// gateway mode so plugins can use `channel-send`.
 async fn build_agent(
     config: &FennecConfig,
     home_dir: &std::path::Path,
     model_override: Option<String>,
     channel_map: Option<ChannelMapHandle>,
+    plugin_bus: Option<MessageBus>,
 ) -> Result<(
     fennec::agent::Agent,
     Arc<dyn Memory>,
@@ -648,6 +652,51 @@ async fn build_agent(
         delegate_subagent_tools,
     )));
 
+    // Plugin system. Bundled plugins (compiled into the binary via
+    // the `inventory` crate) are scanned here and any whose name
+    // appears in `[plugins].enabled` is activated. The default
+    // `enabled = []` skips the activation path entirely so installs
+    // that never opt in have zero behavioural change.
+    let mut plugin_registry = fennec::plugins::PluginRegistry::new();
+    if let Err(e) = plugin_registry.load_bundled(&config.plugins.enabled) {
+        // load_bundled() is "ok-even-if-some-fail" by design — this
+        // arm only fires on a structural failure. Don't abort agent
+        // startup; log and continue with no plugins.
+        tracing::error!(
+            "Plugin registry failed to load bundled: {e}; continuing without bundled plugins"
+        );
+    }
+
+    // WASM-loaded user plugins discovered under `<home>/plugins/`.
+    // Each plugin gets a clone of the host capability handles
+    // (path sandbox, memory, http client, runtime handle). Discovery
+    // and instantiation failures are non-fatal — one bad plugin
+    // never blocks startup.
+    let wasm_resources = fennec::plugins::WasmHostResources {
+        path_sandbox: Arc::clone(&path_sandbox),
+        memory: memory.clone(),
+        http_client: fennec::tools::http::shared_client(),
+        rt_handle: tokio::runtime::Handle::current(),
+        settings: config.plugins.settings.clone(),
+        bus: plugin_bus,
+    };
+    let plugins_root = home_dir.join("plugins");
+    if let Err(e) = plugin_registry.load_wasm(
+        &plugins_root,
+        &config.plugins.enabled,
+        wasm_resources,
+    ) {
+        tracing::error!(
+            "Plugin registry failed to load WASM plugins: {e}; continuing without WASM plugins"
+        );
+    }
+
+    let (plugin_tools, plugin_hooks) = plugin_registry.into_tools_and_hooks();
+    for plugin_tool in plugin_tools {
+        builder = builder.tool(plugin_tool);
+    }
+    builder = builder.hooks(Arc::new(plugin_hooks));
+
     let agent = builder
         .identity_name(&config.identity.name)
         .identity_persona(&config.identity.persona)
@@ -673,7 +722,7 @@ async fn run_agent(
     // unused here. We still need to bind them to suppress unused-let
     // warnings without losing the build_agent return-shape.
     let (mut agent, memory, _cron_origin, _pending_replies, _chat_directory) =
-        build_agent(&config, &home_dir, model, None).await?;
+        build_agent(&config, &home_dir, model, None, None).await?;
 
     if let Some(msg) = message {
         // Single-shot mode.
@@ -754,7 +803,17 @@ async fn run_gateway(
 
     // 2. Build Agent (pass channel map so ask_user tool can reach channels).
     let (agent, _memory, cron_origin, pending_replies, chat_directory) =
-        build_agent(&config, &home_dir, None, Some(channel_map.clone())).await?;
+        build_agent(
+            &config,
+            &home_dir,
+            None,
+            Some(channel_map.clone()),
+            // Plugins running under the gateway get the bus so
+            // their `channel-send` host import works. The CLI
+            // path passes None above.
+            Some(bus.clone()),
+        )
+        .await?;
     let agent = Arc::new(tokio::sync::Mutex::new(agent));
 
     // 3. Build channel list from config.
