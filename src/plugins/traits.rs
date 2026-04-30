@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 
+use super::cli::CliCommandSpec;
 use super::context::PluginContext;
 use super::manifest::PluginManifest;
 
@@ -30,9 +31,30 @@ pub trait Plugin: Send + Sync + 'static {
     /// Called exactly once per session, before the agent starts. Any
     /// error returned here aborts plugin activation but does NOT abort
     /// agent startup — the registry logs the error and proceeds with
-    /// the rest of the plugins. This matches the Hermes policy of
-    /// "one broken plugin should not bring down the agent."
+    /// the rest of the plugins. One broken plugin should not bring
+    /// down the agent.
     fn register(&self, ctx: &mut PluginContext) -> Result<()>;
+
+    /// Static list of CLI subcommands this plugin contributes to
+    /// the `fennec` binary. Default empty.
+    ///
+    /// Called at startup, BEFORE clap parses argv, so that plugin
+    /// commands appear in `fennec --help` and parse correctly. The
+    /// trait method runs against a static `&self` reference — no
+    /// plugin instantiation, no agent build. Plugins that want to
+    /// add CLI subcommands must:
+    ///
+    /// 1. Return one or more [`CliCommandSpec`]s here.
+    /// 2. Register a handler closure for each name via
+    ///    [`PluginContext::register_cli_command`] inside the regular
+    ///    [`Self::register`] call. The two are correlated by name.
+    ///
+    /// Names returned here that don't have a matching handler at
+    /// dispatch time produce a runtime error pointing at the
+    /// missing closure — this catches typos.
+    fn cli_commands(&self) -> Vec<CliCommandSpec> {
+        Vec::new()
+    }
 }
 
 /// The inventory entry that bundles a static plugin reference for

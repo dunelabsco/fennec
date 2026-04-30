@@ -1151,17 +1151,90 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let cli = Cli::parse();
+    // -- Two-phase argv handling ----------------------------------------
+    //
+    // Plugin-contributed subcommands (`fennec spotify play ...`) are
+    // discovered at runtime, so clap can't resolve them via derive
+    // alone. We do a cheap first pass to learn the plugin command
+    // names from manifests (no plugin instantiation), then build a
+    // dynamic clap Command that includes both the derive-defined
+    // built-ins AND the plugin subcommands.
+    //
+    // To learn `[plugins].enabled` and the home directory, we have
+    // to look at `--config-dir` and load config BEFORE the full
+    // parse. The first pass is allowed to be permissive — it just
+    // peeks for those two values.
 
-    // Load config: try from config dir, fall back to defaults.
-    let home_dir = FennecConfig::resolve_home(cli.config_dir.as_deref());
-    let config_path = home_dir.join("config.toml");
-    let config = if config_path.exists() {
-        FennecConfig::load(&config_path)
-            .with_context(|| format!("loading config from {}", config_path.display()))?
+    let raw_args: Vec<String> = std::env::args().collect();
+    let pre_config_dir = preparse_config_dir(&raw_args);
+    let pre_home = FennecConfig::resolve_home(pre_config_dir.as_deref());
+    let pre_config_path = pre_home.join("config.toml");
+    let pre_config = if pre_config_path.exists() {
+        FennecConfig::load(&pre_config_path).unwrap_or_default()
     } else {
         FennecConfig::default()
     };
+
+    // Lightweight CLI command discovery — no plugin instantiation.
+    // Returns the spec list the plugins want exposed as `fennec
+    // <name>` subcommands, validated and deduplicated against
+    // built-in command names and against each other.
+    let plugin_cli_specs = discover_plugin_cli_specs(&pre_home, &pre_config.plugins.enabled);
+
+    // Build the clap command tree: derive-defined built-ins plus
+    // dynamic plugin subcommands. Each plugin subcommand accepts
+    // `args = [...]` as positional, trailing-var-arg, so anything
+    // after `fennec spotify` lands intact in the plugin handler.
+    let mut clap_cmd = <Cli as clap::CommandFactory>::command();
+    for spec in &plugin_cli_specs {
+        // Leak the spec name into a 'static str so clap's
+        // string-pool is happy. Plugin command names are
+        // bounded (1-32 chars, validated above) and the leak is
+        // bounded to startup-time discovery — not a real memory
+        // concern.
+        let static_name: &'static str = Box::leak(spec.name.clone().into_boxed_str());
+        let static_about: &'static str = Box::leak(spec.description.clone().into_boxed_str());
+        clap_cmd = clap_cmd.subcommand(
+            clap::Command::new(static_name)
+                .about(static_about)
+                .arg(
+                    clap::Arg::new("args")
+                        .num_args(0..)
+                        .trailing_var_arg(true)
+                        .allow_hyphen_values(true)
+                        .help("Arguments forwarded to the plugin"),
+                ),
+        );
+    }
+    let matches = clap_cmd.get_matches_from(&raw_args);
+
+    // If a plugin subcommand matched, dispatch to the plugin
+    // BEFORE doing any agent / gateway work. Plugin commands run
+    // in the foreground and return an exit code.
+    if let Some((sub_name, sub_matches)) = matches.subcommand() {
+        if plugin_cli_specs.iter().any(|s| s.name == sub_name) {
+            // Now do the full plugin load to get the handler.
+            return dispatch_plugin_cli(
+                &pre_config,
+                &pre_home,
+                sub_name,
+                sub_matches,
+            )
+            .await;
+        }
+    }
+
+    // No plugin command matched — re-parse via the derive-typed
+    // path so we get the strongly-typed `Commands` enum for the
+    // built-in subcommands. This second parse is essentially free
+    // and gives us back the structured arguments without
+    // hand-rolling translation from `ArgMatches`.
+    let cli = Cli::parse_from(&raw_args);
+
+    // Load config: try from config dir, fall back to defaults.
+    // (Re-uses pre_home and pre_config so we don't re-read config.toml.)
+    let home_dir = pre_home;
+    let config = pre_config;
 
     match cli.command {
         Commands::Agent { message, model } => {
@@ -1194,6 +1267,194 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Pre-parse the `--config-dir` flag from raw argv. Used at startup
+/// before clap is fully configured (we need to know the home dir
+/// to read config + discover plugin CLI commands BEFORE clap can
+/// build a complete subcommand tree).
+///
+/// Permissive: ignores unknown flags, doesn't fail on malformed
+/// argv. Worst case we miss the override and fall back to the
+/// default home dir, which clap will catch on the real parse.
+fn preparse_config_dir(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        if a == "--config-dir" {
+            return iter.next().cloned();
+        }
+        if let Some(v) = a.strip_prefix("--config-dir=") {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Lightweight discovery of plugin-contributed CLI command specs.
+/// Iterates bundled plugin static refs (cheap — just trait method
+/// calls, no instantiation) and reads WASM `plugin.toml` manifests
+/// from `<home>/plugins/`. Used by `main` to extend clap before
+/// argv is parsed.
+///
+/// Validation, dedup, and reserved-name checks are applied here —
+/// the returned specs are safe to feed into clap as subcommands.
+fn discover_plugin_cli_specs(
+    home_dir: &std::path::Path,
+    enabled: &[String],
+) -> Vec<fennec::plugins::CliCommandSpec> {
+    use fennec::plugins::PluginEntry;
+    use std::collections::HashSet;
+
+    let want: HashSet<&str> = enabled.iter().map(String::as_str).collect();
+    if want.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<fennec::plugins::CliCommandSpec> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
+
+    // Bundled plugins — call cli_commands() on each enabled static
+    // reference. No `register()` invocation, no agent build.
+    for entry in fennec::plugins::inventory::iter::<PluginEntry> {
+        let manifest = entry.plugin.manifest();
+        if !want.contains(manifest.name.as_str()) {
+            continue;
+        }
+        for spec in entry.plugin.cli_commands() {
+            if let Err(e) = fennec::plugins::validate_command_name(&spec.name) {
+                tracing::warn!(
+                    plugin = %manifest.name,
+                    command = %spec.name,
+                    "Bundled plugin CLI command rejected at discovery: {e}"
+                );
+                continue;
+            }
+            if !seen_names.insert(spec.name.clone()) {
+                tracing::warn!(
+                    plugin = %manifest.name,
+                    command = %spec.name,
+                    "Plugin CLI command name '{}' already taken; dropping",
+                    spec.name
+                );
+                continue;
+            }
+            out.push(spec);
+        }
+    }
+
+    // WASM plugins — read manifests from disk. The `cli_commands`
+    // field of `plugin.toml` declares names + descriptions; we
+    // bind handlers later when a plugin command actually matches.
+    let plugins_root = home_dir.join("plugins");
+    if let Ok(discovered) =
+        fennec::plugins::wasm::discover_wasm_plugins(&plugins_root)
+    {
+        for d in discovered {
+            if !want.contains(d.manifest.name.as_str()) {
+                continue;
+            }
+            for spec in &d.manifest.cli_commands {
+                if let Err(e) = fennec::plugins::validate_command_name(&spec.name) {
+                    tracing::warn!(
+                        plugin = %d.manifest.name,
+                        command = %spec.name,
+                        "WASM plugin CLI command rejected at discovery: {e}"
+                    );
+                    continue;
+                }
+                if !seen_names.insert(spec.name.clone()) {
+                    tracing::warn!(
+                        plugin = %d.manifest.name,
+                        command = %spec.name,
+                        "Plugin CLI command name '{}' already taken; dropping",
+                        spec.name
+                    );
+                    continue;
+                }
+                out.push(spec.clone());
+            }
+        }
+    }
+
+    out
+}
+
+/// Dispatch a matched plugin CLI command. Does the full plugin
+/// load (bundled + WASM) so the matched command's handler is
+/// available, then runs it.
+///
+/// The agent is NOT built and NOT started — plugin CLI commands
+/// run as standalone tools. Returns `Ok(())` regardless of the
+/// plugin's exit code; the exit code is propagated via
+/// `std::process::exit` so shell pipelines see the right thing.
+async fn dispatch_plugin_cli(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+    sub_name: &str,
+    sub_matches: &clap::ArgMatches,
+) -> Result<()> {
+    // Pull args following `fennec <plugin-cmd>`. clap stores them
+    // under the "args" id we set on the dynamic subcommand.
+    let args: Vec<String> = sub_matches
+        .get_many::<String>("args")
+        .map(|vs| vs.cloned().collect())
+        .unwrap_or_default();
+
+    // Full plugin load. Most fields aren't relevant for a CLI-only
+    // dispatch (we don't need memory, channel bus, etc.), but the
+    // load path requires them. Use stub-friendly choices for the
+    // resources the plugins might touch.
+    let mut registry = fennec::plugins::PluginRegistry::new();
+    if let Err(e) = registry.load_bundled(&config.plugins.enabled) {
+        tracing::error!(
+            "Plugin registry failed to load bundled for CLI dispatch: {e}"
+        );
+    }
+
+    // For WASM, we still need the full host resources because the
+    // plugin's CLI handler may use `http_request` / `read_file` /
+    // etc. as host imports. Construct an in-memory `SqliteMemory`
+    // (under home/memory.db) for the plugin to use; channel bus
+    // is None because we're not in gateway mode.
+    let path_sandbox = Arc::new(PathSandbox::new(config.security.forbidden_paths.clone()));
+    let memory_path = home_dir.join("memory.db");
+    let memory: Arc<dyn Memory> = Arc::new(
+        SqliteMemory::new(
+            memory_path,
+            config.memory.vector_weight as f32,
+            config.memory.keyword_weight as f32,
+            config.memory.cache_max,
+            Arc::new(NoopEmbedding::new(1536)),
+        )
+        .context("opening memory store for plugin CLI dispatch")?,
+    );
+    let wasm_resources = fennec::plugins::WasmHostResources {
+        path_sandbox,
+        memory,
+        http_client: fennec::tools::http::shared_client(),
+        rt_handle: tokio::runtime::Handle::current(),
+        settings: config.plugins.settings.clone(),
+        bus: None,
+    };
+    let plugins_root = home_dir.join("plugins");
+    if let Err(e) = registry.load_wasm(
+        &plugins_root,
+        &config.plugins.enabled,
+        wasm_resources,
+    ) {
+        tracing::error!("Plugin registry failed to load WASM for CLI dispatch: {e}");
+    }
+
+    let runtime = registry.into_runtime(&config.memory.provider);
+
+    let exit_code = match runtime.dispatch_cli(sub_name, args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("plugin command '{sub_name}' failed: {e}");
+            1
+        }
+    };
+    std::process::exit(exit_code);
 }
 
 async fn run_doctor(config: &FennecConfig, home_dir: &std::path::Path) -> Result<()> {

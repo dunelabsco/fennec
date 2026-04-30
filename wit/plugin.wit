@@ -264,6 +264,32 @@ interface plugin {
     memory-on-turn-start: func(user-message: string) -> result<_, string>;
     memory-on-pre-compress: func(messages-json: string) -> result<string, string>;
     memory-on-memory-write: func(action: memory-write-action, key: string, content: string) -> result<_, string>;
+
+    // ---- CLI subcommands --------------------------------------------
+    //
+    // Plugins can contribute top-level subcommands to the `fennec`
+    // binary. Discovery is metadata-driven: the `cli_commands`
+    // field of `plugin.toml` declares names + descriptions, the
+    // host wires those into clap at startup, and dispatch routes
+    // matched commands to `cli-execute` below.
+    //
+    // The `cli-execute` export receives:
+    //
+    //   - `name`: the matched command name (in case the plugin
+    //     declared multiple commands and shares one handler).
+    //   - `args`: the args following `fennec <name>`, NOT including
+    //     `name` itself. So `fennec spotify play "Bohemian Rhapsody"`
+    //     gives the plugin `args = ["play", "Bohemian Rhapsody"]`.
+    //
+    // The return value is a Unix-style exit code.
+    //
+    // Plugins that don't contribute CLI commands should still
+    // export this function (WIT requires every interface function
+    // be exported). A trivial body returning 0 is fine — the
+    // export is only called for commands the plugin's
+    // `plugin.toml` actually declares.
+
+    cli-execute: func(name: string, args: list<string>) -> s32;
 }
 
 // The plugin world wires the two interfaces together: plugins

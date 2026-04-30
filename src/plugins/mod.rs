@@ -57,6 +57,7 @@
 //! inventory::submit! { PluginEntry { plugin: &MyPlugin } }
 //! ```
 
+mod cli;
 mod context;
 mod demo;
 mod hooks;
@@ -67,6 +68,7 @@ mod registry;
 mod traits;
 pub mod wasm;
 
+pub use cli::{validate_command_name, CliCommandHandler, CliCommandSpec, RESERVED_COMMAND_NAMES};
 pub use context::PluginContext;
 pub use hooks::{
     HookKind, HookRegistry, OnSessionEndHook, OnSessionStartHook, PostLlmCallEvent,

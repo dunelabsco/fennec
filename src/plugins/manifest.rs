@@ -8,10 +8,14 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
+use super::cli::CliCommandSpec;
+
 /// What kind of role a plugin fills.
 ///
-/// Matches Hermes' three categories so that the same conceptual model
-/// works for both bundled and (later) WASM plugins.
+/// Three categories cover the realistic plugin shapes for Fennec:
+/// standalone tool/hook contributors, drop-in backends for an
+/// existing core feature, and exclusive-category providers
+/// (memory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginKind {
@@ -63,6 +67,17 @@ pub struct PluginManifest {
     /// Role this plugin fills. See [`PluginKind`].
     #[serde(default = "default_kind")]
     pub kind: PluginKind,
+    /// CLI subcommands this plugin contributes to the `fennec`
+    /// binary. WASM plugins declare their commands here in
+    /// `plugin.toml`; bundled plugins return them from
+    /// [`Plugin::cli_commands`](super::traits::Plugin::cli_commands)
+    /// instead and leave this field empty.
+    ///
+    /// Names that collide with built-in commands or with another
+    /// plugin's commands are dropped at the discovery pass with a
+    /// warn log; the rest of the plugin's commands still register.
+    #[serde(default)]
+    pub cli_commands: Vec<CliCommandSpec>,
 }
 
 fn default_kind() -> PluginKind {
@@ -80,6 +95,7 @@ impl PluginManifest {
             description: String::new(),
             author: String::new(),
             kind: PluginKind::Standalone,
+            cli_commands: Vec::new(),
         }
     }
 

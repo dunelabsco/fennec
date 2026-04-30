@@ -61,6 +61,14 @@ pub struct PluginRegistry {
     /// them so a future PR (or a `fennec memory list` command) can
     /// enumerate available choices.
     memory_providers: std::collections::HashMap<String, Arc<dyn super::memory_provider::MemoryProvider>>,
+    /// CLI subcommand metadata, in the order plugins declared them.
+    /// Used by `main.rs` at startup to add subcommands to clap.
+    /// Names duplicating built-ins or other plugins are dropped at
+    /// the discovery pass with a warn log.
+    cli_specs: Vec<super::cli::CliCommandSpec>,
+    /// Handlers keyed by command name. Built up during plugin
+    /// registration; `dispatch_cli` looks the command up here.
+    cli_handlers: std::collections::HashMap<String, super::cli::CliCommandHandler>,
 }
 
 impl PluginRegistry {
@@ -70,6 +78,8 @@ impl PluginRegistry {
             tools: Vec::new(),
             hooks: HookRegistry::new(),
             memory_providers: std::collections::HashMap::new(),
+            cli_specs: Vec::new(),
+            cli_handlers: std::collections::HashMap::new(),
         }
     }
 
@@ -176,6 +186,24 @@ impl PluginRegistry {
                             );
                         }
                     }
+                    // Bundled CLI command metadata + handlers. The
+                    // metadata comes from `Plugin::cli_commands()`
+                    // (called once on the static reference); the
+                    // handlers come from
+                    // `PluginContext::register_cli_command(...)`
+                    // calls inside `register()`. We pair them by
+                    // name; specs without a matching handler get a
+                    // warn log and are dropped.
+                    let bundled_specs = entry.plugin.cli_commands();
+                    let handler_map: std::collections::HashMap<String, super::cli::CliCommandHandler> =
+                        parts.cli_handlers.into_iter().collect();
+                    register_cli_commands(
+                        &mut self.cli_specs,
+                        &mut self.cli_handlers,
+                        bundled_specs,
+                        handler_map,
+                        &manifest.name,
+                    );
                     self.loaded.push(LoadedPlugin {
                         manifest,
                         tool_count,
@@ -346,6 +374,19 @@ impl PluginRegistry {
             // no-op for observer hooks).
             register_wasm_hooks(&mut self.hooks, Arc::clone(&instance), &resources.rt_handle);
 
+            // CLI commands declared in the plugin's manifest. For
+            // each declared command we bind a synchronous closure
+            // that drives `call_cli_execute` to completion via
+            // `block_in_place + block_on`. The closure is dropped
+            // into `cli_handlers` keyed on the command name.
+            register_wasm_cli_commands(
+                &mut self.cli_specs,
+                &mut self.cli_handlers,
+                &d.manifest,
+                Arc::clone(&instance),
+                &resources.rt_handle,
+            );
+
             // Register the plugin as a memory-provider candidate.
             // Whether it ACTUALLY activates depends on
             // `[memory] provider = "<this-name>"` in config AND the
@@ -449,7 +490,17 @@ impl PluginRegistry {
                 .iter()
                 .map(|p| p.manifest.name.clone())
                 .collect(),
+            cli_specs: self.cli_specs,
+            cli_handlers: self.cli_handlers,
         }
+    }
+
+    /// Snapshot of all plugin-contributed CLI command specs, in
+    /// registration order. Used by `main.rs` to add subcommands to
+    /// clap before parsing argv. Borrowed (not consumed) so the
+    /// registry can still produce its full runtime later.
+    pub fn cli_command_specs(&self) -> &[super::cli::CliCommandSpec] {
+        &self.cli_specs
     }
 
     /// Names of memory providers that registered. Useful for
@@ -468,6 +519,31 @@ pub struct RegistryRuntime {
     pub hooks: HookRegistry,
     pub memory_manager: super::memory_manager::MemoryManager,
     pub loaded_plugin_names: Vec<String>,
+    /// CLI subcommand specs, in declaration order. `main.rs` walks
+    /// these at startup and adds each as a clap subcommand.
+    pub cli_specs: Vec<super::cli::CliCommandSpec>,
+    /// Handler closures keyed by command name. `main.rs` looks
+    /// these up when a plugin command matches.
+    pub cli_handlers: std::collections::HashMap<String, super::cli::CliCommandHandler>,
+}
+
+impl RegistryRuntime {
+    /// Dispatch a plugin CLI command. Looks up `name` in
+    /// `cli_handlers`, runs the handler with `args`, and returns
+    /// the handler's exit code.
+    ///
+    /// Errors:
+    /// - `name` is not a registered plugin command → `Err`
+    /// - handler returned `Err(e)` → propagate as `Err`
+    pub fn dispatch_cli(&self, name: &str, args: Vec<String>) -> anyhow::Result<i32> {
+        let Some(handler) = self.cli_handlers.get(name) else {
+            anyhow::bail!(
+                "no plugin handler registered for CLI command '{}'",
+                name
+            );
+        };
+        handler(args)
+    }
 }
 
 /// Resolve the configured memory provider name to a
@@ -511,6 +587,130 @@ fn resolve_memory_manager(
         "Memory provider activated alongside built-in"
     );
     super::memory_manager::MemoryManager::with_provider(Arc::clone(provider))
+}
+
+/// Pair bundled CLI command specs with handlers and append them to
+/// the registry's command list.
+///
+/// `specs` come from `Plugin::cli_commands()`. `handlers` come from
+/// `PluginContext::register_cli_command(...)` calls — the registry
+/// pairs them by name.
+///
+/// Validation order:
+/// 1. Each spec name passes [`validate_command_name`] — rejects
+///    empty, oversized, non-ASCII, and reserved-name collisions.
+/// 2. Spec name is unique across all already-registered plugin
+///    commands — duplicates dropped with a warn.
+/// 3. Spec has a matching handler in `handlers` — orphan specs
+///    dropped with a warn.
+fn register_cli_commands(
+    specs_out: &mut Vec<super::cli::CliCommandSpec>,
+    handlers_out: &mut std::collections::HashMap<String, super::cli::CliCommandHandler>,
+    declared: Vec<super::cli::CliCommandSpec>,
+    mut handlers: std::collections::HashMap<String, super::cli::CliCommandHandler>,
+    plugin_name: &str,
+) {
+    for spec in declared {
+        if let Err(e) = super::cli::validate_command_name(&spec.name) {
+            tracing::warn!(
+                plugin = %plugin_name,
+                command = %spec.name,
+                "Plugin CLI command rejected: {e}"
+            );
+            continue;
+        }
+        if handlers_out.contains_key(&spec.name) {
+            tracing::warn!(
+                plugin = %plugin_name,
+                command = %spec.name,
+                "Plugin CLI command name '{}' clashes with one already \
+                 registered by another plugin; dropping",
+                spec.name
+            );
+            continue;
+        }
+        let Some(handler) = handlers.remove(&spec.name) else {
+            tracing::warn!(
+                plugin = %plugin_name,
+                command = %spec.name,
+                "Plugin '{}' declared CLI command '{}' but did not call \
+                 ctx.register_cli_command(...) for it; dropping",
+                plugin_name,
+                spec.name
+            );
+            continue;
+        };
+        handlers_out.insert(spec.name.clone(), handler);
+        specs_out.push(spec);
+    }
+    // Any handlers without a matching declared spec are also a
+    // mismatch; flag them so plugin authors notice.
+    for orphan_name in handlers.keys() {
+        tracing::warn!(
+            plugin = %plugin_name,
+            command = %orphan_name,
+            "Plugin '{}' registered a CLI handler for '{}' but did not \
+             declare it in its `cli_commands()` list; dropping",
+            plugin_name,
+            orphan_name
+        );
+    }
+}
+
+/// Register WASM-plugin CLI commands. The plugin declares them in
+/// `plugin.toml`'s `cli_commands` array; the host wraps each in a
+/// closure that calls `call_cli_execute` on the plugin instance.
+fn register_wasm_cli_commands(
+    specs_out: &mut Vec<super::cli::CliCommandSpec>,
+    handlers_out: &mut std::collections::HashMap<String, super::cli::CliCommandHandler>,
+    manifest: &super::manifest::PluginManifest,
+    instance: Arc<super::wasm::runtime::WasmPluginInstance>,
+    rt_handle: &Handle,
+) {
+    for spec in &manifest.cli_commands {
+        if let Err(e) = super::cli::validate_command_name(&spec.name) {
+            tracing::warn!(
+                plugin = %manifest.name,
+                command = %spec.name,
+                "WASM plugin CLI command rejected: {e}"
+            );
+            continue;
+        }
+        if handlers_out.contains_key(&spec.name) {
+            tracing::warn!(
+                plugin = %manifest.name,
+                command = %spec.name,
+                "WASM plugin CLI command name '{}' clashes with one \
+                 already registered; dropping",
+                spec.name
+            );
+            continue;
+        }
+        let inst = Arc::clone(&instance);
+        let rt = rt_handle.clone();
+        let plugin_name = manifest.name.clone();
+        let cmd_name = spec.name.clone();
+        let handler: super::cli::CliCommandHandler =
+            Arc::new(move |args: Vec<String>| {
+                let inst = Arc::clone(&inst);
+                let rt = rt.clone();
+                let cmd_name = cmd_name.clone();
+                let plugin_name = plugin_name.clone();
+                let result = tokio::task::block_in_place(|| {
+                    rt.block_on(inst.call_cli_execute(&cmd_name, &args))
+                });
+                result.map_err(|e| {
+                    anyhow::anyhow!(
+                        "WASM plugin '{}' cli-execute('{}') failed: {}",
+                        plugin_name,
+                        cmd_name,
+                        e
+                    )
+                })
+            });
+        handlers_out.insert(spec.name.clone(), handler);
+        specs_out.push(spec.clone());
+    }
 }
 
 /// Register lifecycle hooks that route into a single WASM plugin
@@ -760,5 +960,61 @@ mod tests {
         let runtime = reg.into_runtime("definitely-not-real");
         assert!(!runtime.memory_manager.has_external());
         assert_eq!(runtime.memory_manager.active_name(), "builtin");
+    }
+
+    /// End-to-end CLI dispatch: register a spec + handler manually
+    /// in the registry's internal state, then call
+    /// `RegistryRuntime::dispatch_cli`. Verifies the lookup is
+    /// keyed correctly and the handler receives the args verbatim.
+    /// Bypasses the bundled-plugin path (which requires a real
+    /// `Plugin` impl with `cli_commands()`) so the test stays
+    /// focused on the dispatch surface.
+    #[test]
+    fn cli_dispatch_invokes_handler_with_args() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        let mut reg = PluginRegistry::new();
+        let captured = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let counter = Arc::new(AtomicI32::new(0));
+        let cap = Arc::clone(&captured);
+        let ctr = Arc::clone(&counter);
+        reg.cli_specs.push(super::super::cli::CliCommandSpec {
+            name: "test-cmd".to_string(),
+            description: "test".to_string(),
+        });
+        reg.cli_handlers.insert(
+            "test-cmd".to_string(),
+            Arc::new(move |args: Vec<String>| {
+                *cap.lock() = args;
+                ctr.fetch_add(1, Ordering::SeqCst);
+                Ok(7) // unique exit code so we can verify propagation
+            }),
+        );
+        let runtime = reg.into_runtime("builtin");
+        assert_eq!(runtime.cli_specs.len(), 1);
+        assert_eq!(runtime.cli_specs[0].name, "test-cmd");
+
+        let code = runtime
+            .dispatch_cli(
+                "test-cmd",
+                vec!["one".to_string(), "two".to_string()],
+            )
+            .unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(*captured.lock(), vec!["one", "two"]);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Dispatching a name that isn't registered returns an error
+    /// (does NOT panic). This covers the case where someone tries
+    /// to dispatch a command after a previous error dropped its
+    /// handler.
+    #[test]
+    fn cli_dispatch_unknown_command_errors() {
+        let reg = PluginRegistry::new();
+        let runtime = reg.into_runtime("builtin");
+        assert!(runtime
+            .dispatch_cli("not-a-command", vec![])
+            .is_err());
     }
 }
