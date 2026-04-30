@@ -48,20 +48,36 @@ impl Default for FennecConfig {
 /// doesn't correspond to any installed plugin produces a startup
 /// warning (likely a typo) but does not abort startup.
 ///
-/// In a future phase this struct will gain `wasm_dir` and a
-/// `disabled` deny-list to mirror Hermes' two-axis allow/deny model.
+/// In a future phase this struct will gain a `disabled` deny-list
+/// (currently `enabled` is the single allowlist axis).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginsConfig {
     /// Names of plugins that should be activated at startup.
     /// Default: empty (no plugins active).
     pub enabled: Vec<String>,
+    /// Per-plugin string settings. Top-level key is plugin name;
+    /// inner map is the plugin's own key/value space. A plugin
+    /// reads its own settings via the `config-get-string` host
+    /// import, which scopes reads to the current plugin — plugins
+    /// cannot read each other's settings.
+    ///
+    /// Example `config.toml` shape:
+    /// ```toml
+    /// [plugins.settings.spotify]
+    /// market = "US"
+    /// default_device = "kitchen"
+    /// ```
+    /// Inside the spotify plugin, `config-get-string("market")`
+    /// returns `Some("US")`.
+    pub settings: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 }
 
 impl Default for PluginsConfig {
     fn default() -> Self {
         Self {
             enabled: Vec::new(),
+            settings: std::collections::HashMap::new(),
         }
     }
 }

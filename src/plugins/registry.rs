@@ -12,13 +12,14 @@
 //! Hermes (see `hermes_cli/plugins.py` — failed plugins log a warning
 //! and the loader proceeds).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::runtime::Handle;
 
+use crate::bus::MessageBus;
 use crate::memory::traits::Memory;
 use crate::security::path_sandbox::PathSandbox;
 use crate::tools::traits::Tool;
@@ -220,13 +221,24 @@ impl PluginRegistry {
                 }
             };
 
-            // Instantiate with a fresh host state per plugin.
+            // Instantiate with a fresh host state per plugin. The
+            // plugin sees only its own slice of `[plugins.settings]`
+            // — pulled from the resources map at instantiation
+            // time, so a config reload would require a restart
+            // (matches every other config field).
+            let plugin_settings = resources
+                .settings
+                .get(&name)
+                .cloned()
+                .unwrap_or_default();
             let state = PluginHostState {
                 plugin_name: name.clone(),
                 path_sandbox: Arc::clone(&resources.path_sandbox),
                 memory: Arc::clone(&resources.memory),
                 http_client: resources.http_client.clone(),
                 rt_handle: resources.rt_handle.clone(),
+                settings: plugin_settings,
+                bus: resources.bus.clone(),
             };
             let instance = match WasmPluginInstance::instantiate(&engine, &component, state) {
                 Ok(i) => Arc::new(i),
@@ -241,11 +253,15 @@ impl PluginRegistry {
 
             // Call register() to discover the tool list. We have to
             // bridge sync→async here since the registry call is sync
-            // but call_register awaits a Mutex.
-            let specs = match resources
-                .rt_handle
-                .block_on(instance.call_register())
-            {
+            // but call_register awaits a Mutex. block_in_place tells
+            // the multi-threaded runtime that this worker will
+            // block; another worker takes over async tasks. Without
+            // it, block_on panics when load_bundled() is itself
+            // called from an async fn (which it is — build_agent is
+            // async).
+            let specs = match tokio::task::block_in_place(|| {
+                resources.rt_handle.block_on(instance.call_register())
+            }) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(
@@ -322,6 +338,15 @@ pub struct WasmHostResources {
     pub memory: Arc<dyn Memory>,
     pub http_client: reqwest::Client,
     pub rt_handle: Handle,
+    /// Per-plugin string settings, keyed by plugin name.
+    /// Each plugin sees only its own slice; the registry slices the
+    /// map at instantiation time and hands a per-plugin `HashMap`
+    /// to that plugin's host state.
+    pub settings: HashMap<String, HashMap<String, String>>,
+    /// Optional message bus for outbound channel sends. `None` in
+    /// CLI / agent mode where there are no channels; the
+    /// `channel-send` host import returns an error in that case.
+    pub bus: Option<MessageBus>,
 }
 
 impl Default for PluginRegistry {

@@ -177,7 +177,8 @@ use fennec::plugin::host::{
 };
 
 use super::host::{
-    self, host_http_request, host_log, host_memory_recall, host_memory_store,
+    self, host_channel_send, host_config_get_string, host_http_request, host_log,
+    host_memory_forget, host_memory_get, host_memory_recall, host_memory_store,
     host_now_millis, host_read_file, host_write_file, LogLevel, WasmHttpRequest,
 };
 
@@ -262,6 +263,40 @@ impl Host for PluginHostState {
         content: String,
     ) -> wasmtime::Result<Result<(), HostError>> {
         Ok(host_memory_store(self, &key, &content)
+            .map_err(|message| HostError { message }))
+    }
+
+    fn memory_get(
+        &mut self,
+        key: String,
+    ) -> wasmtime::Result<Result<Option<WitMemEntry>, HostError>> {
+        Ok(host_memory_get(self, &key)
+            .map(|opt| {
+                opt.map(|e| WitMemEntry {
+                    key: e.key,
+                    content: e.content,
+                    category: e.category,
+                    created_at: e.created_at,
+                })
+            })
+            .map_err(|message| HostError { message }))
+    }
+
+    fn memory_forget(&mut self, key: String) -> wasmtime::Result<Result<bool, HostError>> {
+        Ok(host_memory_forget(self, &key).map_err(|message| HostError { message }))
+    }
+
+    fn config_get_string(&mut self, key: String) -> wasmtime::Result<Option<String>> {
+        Ok(host_config_get_string(self, &key))
+    }
+
+    fn channel_send(
+        &mut self,
+        channel: String,
+        chat_id: String,
+        content: String,
+    ) -> wasmtime::Result<Result<(), HostError>> {
+        Ok(host_channel_send(self, &channel, &chat_id, &content)
             .map_err(|message| HostError { message }))
     }
 }

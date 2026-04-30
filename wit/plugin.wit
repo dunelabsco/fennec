@@ -101,6 +101,38 @@ interface host {
 
     memory-recall: func(query: string, limit: u32) -> result<list<memory-entry>, host-error>;
     memory-store: func(key: string, content: string) -> result<_, host-error>;
+
+    // Direct lookup of a single entry by key. Returns `none` if no
+    // entry exists. Reads are unrestricted — plugins can see any
+    // memory entry, same as the agent's memory_recall tool.
+    memory-get: func(key: string) -> result<option<memory-entry>, host-error>;
+
+    // Delete a memory entry. Only entries written by this plugin can
+    // be deleted (entries whose category is `plugin:<this-plugin>`).
+    // Attempting to delete an entry from another category is a no-op
+    // — the host returns Ok(false) without raising an error so
+    // plugins can call this idempotently. Returns true if a deletion
+    // actually happened.
+    memory-forget: func(key: string) -> result<bool, host-error>;
+
+    // ---- Config -----------------------------------------------------
+    //
+    // Plugins can declare their own config under
+    // `[plugins.settings.<name>]` in `~/.fennec/config.toml` and read
+    // those values at runtime. The host scopes lookups to the
+    // current plugin — plugins cannot read each other's settings or
+    // any other Fennec config sections.
+
+    config-get-string: func(key: string) -> option<string>;
+
+    // ---- Channels ---------------------------------------------------
+    //
+    // Send a message to a configured channel. Only available when
+    // Fennec is running in gateway mode (channels are wired up); in
+    // CLI mode this returns an error.
+
+    channel-send: func(channel: string, chat-id: string, content: string)
+        -> result<_, host-error>;
 }
 
 // What plugins implement.
