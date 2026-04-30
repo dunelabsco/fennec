@@ -13,14 +13,23 @@
 //! and the loader proceeds).
 
 use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
+use tokio::runtime::Handle;
 
+use crate::memory::traits::Memory;
+use crate::security::path_sandbox::PathSandbox;
 use crate::tools::traits::Tool;
 
 use super::context::PluginContext;
 use super::manifest::PluginManifest;
 use super::traits::PluginEntry;
+use super::wasm::host::PluginHostState;
+use super::wasm::loader::discover_wasm_plugins;
+use super::wasm::runtime::{WasmEngine, WasmPluginInstance};
+use super::wasm::tool::WasmTool;
 
 /// Diagnostic record for a successfully-loaded plugin. Surfaced by
 /// `fennec doctor` (later) and through [`PluginRegistry::loaded`].
@@ -147,6 +156,149 @@ impl PluginRegistry {
         Ok(())
     }
 
+    /// Discover, compile, and instantiate every WASM plugin under
+    /// `plugins_root` whose manifest name appears in `enabled`.
+    ///
+    /// On any per-plugin failure (manifest invalid, component
+    /// compilation failed, instantiation trapped, register() trapped)
+    /// the plugin is dropped with an error log; the registry continues
+    /// with the remaining plugins.
+    ///
+    /// The host resources (path sandbox, memory, http client, runtime
+    /// handle) are cloned into a fresh [`PluginHostState`] for each
+    /// plugin instance — wasmtime stores require owned state.
+    pub fn load_wasm(
+        &mut self,
+        plugins_root: &Path,
+        enabled: &[String],
+        resources: WasmHostResources,
+    ) -> Result<()> {
+        let want: HashSet<&str> = enabled.iter().map(String::as_str).collect();
+
+        let discovered = discover_wasm_plugins(plugins_root)?;
+        if discovered.is_empty() {
+            tracing::debug!(
+                "WASM plugin loader: no plugins discovered under {}",
+                plugins_root.display()
+            );
+            return Ok(());
+        }
+
+        // Build the engine once; share across all plugin
+        // instantiations. Compilation is per-plugin, but engine
+        // construction is the expensive part.
+        let engine = match WasmEngine::new() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to build wasmtime engine: {e}; skipping all WASM plugins"
+                );
+                return Ok(());
+            }
+        };
+
+        for d in discovered {
+            let name = d.manifest.name.clone();
+            if !want.contains(name.as_str()) {
+                tracing::debug!(
+                    plugin = %name,
+                    "WASM plugin discovered but not in [plugins].enabled; skipping"
+                );
+                continue;
+            }
+
+            // Compile.
+            let component = match engine.compile_component(&d.wasm_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(
+                        plugin = %name,
+                        path = %d.wasm_path.display(),
+                        "Failed to compile WASM component: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            // Instantiate with a fresh host state per plugin.
+            let state = PluginHostState {
+                plugin_name: name.clone(),
+                path_sandbox: Arc::clone(&resources.path_sandbox),
+                memory: Arc::clone(&resources.memory),
+                http_client: resources.http_client.clone(),
+                rt_handle: resources.rt_handle.clone(),
+            };
+            let instance = match WasmPluginInstance::instantiate(&engine, &component, state) {
+                Ok(i) => Arc::new(i),
+                Err(e) => {
+                    tracing::error!(
+                        plugin = %name,
+                        "Failed to instantiate WASM plugin: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            // Call register() to discover the tool list. We have to
+            // bridge sync→async here since the registry call is sync
+            // but call_register awaits a Mutex.
+            let specs = match resources
+                .rt_handle
+                .block_on(instance.call_register())
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        plugin = %name,
+                        "WASM plugin register() failed: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            let tool_count = specs.len();
+            for spec in specs {
+                let spec_name = spec.name.clone();
+                match WasmTool::from_spec(Arc::clone(&instance), spec) {
+                    Ok(tool) => self.tools.push(Box::new(tool)),
+                    Err(e) => {
+                        tracing::error!(
+                            plugin = %name,
+                            tool = %spec_name,
+                            "Skipping WASM-provided tool: {e}"
+                        );
+                    }
+                }
+            }
+
+            tracing::info!(
+                plugin = %name,
+                version = %d.manifest.version,
+                tools = tool_count,
+                "Loaded WASM plugin"
+            );
+            self.loaded.push(LoadedPlugin {
+                manifest: d.manifest,
+                tool_count,
+            });
+        }
+
+        // Surface unmatched names: user listed a plugin that isn't
+        // installed (matches the `load_bundled` behaviour above).
+        let loaded_names: HashSet<&str> =
+            self.loaded.iter().map(|p| p.manifest.name.as_str()).collect();
+        for requested in &want {
+            if !loaded_names.contains(requested) {
+                tracing::warn!(
+                    plugin = %requested,
+                    "Plugin requested in [plugins].enabled but not found among bundled or WASM plugins"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Diagnostic snapshot of every successfully-loaded plugin.
     pub fn loaded(&self) -> &[LoadedPlugin] {
         &self.loaded
@@ -157,6 +309,19 @@ impl PluginRegistry {
     pub fn into_tools(self) -> Vec<Box<dyn Tool>> {
         self.tools
     }
+}
+
+/// Bundle of host-side resources passed into the WASM loader.
+///
+/// Each WASM plugin receives a clone of these handles in its
+/// [`PluginHostState`]. The bundle exists so callers can pass one
+/// argument instead of five and so future host-import additions
+/// only require extending this struct.
+pub struct WasmHostResources {
+    pub path_sandbox: Arc<PathSandbox>,
+    pub memory: Arc<dyn Memory>,
+    pub http_client: reqwest::Client,
+    pub rt_handle: Handle,
 }
 
 impl Default for PluginRegistry {

@@ -652,18 +652,39 @@ async fn build_agent(
     // the `inventory` crate) are scanned here and any whose name
     // appears in `[plugins].enabled` is activated. The default
     // `enabled = []` skips the activation path entirely so installs
-    // that never opt in have zero behavioural change. WASM-loaded
-    // user plugins (`~/.fennec/plugins/<name>/<name>.wasm`) will
-    // arrive in a later phase using the same registry.
+    // that never opt in have zero behavioural change.
     let mut plugin_registry = fennec::plugins::PluginRegistry::new();
     if let Err(e) = plugin_registry.load_bundled(&config.plugins.enabled) {
         // load_bundled() is "ok-even-if-some-fail" by design — this
         // arm only fires on a structural failure. Don't abort agent
         // startup; log and continue with no plugins.
         tracing::error!(
-            "Plugin registry failed to load: {e}; continuing without plugins"
+            "Plugin registry failed to load bundled: {e}; continuing without bundled plugins"
         );
     }
+
+    // WASM-loaded user plugins discovered under `<home>/plugins/`.
+    // Each plugin gets a clone of the host capability handles
+    // (path sandbox, memory, http client, runtime handle). Discovery
+    // and instantiation failures are non-fatal — one bad plugin
+    // never blocks startup.
+    let wasm_resources = fennec::plugins::WasmHostResources {
+        path_sandbox: Arc::clone(&path_sandbox),
+        memory: memory.clone(),
+        http_client: fennec::tools::http::shared_client(),
+        rt_handle: tokio::runtime::Handle::current(),
+    };
+    let plugins_root = home_dir.join("plugins");
+    if let Err(e) = plugin_registry.load_wasm(
+        &plugins_root,
+        &config.plugins.enabled,
+        wasm_resources,
+    ) {
+        tracing::error!(
+            "Plugin registry failed to load WASM plugins: {e}; continuing without WASM plugins"
+        );
+    }
+
     for plugin_tool in plugin_registry.into_tools() {
         builder = builder.tool(plugin_tool);
     }

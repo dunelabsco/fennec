@@ -62,10 +62,11 @@ mod demo;
 mod manifest;
 mod registry;
 mod traits;
+pub mod wasm;
 
 pub use context::PluginContext;
 pub use manifest::{PluginKind, PluginManifest};
-pub use registry::{LoadedPlugin, PluginRegistry};
+pub use registry::{LoadedPlugin, PluginRegistry, WasmHostResources};
 pub use traits::{Plugin, PluginEntry};
 
 /// Re-export the inventory crate so plugin authors don't have to add it

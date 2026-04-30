@@ -58,6 +58,16 @@ serde_yaml_ng = "0.10"
 # loader iterates `inventory::iter::<PluginEntry>()` at startup. This is
 # the same mechanism `clap`, `rkyv`, and many other crates use.
 inventory = "0.3"
+# WASM plugin runtime — used by the plugin system to load `.wasm`
+# components dropped into ~/.fennec/plugins/<name>/. The Component
+# Model (`wasmtime::component`) gives plugins typed bindings via the
+# WIT interface in `wit/plugin.wit`. Default features include the
+# Cranelift JIT compiler, which makes startup compilation fast enough
+# that we don't need an AOT cache for the first pass. Adds ~10-15 MB
+# to the release binary; an opt-out feature can come later if anyone
+# needs a slim build.
+wasmtime = "27"
+wasmtime-wasi = "27"
 
 [dev-dependencies]
 tempfile = "3.15"
