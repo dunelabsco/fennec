@@ -15,6 +15,7 @@ pub struct FennecConfig {
     pub gateway: GatewayConfig,
     pub cron: CronConfig,
     pub collective: CollectiveConfig,
+    pub plugins: PluginsConfig,
 }
 
 impl Default for FennecConfig {
@@ -29,6 +30,38 @@ impl Default for FennecConfig {
             gateway: GatewayConfig::default(),
             cron: CronConfig::default(),
             collective: CollectiveConfig::default(),
+            plugins: PluginsConfig::default(),
+        }
+    }
+}
+
+/// Plugin-system configuration.
+///
+/// Bundled plugins ship in the binary but stay dormant until they
+/// appear in `enabled`. The default empty list preserves the
+/// pre-plugin behaviour byte-for-byte: no plugins activate, no tool
+/// list changes, no startup overhead beyond a single
+/// `inventory::iter` walk that finds nothing to do.
+///
+/// Names in `enabled` are matched against the `name` field returned
+/// by each plugin's `Plugin::manifest()`. A name in this list that
+/// doesn't correspond to any installed plugin produces a startup
+/// warning (likely a typo) but does not abort startup.
+///
+/// In a future phase this struct will gain `wasm_dir` and a
+/// `disabled` deny-list to mirror Hermes' two-axis allow/deny model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginsConfig {
+    /// Names of plugins that should be activated at startup.
+    /// Default: empty (no plugins active).
+    pub enabled: Vec<String>,
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Vec::new(),
         }
     }
 }
