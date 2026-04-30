@@ -691,9 +691,11 @@ async fn build_agent(
         );
     }
 
-    for plugin_tool in plugin_registry.into_tools() {
+    let (plugin_tools, plugin_hooks) = plugin_registry.into_tools_and_hooks();
+    for plugin_tool in plugin_tools {
         builder = builder.tool(plugin_tool);
     }
+    builder = builder.hooks(Arc::new(plugin_hooks));
 
     let agent = builder
         .identity_name(&config.identity.name)

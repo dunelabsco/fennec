@@ -161,6 +161,60 @@ interface plugin {
     // object; the plugin returns either a JSON-encoded result string
     // (success) or an error message.
     invoke: func(tool-name: string, args-json: string) -> result<string, string>;
+
+    // ---- Lifecycle hooks --------------------------------------------
+    //
+    // The host calls each of these hooks at the matching agent
+    // lifecycle point. Plugins can implement zero or more of them;
+    // the host catches any trap or panic, logs it, and continues
+    // with the remaining hooks (one bad hook does not abort the
+    // agent turn).
+    //
+    // Tool hooks return an action so plugins can influence flow:
+    //
+    // - `pre-tool-call-action::%continue` — proceed normally
+    // - `pre-tool-call-action::skip(reason)` — abort the call. The
+    //   tool result becomes "[skipped by plugin: <reason>]" so the
+    //   LLM sees something coherent.
+    // - `pre-tool-call-action::rewrite(args-json)` — replace the
+    //   tool's arguments. Subsequent hooks see the rewritten args.
+    //
+    // Multi-plugin ordering: hooks fire in plugin registration
+    // order. The first `skip` wins (subsequent hooks not fired).
+    // `rewrite` actions chain — each plugin sees the previous one's
+    // modifications.
+    //
+    // LLM and session hooks are observer-only. "Skip the LLM call"
+    // or "skip session start" don't have coherent semantics, so
+    // those hooks have no return value.
+
+    variant pre-tool-call-action {
+        %continue,
+        skip(string),
+        rewrite(string),
+    }
+
+    record post-rewrite {
+        output: string,
+        success: bool,
+    }
+
+    variant post-tool-call-action {
+        %continue,
+        rewrite(post-rewrite),
+    }
+
+    on-pre-tool-call: func(tool-name: string, args-json: string) -> pre-tool-call-action;
+    on-post-tool-call: func(tool-name: string, args-json: string, output: string, success: bool) -> post-tool-call-action;
+
+    // Observer hooks. JSON payloads are stable across versions: the
+    // host serialises a small fixed shape so plugins built against
+    // an older WIT keep parsing what they care about.
+    on-pre-llm-call: func(messages-json: string);
+    on-post-llm-call: func(response-json: string);
+
+    on-session-start: func(session-id: string);
+    on-session-end: func(session-id: string);
 }
 
 // The plugin world wires the two interfaces together: plugins

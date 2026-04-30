@@ -141,6 +141,148 @@ impl WasmPluginInstance {
             })?;
         result.map_err(|e| anyhow!("plugin '{}' returned error: {}", self.plugin_name, e))
     }
+
+    /// Call the plugin's exported `on-pre-tool-call` hook.
+    pub async fn call_on_pre_tool_call(
+        &self,
+        tool_name: &str,
+        args_json: &str,
+    ) -> Result<crate::plugins::PreToolCallAction> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let action = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_on_pre_tool_call(&mut inner.store, tool_name, args_json)
+            .with_context(|| {
+                format!(
+                    "plugin '{}' on-pre-tool-call({}) trapped",
+                    self.plugin_name, tool_name
+                )
+            })?;
+        Ok(wit_to_pre_tool_action(action))
+    }
+
+    /// Call the plugin's exported `on-post-tool-call` hook.
+    pub async fn call_on_post_tool_call(
+        &self,
+        tool_name: &str,
+        args_json: &str,
+        output: &str,
+        success: bool,
+    ) -> Result<crate::plugins::PostToolCallAction> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let action = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_on_post_tool_call(&mut inner.store, tool_name, args_json, output, success)
+            .with_context(|| {
+                format!(
+                    "plugin '{}' on-post-tool-call({}) trapped",
+                    self.plugin_name, tool_name
+                )
+            })?;
+        Ok(wit_to_post_tool_action(action))
+    }
+
+    /// Call the plugin's exported `on-pre-llm-call` hook (observer).
+    pub async fn call_on_pre_llm_call(&self, messages_json: &str) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_on_pre_llm_call(&mut inner.store, messages_json)
+            .with_context(|| {
+                format!("plugin '{}' on-pre-llm-call trapped", self.plugin_name)
+            })?;
+        Ok(())
+    }
+
+    /// Call the plugin's exported `on-post-llm-call` hook (observer).
+    pub async fn call_on_post_llm_call(&self, response_json: &str) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_on_post_llm_call(&mut inner.store, response_json)
+            .with_context(|| {
+                format!("plugin '{}' on-post-llm-call trapped", self.plugin_name)
+            })?;
+        Ok(())
+    }
+
+    /// Call the plugin's exported `on-session-start` hook (observer).
+    pub async fn call_on_session_start(&self, session_id: &str) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_on_session_start(&mut inner.store, session_id)
+            .with_context(|| {
+                format!("plugin '{}' on-session-start trapped", self.plugin_name)
+            })?;
+        Ok(())
+    }
+
+    /// Call the plugin's exported `on-session-end` hook (observer).
+    pub async fn call_on_session_end(&self, session_id: &str) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_on_session_end(&mut inner.store, session_id)
+            .with_context(|| {
+                format!("plugin '{}' on-session-end trapped", self.plugin_name)
+            })?;
+        Ok(())
+    }
+}
+
+/// Map the bindgen-generated `PreToolCallAction` into our public
+/// Rust enum. Keeps the WIT shape internal so callers don't have to
+/// import the bindgen module.
+fn wit_to_pre_tool_action(
+    action: exports::fennec::plugin::plugin::PreToolCallAction,
+) -> crate::plugins::PreToolCallAction {
+    use exports::fennec::plugin::plugin::PreToolCallAction as Wit;
+    match action {
+        Wit::Continue => crate::plugins::PreToolCallAction::Continue,
+        Wit::Skip(reason) => crate::plugins::PreToolCallAction::Skip { reason },
+        Wit::Rewrite(args_json) => {
+            // The plugin returned a JSON-encoded args object. Parse
+            // it; on parse failure fall back to Continue with a warn
+            // log so a malformed plugin can't crash the agent.
+            match serde_json::from_str::<serde_json::Value>(&args_json) {
+                Ok(args) => crate::plugins::PreToolCallAction::Rewrite { args },
+                Err(e) => {
+                    tracing::warn!(
+                        "Plugin returned invalid JSON in pre-tool-call rewrite: {e}; treating as Continue"
+                    );
+                    crate::plugins::PreToolCallAction::Continue
+                }
+            }
+        }
+    }
+}
+
+/// Map the bindgen-generated `PostToolCallAction` into our public
+/// Rust enum.
+fn wit_to_post_tool_action(
+    action: exports::fennec::plugin::plugin::PostToolCallAction,
+) -> crate::plugins::PostToolCallAction {
+    use exports::fennec::plugin::plugin::PostToolCallAction as Wit;
+    match action {
+        Wit::Continue => crate::plugins::PostToolCallAction::Continue,
+        Wit::Rewrite(rw) => crate::plugins::PostToolCallAction::Rewrite {
+            output: rw.output,
+            success: rw.success,
+        },
+    }
 }
 
 /// Owned copy of the bindgen-generated `ToolSpec`. The bindgen type

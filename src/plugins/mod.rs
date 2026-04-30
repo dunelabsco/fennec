@@ -59,12 +59,19 @@
 
 mod context;
 mod demo;
+mod hooks;
 mod manifest;
 mod registry;
 mod traits;
 pub mod wasm;
 
 pub use context::PluginContext;
+pub use hooks::{
+    HookKind, HookRegistry, OnSessionEndHook, OnSessionStartHook, PostLlmCallEvent,
+    PostLlmCallHook, PostToolCallAction, PostToolCallEvent, PostToolCallHook,
+    PostToolResolution, PreLlmCallEvent, PreLlmCallHook, PreToolCallAction,
+    PreToolCallEvent, PreToolCallHook, PreToolResolution, SessionEvent,
+};
 pub use manifest::{PluginKind, PluginManifest};
 pub use registry::{LoadedPlugin, PluginRegistry, WasmHostResources};
 pub use traits::{Plugin, PluginEntry};

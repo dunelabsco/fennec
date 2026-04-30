@@ -25,6 +25,7 @@ use crate::security::path_sandbox::PathSandbox;
 use crate::tools::traits::Tool;
 
 use super::context::PluginContext;
+use super::hooks::HookRegistry;
 use super::manifest::PluginManifest;
 use super::traits::PluginEntry;
 use super::wasm::host::PluginHostState;
@@ -53,6 +54,7 @@ pub struct LoadedPlugin {
 pub struct PluginRegistry {
     loaded: Vec<LoadedPlugin>,
     tools: Vec<Box<dyn Tool>>,
+    hooks: HookRegistry,
 }
 
 impl PluginRegistry {
@@ -60,6 +62,7 @@ impl PluginRegistry {
         Self {
             loaded: Vec::new(),
             tools: Vec::new(),
+            hooks: HookRegistry::new(),
         }
     }
 
@@ -117,15 +120,40 @@ impl PluginRegistry {
             let mut ctx = PluginContext::new();
             match entry.plugin.register(&mut ctx) {
                 Ok(()) => {
-                    let tools = ctx.into_tools();
-                    let tool_count = tools.len();
+                    let parts = ctx.into_parts();
+                    let tool_count = parts.tools.len();
+                    let hook_count = parts.pre_tool_hooks.len()
+                        + parts.post_tool_hooks.len()
+                        + parts.pre_llm_hooks.len()
+                        + parts.post_llm_hooks.len()
+                        + parts.on_session_start_hooks.len()
+                        + parts.on_session_end_hooks.len();
                     tracing::info!(
                         plugin = %manifest.name,
                         version = %manifest.version,
                         tools = tool_count,
+                        hooks = hook_count,
                         "Loaded bundled plugin"
                     );
-                    self.tools.extend(tools);
+                    self.tools.extend(parts.tools);
+                    for h in parts.pre_tool_hooks {
+                        self.hooks.register_pre_tool(h);
+                    }
+                    for h in parts.post_tool_hooks {
+                        self.hooks.register_post_tool(h);
+                    }
+                    for h in parts.pre_llm_hooks {
+                        self.hooks.register_pre_llm(h);
+                    }
+                    for h in parts.post_llm_hooks {
+                        self.hooks.register_post_llm(h);
+                    }
+                    for h in parts.on_session_start_hooks {
+                        self.hooks.register_on_session_start(h);
+                    }
+                    for h in parts.on_session_end_hooks {
+                        self.hooks.register_on_session_end(h);
+                    }
                     self.loaded.push(LoadedPlugin {
                         manifest,
                         tool_count,
@@ -287,6 +315,15 @@ impl PluginRegistry {
                 }
             }
 
+            // Register lifecycle hooks that bridge into this WASM
+            // plugin. Each hook is a Rust closure that drives the
+            // async wasm call via `block_in_place + block_on`.
+            // Plugins that don't implement a particular export will
+            // trap when called; the closure logs the trap and falls
+            // back to a safe default (Continue for action hooks,
+            // no-op for observer hooks).
+            register_wasm_hooks(&mut self.hooks, Arc::clone(&instance), &resources.rt_handle);
+
             tracing::info!(
                 plugin = %name,
                 version = %d.manifest.version,
@@ -324,6 +361,159 @@ impl PluginRegistry {
     /// agent builder can consume. Consumes `self`.
     pub fn into_tools(self) -> Vec<Box<dyn Tool>> {
         self.tools
+    }
+
+    /// Split the registry into the things the agent builder
+    /// actually needs: the tool list + the [`HookRegistry`].
+    /// Preferred over `into_tools()` when the caller also wants
+    /// lifecycle hooks (which is everyone except a couple of
+    /// internal tests).
+    pub fn into_tools_and_hooks(self) -> (Vec<Box<dyn Tool>>, HookRegistry) {
+        (self.tools, self.hooks)
+    }
+}
+
+/// Register lifecycle hooks that route into a single WASM plugin
+/// instance.
+///
+/// Each callback is a sync `Fn` (the `HookRegistry` shape) that
+/// drives an async wasmtime call to completion via
+/// `block_in_place + block_on`. If the plugin doesn't implement the
+/// matching export, wasmtime traps; the trap is caught, logged, and
+/// the hook falls back to a safe default (Continue for action
+/// hooks, observer hooks become no-ops).
+fn register_wasm_hooks(
+    registry: &mut HookRegistry,
+    instance: Arc<WasmPluginInstance>,
+    rt_handle: &Handle,
+) {
+    // Plugin name captured for log context. The instance carries it
+    // already but closures can't easily move into generic fn args.
+    let plugin_name = instance.plugin_name.clone();
+
+    // ---- pre_tool_call ----
+    {
+        let inst = Arc::clone(&instance);
+        let rt = rt_handle.clone();
+        let name = plugin_name.clone();
+        registry.register_pre_tool(Arc::new(move |event| {
+            let args_json = event.args.to_string();
+            let result = tokio::task::block_in_place(|| {
+                rt.block_on(inst.call_on_pre_tool_call(event.tool_name, &args_json))
+            });
+            match result {
+                Ok(action) => action,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %name,
+                        tool = %event.tool_name,
+                        "WASM pre_tool_call hook failed: {e}; treating as Continue"
+                    );
+                    crate::plugins::PreToolCallAction::Continue
+                }
+            }
+        }));
+    }
+
+    // ---- post_tool_call ----
+    {
+        let inst = Arc::clone(&instance);
+        let rt = rt_handle.clone();
+        let name = plugin_name.clone();
+        registry.register_post_tool(Arc::new(move |event| {
+            let args_json = event.args.to_string();
+            let result = tokio::task::block_in_place(|| {
+                rt.block_on(inst.call_on_post_tool_call(
+                    event.tool_name,
+                    &args_json,
+                    event.output,
+                    event.success,
+                ))
+            });
+            match result {
+                Ok(action) => action,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %name,
+                        tool = %event.tool_name,
+                        "WASM post_tool_call hook failed: {e}; treating as Continue"
+                    );
+                    crate::plugins::PostToolCallAction::Continue
+                }
+            }
+        }));
+    }
+
+    // ---- pre_llm_call (observer) ----
+    {
+        let inst = Arc::clone(&instance);
+        let rt = rt_handle.clone();
+        let name = plugin_name.clone();
+        registry.register_pre_llm(Arc::new(move |event| {
+            let result = tokio::task::block_in_place(|| {
+                rt.block_on(inst.call_on_pre_llm_call(event.messages_json))
+            });
+            if let Err(e) = result {
+                tracing::warn!(
+                    plugin = %name,
+                    "WASM pre_llm_call hook failed: {e}"
+                );
+            }
+        }));
+    }
+
+    // ---- post_llm_call (observer) ----
+    {
+        let inst = Arc::clone(&instance);
+        let rt = rt_handle.clone();
+        let name = plugin_name.clone();
+        registry.register_post_llm(Arc::new(move |event| {
+            let result = tokio::task::block_in_place(|| {
+                rt.block_on(inst.call_on_post_llm_call(event.response_json))
+            });
+            if let Err(e) = result {
+                tracing::warn!(
+                    plugin = %name,
+                    "WASM post_llm_call hook failed: {e}"
+                );
+            }
+        }));
+    }
+
+    // ---- on_session_start (observer) ----
+    {
+        let inst = Arc::clone(&instance);
+        let rt = rt_handle.clone();
+        let name = plugin_name.clone();
+        registry.register_on_session_start(Arc::new(move |event| {
+            let result = tokio::task::block_in_place(|| {
+                rt.block_on(inst.call_on_session_start(event.session_id))
+            });
+            if let Err(e) = result {
+                tracing::warn!(
+                    plugin = %name,
+                    "WASM on_session_start hook failed: {e}"
+                );
+            }
+        }));
+    }
+
+    // ---- on_session_end (observer) ----
+    {
+        let inst = Arc::clone(&instance);
+        let rt = rt_handle.clone();
+        let name = plugin_name.clone();
+        registry.register_on_session_end(Arc::new(move |event| {
+            let result = tokio::task::block_in_place(|| {
+                rt.block_on(inst.call_on_session_end(event.session_id))
+            });
+            if let Err(e) = result {
+                tracing::warn!(
+                    plugin = %name,
+                    "WASM on_session_end hook failed: {e}"
+                );
+            }
+        }));
     }
 }
 
