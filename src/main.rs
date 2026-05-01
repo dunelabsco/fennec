@@ -739,13 +739,38 @@ async fn build_agent(
         builder = builder.collective(search);
     }
 
-    // Load skills from ~/.fennec/skills/, filter by PATH requirements, and
-    // inject. Returns empty Vec if the directory doesn't exist yet.
+    // Skills directory: seed bundled skills (best-effort), then load
+    // everything with full provenance and lifecycle state populated so
+    // the curator and `skill_manage` can distinguish bundled / hub /
+    // agent-created skills and respect pin/state flags.
     let skills_dir = home_dir.join("skills");
-    let loaded_skills = SkillsLoader::load_from_directory(&skills_dir)
-        .context("loading skills directory")?;
+    match fennec::skills::sync::sync_bundled(&skills_dir) {
+        Ok(counts) => tracing::info!(
+            considered = counts.considered,
+            installed = counts.installed,
+            updated = counts.updated,
+            skipped_customized = counts.skipped_customized,
+            skipped_deleted = counts.skipped_deleted,
+            up_to_date = counts.up_to_date,
+            errors = counts.errors,
+            "bundled skills synced",
+        ),
+        Err(e) => tracing::warn!(error = %e, "bundled skill sync failed; continuing"),
+    }
+
+    let usage_store = Arc::new(fennec::skills::UsageStore::open(&skills_dir));
+    let bundled_manifest = fennec::skills::BundledManifest::load(&skills_dir);
+    let hub_lock = fennec::skills::HubLock::load(&skills_dir);
+    let loaded_skills = SkillsLoader::load_with_provenance(
+        &skills_dir,
+        Some(&bundled_manifest),
+        Some(&hub_lock),
+        Some(&usage_store),
+    )
+    .context("loading skills directory")?;
     let available_skills: Vec<Skill> = SkillsLoader::filter_available(&loaded_skills)
         .into_iter()
+        .filter(|s| s.state != fennec::skills::SkillState::Archived)
         .cloned()
         .collect();
     tracing::info!(
@@ -757,7 +782,14 @@ async fn build_agent(
     let skills_prompt = SkillsLoader::build_skills_prompt(&available_skills);
     builder = builder
         .skills_prompt(skills_prompt)
-        .tool(Box::new(SkillsTool::new(available_skills)));
+        .tool(Box::new(SkillsTool::with_usage(
+            available_skills,
+            Arc::clone(&usage_store),
+        )))
+        .tool(Box::new(fennec::tools::SkillManageTool::new(
+            skills_dir.clone(),
+            Arc::clone(&usage_store),
+        )));
 
     // Wire DelegateTool so the agent can spawn read-only sub-agents for
     // bounded research / investigation tasks. Toolkit is intentionally
