@@ -97,6 +97,31 @@ enum Commands {
     Login,
     /// Run diagnostic checks — provider reachability, API key, memory DB, Plurum, config.
     Doctor,
+    /// Manage the skill curator — periodic background consolidation
+    /// of agent-created skills.
+    Curator {
+        #[command(subcommand)]
+        action: CuratorAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CuratorAction {
+    /// Print last-run timestamp, summary, paused state, and run count.
+    Status,
+    /// Run the curator now, ignoring the idle/interval gate.
+    Run,
+    /// Suspend automatic curator runs (manual `run` still works).
+    Pause,
+    /// Resume automatic curator runs.
+    Resume,
+    /// Pin a skill so it is exempt from auto-transitions and curator
+    /// consolidation.
+    Pin { name: String },
+    /// Remove a pin.
+    Unpin { name: String },
+    /// Restore a previously archived skill from `<home>/skills/.archive/`.
+    Restore { name: String },
 }
 
 /// Resolve the API key from config or provider-specific environment variable.
@@ -1291,9 +1316,134 @@ async fn main() -> Result<()> {
         Commands::Doctor => {
             run_doctor(&config, &home_dir).await?;
         }
+        Commands::Curator { action } => {
+            run_curator_command(&config, &home_dir, action).await?;
+        }
     }
 
     Ok(())
+}
+
+/// Dispatch a `fennec curator <action>` invocation. Each action
+/// touches at most three filesystem entries (skills root, usage
+/// sidecar, curator state file) so they are cheap to wire here
+/// without going through the full agent build.
+async fn run_curator_command(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+    action: CuratorAction,
+) -> Result<()> {
+    use fennec::skills::curator::{
+        CuratorScheduleConfig, CuratorStateStore, RunContext, run_curator,
+    };
+    use fennec::skills::{UsageStore, archive};
+
+    let skills_dir = home_dir.join("skills");
+    std::fs::create_dir_all(&skills_dir).context("ensuring skills dir exists")?;
+    let logs_dir = home_dir.join("logs");
+    let usage = Arc::new(UsageStore::open(&skills_dir));
+    let state = Arc::new(CuratorStateStore::open(&skills_dir));
+
+    match action {
+        CuratorAction::Status => {
+            let snap = state.snapshot();
+            println!("Curator status");
+            println!("  paused: {}", snap.paused);
+            println!("  run_count: {}", snap.run_count);
+            match snap.last_run_at {
+                Some(t) => {
+                    println!("  last_run_at: {}", t);
+                    println!("  last_run_duration: {:.2}s", snap.last_run_duration_seconds);
+                    println!("  last_run_summary: {}", snap.last_run_summary);
+                    if let Some(p) = &snap.last_report_path {
+                        println!("  last_report: {}", p.display());
+                    }
+                }
+                None => {
+                    println!("  last_run_at: never");
+                }
+            }
+            // Show schedule decision against current state for
+            // operator visibility.
+            let sched = CuratorScheduleConfig::default();
+            let decision = fennec::skills::curator::should_auto_run(
+                &sched,
+                &snap,
+                None,
+                chrono::Utc::now(),
+            );
+            match decision {
+                fennec::skills::curator::AutoRunDecision::Run => {
+                    println!("  next: would run on next idle session");
+                }
+                fennec::skills::curator::AutoRunDecision::Skip(reason) => {
+                    println!("  next: skipped — {}", reason.as_human_string());
+                }
+            }
+        }
+        CuratorAction::Run => {
+            let primary = build_provider_for_curator(config, home_dir).await?;
+            let aux = primary.map(|p| Arc::new(p));
+            let mut ctx = RunContext::new(
+                skills_dir.clone(),
+                logs_dir,
+                Arc::clone(&usage),
+                Arc::clone(&state),
+            );
+            ctx.aux = aux;
+            let summary = run_curator(&ctx).await?;
+            println!("Curator finished");
+            println!("  duration: {:.2}s", summary.duration_seconds);
+            println!("  summary: {}", summary.one_line_summary);
+            if let Some(p) = summary.report_dir {
+                println!("  report: {}", p.display());
+            }
+        }
+        CuratorAction::Pause => {
+            state.set_paused(true).context("setting paused flag")?;
+            println!("Curator paused. Manual `fennec curator run` still works.");
+        }
+        CuratorAction::Resume => {
+            state.set_paused(false).context("clearing paused flag")?;
+            println!("Curator resumed.");
+        }
+        CuratorAction::Pin { name } => {
+            usage.set_pinned(&name, true);
+            println!("Pinned {:?}.", name);
+        }
+        CuratorAction::Unpin { name } => {
+            usage.set_pinned(&name, false);
+            println!("Unpinned {:?}.", name);
+        }
+        CuratorAction::Restore { name } => {
+            let dest = archive::restore(&skills_dir, &name)
+                .with_context(|| format!("restoring {:?}", name))?;
+            usage.set_state(&name, fennec::skills::SkillState::Active);
+            println!("Restored {:?} to {}.", name, dest.display());
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the auxiliary client for the curator CLI command. Returns
+/// `Ok(None)` when the operator hasn't configured any provider — the
+/// curator falls back to auto-only mode rather than failing.
+async fn build_provider_for_curator(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) -> Result<Option<fennec::providers::AuxiliaryClient>> {
+    let secret_store = SecretStore::new(home_dir.to_path_buf())
+        .context("creating secret store for curator")?;
+    let api_key = match resolve_api_key(config, &secret_store) {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            tracing::info!("no provider key for curator — running auto-transition phase only");
+            return Ok(None);
+        }
+    };
+    let primary: Arc<dyn Provider> = build_provider(config, api_key, None).into();
+    Ok(Some(build_auxiliary_client(config, primary, &secret_store)))
 }
 
 async fn run_doctor(config: &FennecConfig, home_dir: &std::path::Path) -> Result<()> {

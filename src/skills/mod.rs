@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod curator;
 pub mod format;
 pub mod fuzzy;
 pub mod guard;
