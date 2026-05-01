@@ -15,6 +15,7 @@ pub struct FennecConfig {
     pub gateway: GatewayConfig,
     pub cron: CronConfig,
     pub collective: CollectiveConfig,
+    pub auxiliary: AuxiliaryConfigToml,
 }
 
 impl Default for FennecConfig {
@@ -29,8 +30,46 @@ impl Default for FennecConfig {
             gateway: GatewayConfig::default(),
             cron: CronConfig::default(),
             collective: CollectiveConfig::default(),
+            auxiliary: AuxiliaryConfigToml::default(),
         }
     }
+}
+
+/// Per-task auxiliary client config. One subsection per built-in
+/// background-task kind plus a free-form `custom` map for plugin
+/// task names. All fields default to empty/zero — meaning "auto"
+/// resolution (walk the fallback chain) and provider-default
+/// timeouts. Existing installs without an `[auxiliary]` section
+/// see no behavior change.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AuxiliaryConfigToml {
+    pub curator: AuxiliaryTaskToml,
+    pub compression: AuxiliaryTaskToml,
+    pub web_extract: AuxiliaryTaskToml,
+    pub vision: AuxiliaryTaskToml,
+    pub session_search: AuxiliaryTaskToml,
+    pub smart_approval: AuxiliaryTaskToml,
+    pub title: AuxiliaryTaskToml,
+    /// Free-form per-task overrides keyed by task name. Plugin
+    /// background tasks register their custom name here.
+    pub custom: std::collections::HashMap<String, AuxiliaryTaskToml>,
+}
+
+/// Per-task config row.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AuxiliaryTaskToml {
+    /// Provider name (`"auto"` or a specific name like `"openai"`).
+    /// Empty/missing is treated as `"auto"`.
+    pub provider: String,
+    /// Task-specific model override. Empty = use whatever the
+    /// resolved provider's default is.
+    pub model: String,
+    /// Per-call timeout in seconds. `0` = use the provider's own
+    /// default. Useful for slow providers or large context windows
+    /// where the default is too short.
+    pub timeout_secs: u64,
 }
 
 impl FennecConfig {
