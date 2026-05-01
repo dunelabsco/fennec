@@ -3,13 +3,25 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use super::format::{
+    RESERVED_DIR_ENTRIES, SkillLayout, SkillProvenance, SkillState, validate_category,
+    validate_skill_name,
+};
+use super::manifest::{BundledManifest, HubLock};
+
 /// Max bytes we'll accept for a skill file. Skill markdown is short by
 /// convention — 1 MiB is orders of magnitude above anything realistic and
 /// keeps an attacker-planted huge file from OOMing the process at startup.
 const MAX_SKILL_FILE_BYTES: u64 = 1 * 1024 * 1024;
 
-/// A skill loaded from a markdown file with YAML frontmatter.
-#[derive(Debug, Clone)]
+/// A skill loaded from disk.
+///
+/// Skills come from one of two on-disk layouts (see `SkillLayout`):
+/// flat `.md` files at the top level, or directory-format folders that
+/// can carry `references/`, `templates/`, `scripts/`, `assets/` subfiles.
+/// Both share the same in-memory shape so callers (the prompt builder,
+/// the `load_skill` tool, the curator) treat them uniformly.
+#[derive(Debug, Clone, Default)]
 pub struct Skill {
     /// Machine-readable skill name.
     pub name: String,
@@ -21,6 +33,23 @@ pub struct Skill {
     pub always: bool,
     /// External commands that must be available in PATH.
     pub requirements: Vec<String>,
+    /// On-disk layout (flat file or directory). Populated by the loader;
+    /// `None` for `Skill` instances constructed in-memory by tests or
+    /// callers that don't care about disk paths.
+    #[doc(hidden)]
+    pub layout: Option<SkillLayout>,
+    /// Where this skill came from (bundled / hub-installed / agent-
+    /// created). Defaults to `AgentCreated`.
+    #[doc(hidden)]
+    pub provenance: SkillProvenance,
+    /// Lifecycle state pulled from the usage sidecar at load time.
+    /// Defaults to `Active` when no record exists.
+    #[doc(hidden)]
+    pub state: SkillState,
+    /// Whether the user has pinned this skill (exempt from automatic
+    /// transitions). Pulled from the usage sidecar at load time.
+    #[doc(hidden)]
+    pub pinned: bool,
 }
 
 /// Wire shape of the YAML frontmatter block at the top of every skill file.
@@ -50,25 +79,52 @@ struct FrontMatter {
 pub struct SkillsLoader;
 
 impl SkillsLoader {
-    /// Load all `*.md` skill files from the given directory.
+    /// Load every skill from the given directory, walking both layouts:
     ///
-    /// Each file is expected to have YAML frontmatter between `---` fences
-    /// followed by markdown content.
+    ///   - **flat**: `<dir>/<name>.md` (current bundled-skill format).
+    ///   - **directory**: `<dir>/<name>/SKILL.md` and
+    ///     `<dir>/<category>/<name>/SKILL.md`, with optional supporting
+    ///     subdirectories (`references/`, `templates/`, `scripts/`,
+    ///     `assets/`).
     ///
-    /// Hardening applied per file, BEFORE reading contents:
-    ///   - **symlink filter**: a symlink pointing at `~/.ssh/id_rsa` (or
-    ///     anything outside the skills dir) is skipped with a warn-level
-    ///     log. The old path would read it and log the first line as
-    ///     "invalid skill" content, which is a data-exfiltration vector
-    ///     on multi-user machines.
+    /// Hardening applied at every level:
+    ///   - **symlink filter**: any symlink (file *or* directory) is
+    ///     skipped. A symlink pointing at `~/.ssh/id_rsa` would
+    ///     otherwise be read and have its first line logged as "invalid
+    ///     skill" content — a data-exfiltration vector on multi-user
+    ///     machines.
     ///   - **size cap**: files larger than `MAX_SKILL_FILE_BYTES` are
     ///     skipped. Prevents startup OOM on an attacker-planted huge file.
+    ///   - **reserved-name skip**: `.archive/`, `.hub/`, `.usage.json`,
+    ///     `.bundled_manifest`, `.curator_state` and any dotfile under
+    ///     the root are ignored — these are sidecar state, not skills.
     ///
-    /// Per-file errors are logged and skipped — a single broken file must
-    /// never block the whole skill-loading phase.
+    /// Per-skill errors are logged and skipped — a single broken file
+    /// must never block the whole load phase.
+    ///
+    /// All skills are returned with default provenance / state / pinned
+    /// values. To populate provenance and lifecycle state from the
+    /// bundled manifest, hub lock, and usage sidecar, call
+    /// [`Self::load_with_provenance`].
     pub fn load_from_directory(path: &Path) -> Result<Vec<Skill>> {
-        let mut skills = Vec::new();
+        Self::load_with_provenance(path, None, None, None)
+    }
 
+    /// Same as [`Self::load_from_directory`] but populates each loaded
+    /// skill's `provenance` (from the bundled manifest and hub lock) and
+    /// `state` / `pinned` (from the usage sidecar) when those are
+    /// available.
+    ///
+    /// Pass `None` for any input to skip that source — bundled skills
+    /// will then default to `AgentCreated` provenance, and lifecycle
+    /// fields default to `Active` / unpinned.
+    pub fn load_with_provenance(
+        path: &Path,
+        bundled: Option<&BundledManifest>,
+        hub: Option<&HubLock>,
+        usage: Option<&super::usage::UsageStore>,
+    ) -> Result<Vec<Skill>> {
+        let mut skills = Vec::new();
         if !path.is_dir() {
             return Ok(skills);
         }
@@ -81,81 +137,251 @@ impl SkillsLoader {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::warn!(
-                        "Skipping unreadable entry in skills dir {}: {}",
-                        path.display(),
-                        e
+                        dir = %path.display(),
+                        error = %e,
+                        "skipping unreadable entry in skills dir"
                     );
                     continue;
                 }
             };
-            let file_path = entry.path();
+            let entry_path = entry.path();
+            let file_name = match entry_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
 
-            if file_path.extension().and_then(|e| e.to_str()) != Some("md") {
+            // Skip dotfiles and reserved sidecar entries unconditionally.
+            if file_name.starts_with('.')
+                || RESERVED_DIR_ENTRIES.contains(&file_name)
+            {
                 continue;
             }
 
-            // symlink_metadata does NOT follow symlinks, so we can
-            // distinguish real files from links pointed elsewhere.
-            let meta = match std::fs::symlink_metadata(&file_path) {
+            let meta = match std::fs::symlink_metadata(&entry_path) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(
-                        "Skipping skill file {}: stat failed: {}",
-                        file_path.display(),
-                        e
+                        path = %entry_path.display(),
+                        error = %e,
+                        "skipping skills entry: stat failed"
                     );
                     continue;
                 }
             };
-
             let ft = meta.file_type();
             if ft.is_symlink() {
                 tracing::warn!(
-                    "Skipping symlink in skills directory: {}",
-                    file_path.display()
-                );
-                continue;
-            }
-            if !ft.is_file() {
-                // e.g. directory named `foo.md`, or a device node — ignore.
-                continue;
-            }
-
-            if meta.len() > MAX_SKILL_FILE_BYTES {
-                tracing::warn!(
-                    "Skipping oversized skill file {} ({} bytes, cap {})",
-                    file_path.display(),
-                    meta.len(),
-                    MAX_SKILL_FILE_BYTES
+                    path = %entry_path.display(),
+                    "skipping symlink in skills directory"
                 );
                 continue;
             }
 
-            let raw = match std::fs::read_to_string(&file_path) {
-                Ok(s) => s,
-                Err(e) => {
+            if ft.is_file() {
+                if entry_path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                if meta.len() > MAX_SKILL_FILE_BYTES {
                     tracing::warn!(
-                        "Skipping unreadable skill file {}: {}",
-                        file_path.display(),
-                        e
+                        path = %entry_path.display(),
+                        bytes = meta.len(),
+                        cap = MAX_SKILL_FILE_BYTES,
+                        "skipping oversized flat skill file"
                     );
                     continue;
                 }
-            };
+                match Self::load_flat_skill(&entry_path) {
+                    Ok(skill) => skills.push(skill),
+                    Err(e) => tracing::warn!(
+                        path = %entry_path.display(),
+                        error = %e,
+                        "skipping invalid flat skill"
+                    ),
+                }
+            } else if ft.is_dir() {
+                Self::walk_dir_entry(&entry_path, None, &mut skills);
+            }
+        }
 
-            match Self::parse_skill(&raw) {
-                Ok(skill) => skills.push(skill),
-                Err(e) => {
-                    tracing::warn!(
-                        "Skipping invalid skill file {}: {}",
-                        file_path.display(),
-                        e
-                    );
+        // Apply provenance and lifecycle state based on the on-disk
+        // sidecars after every skill is loaded. Doing this in a second
+        // pass keeps the walker self-contained.
+        for s in &mut skills {
+            if let Some(b) = bundled {
+                if b.contains(&s.name) {
+                    s.provenance = SkillProvenance::Bundled;
+                }
+            }
+            if let Some(h) = hub {
+                if h.contains(&s.name) {
+                    // Hub wins over bundled: a hub install of a name
+                    // that happens to overlap a bundled skill is
+                    // attributable to the user's install action.
+                    s.provenance = SkillProvenance::HubInstalled;
+                }
+            }
+            if let Some(u) = usage {
+                if let Some(rec) = u.get(&s.name) {
+                    s.state = rec.state;
+                    s.pinned = rec.pinned;
                 }
             }
         }
 
         Ok(skills)
+    }
+
+    /// Walk a single subdirectory under `<root>/skills/`. Either it is
+    /// itself a directory-format skill (`SKILL.md` at this level) or it
+    /// is a category folder containing one or more directory-format
+    /// skills (`<category>/<name>/SKILL.md`).
+    ///
+    /// `current_category` is `None` at the top level and `Some("…")`
+    /// when we recurse into a category. Nesting beyond one level is
+    /// flagged and skipped — skills don't live three levels deep.
+    fn walk_dir_entry(
+        dir: &Path,
+        current_category: Option<&str>,
+        skills: &mut Vec<Skill>,
+    ) {
+        let dir_name = match dir.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => return,
+        };
+        let skill_md = dir.join("SKILL.md");
+        if skill_md.is_file() {
+            // This subdirectory IS a skill. Validate its name.
+            if let Err(e) = validate_skill_name(dir_name) {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "skipping directory skill: invalid name"
+                );
+                return;
+            }
+            match Self::load_directory_skill(
+                dir,
+                dir_name,
+                current_category.map(str::to_string),
+            ) {
+                Ok(skill) => skills.push(skill),
+                Err(e) => tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "skipping invalid directory skill"
+                ),
+            }
+            return;
+        }
+
+        // Not a skill itself. If we're already inside a category, give
+        // up — categories don't nest.
+        if current_category.is_some() {
+            tracing::warn!(
+                path = %dir.display(),
+                "skipping deeply-nested directory: skills do not nest beyond one category level"
+            );
+            return;
+        }
+
+        // Treat as a category folder. Walk children one level deep.
+        if let Err(e) = validate_category(dir_name) {
+            tracing::warn!(
+                path = %dir.display(),
+                error = %e,
+                "skipping category folder: invalid name"
+            );
+            return;
+        }
+
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "skipping unreadable category folder"
+                );
+                return;
+            }
+        };
+        for child in entries.flatten() {
+            let child_path = child.path();
+            let child_name = match child_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if child_name.starts_with('.') {
+                continue;
+            }
+            let cm = match std::fs::symlink_metadata(&child_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if cm.file_type().is_symlink() {
+                tracing::warn!(
+                    path = %child_path.display(),
+                    "skipping symlink under category folder"
+                );
+                continue;
+            }
+            if cm.file_type().is_dir() {
+                Self::walk_dir_entry(&child_path, Some(dir_name), skills);
+            }
+        }
+    }
+
+    /// Read a flat `<name>.md` skill file from `path`.
+    fn load_flat_skill(path: &Path) -> Result<Skill> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading flat skill {}", path.display()))?;
+        let mut skill = Self::parse_skill(&raw)?;
+        // Skill names from flat files derive from frontmatter, not the
+        // filename, but we still validate them so directory-format
+        // tools can rely on a consistent name shape.
+        if let Err(e) = validate_skill_name(&skill.name) {
+            anyhow::bail!("skill name {:?} invalid: {}", skill.name, e);
+        }
+        skill.layout = Some(SkillLayout::Flat {
+            file: path.to_path_buf(),
+        });
+        Ok(skill)
+    }
+
+    /// Read a `<dir>/SKILL.md` directory-format skill.
+    fn load_directory_skill(
+        dir: &Path,
+        dir_name: &str,
+        category: Option<String>,
+    ) -> Result<Skill> {
+        let skill_md = dir.join("SKILL.md");
+        let meta = std::fs::metadata(&skill_md)
+            .with_context(|| format!("stat-ing {}", skill_md.display()))?;
+        if meta.len() > MAX_SKILL_FILE_BYTES {
+            anyhow::bail!(
+                "SKILL.md too large ({} bytes, cap {})",
+                meta.len(),
+                MAX_SKILL_FILE_BYTES
+            );
+        }
+        let raw = std::fs::read_to_string(&skill_md)
+            .with_context(|| format!("reading {}", skill_md.display()))?;
+        let mut skill = Self::parse_skill(&raw)?;
+        // For directory skills, frontmatter `name` and the directory
+        // name must agree — otherwise a rename outside the tool would
+        // produce a phantom name mismatch the curator can't resolve.
+        if skill.name != dir_name {
+            anyhow::bail!(
+                "frontmatter name {:?} does not match directory name {:?}",
+                skill.name,
+                dir_name
+            );
+        }
+        skill.layout = Some(SkillLayout::Directory {
+            dir: dir.to_path_buf(),
+            category,
+        });
+        Ok(skill)
     }
 
     /// Parse a single skill from its raw markdown+frontmatter text.
@@ -164,7 +390,7 @@ impl SkillsLoader {
     /// with optional `\r` before the newline). Everything in between is
     /// fed to a real YAML parser; everything after the closing fence is
     /// the markdown body.
-    fn parse_skill(raw: &str) -> Result<Skill> {
+    pub(crate) fn parse_skill(raw: &str) -> Result<Skill> {
         // Strip an optional UTF-8 BOM so editors that insert one don't
         // cause the opening fence check to fail.
         let raw = raw.trim_start_matches('\u{feff}');
@@ -217,6 +443,7 @@ impl SkillsLoader {
             content: body,
             always: fm.always,
             requirements: fm.requirements,
+            ..Default::default()
         })
     }
 
@@ -272,6 +499,7 @@ fn which_exists(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::UsageStore;
 
     #[test]
     fn test_parse_skill_basic() {
@@ -338,6 +566,7 @@ Content.
                 content: "Always content here.".to_string(),
                 always: true,
                 requirements: vec![],
+                ..Default::default()
             },
             Skill {
                 name: "optional-skill".to_string(),
@@ -345,6 +574,7 @@ Content.
                 content: "Optional content.".to_string(),
                 always: false,
                 requirements: vec![],
+                ..Default::default()
             },
         ];
 
@@ -366,6 +596,7 @@ Content.
             content: "Content.".to_string(),
             always: false,
             requirements: vec![],
+            ..Default::default()
         }];
 
         let available = SkillsLoader::filter_available(&skills);
@@ -579,5 +810,304 @@ After
         let skills = SkillsLoader::load_from_directory(&skills_dir).unwrap();
         let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["good"]);
+    }
+
+    // -- Directory-format walker ------------------------------------
+
+    /// `<root>/foo/SKILL.md` should load as a directory skill.
+    #[test]
+    fn loads_directory_skill_at_top_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let foo = tmp.path().join("foo");
+        std::fs::create_dir(&foo).unwrap();
+        std::fs::write(
+            foo.join("SKILL.md"),
+            "---\nname: foo\ndescription: ok\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills = SkillsLoader::load_from_directory(tmp.path()).unwrap();
+        assert_eq!(skills.len(), 1);
+        let s = &skills[0];
+        assert_eq!(s.name, "foo");
+        match s.layout.as_ref().unwrap() {
+            SkillLayout::Directory { dir, category } => {
+                assert_eq!(dir, &foo);
+                assert!(category.is_none());
+            }
+            _ => panic!("expected directory layout, got {:?}", s.layout),
+        }
+    }
+
+    /// `<root>/<category>/<name>/SKILL.md` should load with category set.
+    #[test]
+    fn loads_directory_skill_in_category() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = tmp.path().join("productivity");
+        let foo = cat.join("foo");
+        std::fs::create_dir_all(&foo).unwrap();
+        std::fs::write(
+            foo.join("SKILL.md"),
+            "---\nname: foo\ndescription: ok\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills = SkillsLoader::load_from_directory(tmp.path()).unwrap();
+        assert_eq!(skills.len(), 1);
+        let s = &skills[0];
+        assert_eq!(s.name, "foo");
+        assert_eq!(s.layout.as_ref().unwrap().category(), Some("productivity"));
+    }
+
+    /// Directory skill with `references/` and `scripts/` should still
+    /// load — only SKILL.md is read, supporting files don't break it.
+    #[test]
+    fn directory_skill_with_subfiles_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let foo = tmp.path().join("foo");
+        std::fs::create_dir_all(foo.join("references")).unwrap();
+        std::fs::create_dir_all(foo.join("scripts")).unwrap();
+        std::fs::write(
+            foo.join("SKILL.md"),
+            "---\nname: foo\ndescription: ok\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(foo.join("references").join("api.md"), "ref body").unwrap();
+        std::fs::write(foo.join("scripts").join("run.sh"), "#!/bin/sh\n").unwrap();
+
+        let skills = SkillsLoader::load_from_directory(tmp.path()).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "foo");
+    }
+
+    /// Mixed flat + directory format in the same root must both load.
+    #[test]
+    fn mixed_flat_and_directory_load_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("flat-one.md"),
+            "---\nname: flat-one\ndescription: ok\n---\nbody\n",
+        )
+        .unwrap();
+        let dir = tmp.path().join("dir-one");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: dir-one\ndescription: ok\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mut names: Vec<_> = SkillsLoader::load_from_directory(tmp.path())
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["dir-one", "flat-one"]);
+    }
+
+    /// `.archive/`, `.hub/`, `.usage.json`, and `.bundled_manifest`
+    /// must never be walked.
+    #[test]
+    fn reserved_dir_entries_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Plant a "skill" inside .archive/ — it should be ignored.
+        let arch = tmp.path().join(".archive").join("ghost");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::write(
+            arch.join("SKILL.md"),
+            "---\nname: ghost\ndescription: ok\n---\nbody\n",
+        )
+        .unwrap();
+        // Same for .hub/.
+        let hub = tmp.path().join(".hub").join("alsoghost");
+        std::fs::create_dir_all(&hub).unwrap();
+        std::fs::write(
+            hub.join("SKILL.md"),
+            "---\nname: alsoghost\ndescription: ok\n---\nbody\n",
+        )
+        .unwrap();
+        // .usage.json and .bundled_manifest are at the root.
+        std::fs::write(tmp.path().join(".usage.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join(".bundled_manifest"), "").unwrap();
+
+        let skills = SkillsLoader::load_from_directory(tmp.path()).unwrap();
+        let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"ghost"), "archived skill leaked");
+        assert!(!names.contains(&"alsoghost"), "hub skill leaked");
+    }
+
+    /// A directory skill whose SKILL.md `name:` does not match the
+    /// directory name must be rejected — silently renaming a directory
+    /// outside the tool would otherwise produce a phantom mismatch.
+    #[test]
+    fn directory_skill_name_mismatch_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("expected-name");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: different-name\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills = SkillsLoader::load_from_directory(tmp.path()).unwrap();
+        assert!(skills.is_empty(), "expected mismatch to be skipped");
+    }
+
+    /// Categories don't nest. `<root>/cat1/cat2/foo/SKILL.md` is
+    /// rejected: the loader walks at most one category level.
+    #[test]
+    fn nested_categories_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("cat1").join("cat2").join("foo");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: foo\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills = SkillsLoader::load_from_directory(tmp.path()).unwrap();
+        assert!(
+            skills.is_empty(),
+            "double-nested skill should be skipped, got {:?}",
+            skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// A directory under <root> that has no SKILL.md is treated as a
+    /// category folder. If it contains no skills either, the load is
+    /// silent (no warning, no panic).
+    #[test]
+    fn empty_category_folder_is_silently_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("empty-cat")).unwrap();
+        let skills = SkillsLoader::load_from_directory(tmp.path()).unwrap();
+        assert!(skills.is_empty());
+    }
+
+    /// A directory-format skill whose dir name fails validate_skill_name
+    /// (e.g. uppercase) must be skipped.
+    #[test]
+    fn directory_skill_invalid_dirname_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("Foo"); // uppercase
+        std::fs::create_dir(&bad).unwrap();
+        std::fs::write(
+            bad.join("SKILL.md"),
+            "---\nname: Foo\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+        let skills = SkillsLoader::load_from_directory(tmp.path()).unwrap();
+        assert!(skills.is_empty());
+    }
+
+    /// load_with_provenance assigns Bundled provenance to skills listed
+    /// in the bundled manifest, and AgentCreated to others.
+    #[test]
+    fn provenance_populated_from_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("alpha.md"),
+            "---\nname: alpha\ndescription: a\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("beta.md"),
+            "---\nname: beta\ndescription: b\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mut bundled = BundledManifest::default();
+        bundled.set("alpha", "abc");
+        let hub = HubLock::default();
+
+        let skills =
+            SkillsLoader::load_with_provenance(tmp.path(), Some(&bundled), Some(&hub), None)
+                .unwrap();
+        let by_name: std::collections::HashMap<_, _> =
+            skills.iter().map(|s| (s.name.as_str(), s)).collect();
+        assert_eq!(
+            by_name.get("alpha").unwrap().provenance,
+            SkillProvenance::Bundled
+        );
+        assert_eq!(
+            by_name.get("beta").unwrap().provenance,
+            SkillProvenance::AgentCreated
+        );
+    }
+
+    /// Hub provenance overrides bundled when both manifests claim the
+    /// same name (the user's install action takes precedence).
+    #[test]
+    fn hub_provenance_overrides_bundled() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("conflict.md"),
+            "---\nname: conflict\ndescription: c\n---\nbody\n",
+        )
+        .unwrap();
+        let mut bundled = BundledManifest::default();
+        bundled.set("conflict", "abc");
+        let mut hub = HubLock::default();
+        hub.installed
+            .insert("conflict".into(), serde_json::json!({"source": "github"}));
+
+        let skills =
+            SkillsLoader::load_with_provenance(tmp.path(), Some(&bundled), Some(&hub), None)
+                .unwrap();
+        assert_eq!(skills[0].provenance, SkillProvenance::HubInstalled);
+    }
+
+    /// load_with_provenance pulls state and pinned from the usage
+    /// sidecar when an UsageStore is provided.
+    #[test]
+    fn state_and_pinned_pulled_from_usage_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("alpha.md"),
+            "---\nname: alpha\ndescription: a\n---\nbody\n",
+        )
+        .unwrap();
+
+        let store = UsageStore::open(tmp.path());
+        store.bump_use("alpha");
+        store.set_state("alpha", SkillState::Stale);
+        store.set_pinned("alpha", true);
+
+        let skills =
+            SkillsLoader::load_with_provenance(tmp.path(), None, None, Some(&store)).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].state, SkillState::Stale);
+        assert!(skills[0].pinned);
+    }
+
+    /// Symlinked subdirectories must be skipped (data-exfiltration
+    /// hardening at the directory level, not just the file level).
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Real skill dir outside the skills root.
+        let external = tmp.path().join("real-skill");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(
+            external.join("SKILL.md"),
+            "---\nname: leak\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills_root = tmp.path().join("skills");
+        std::fs::create_dir(&skills_root).unwrap();
+        let link = skills_root.join("victim");
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+
+        let skills = SkillsLoader::load_from_directory(&skills_root).unwrap();
+        assert!(
+            skills.is_empty(),
+            "symlinked skill directory should not load, got {:?}",
+            skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     }
 }

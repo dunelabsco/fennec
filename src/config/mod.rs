@@ -1,2 +1,4 @@
 pub mod schema;
-pub use schema::FennecConfig;
+pub use schema::{
+    AuxiliaryConfigToml, AuxiliaryTaskToml, FennecConfig, ProviderConfig,
+};
