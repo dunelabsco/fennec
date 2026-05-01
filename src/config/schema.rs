@@ -16,6 +16,7 @@ pub struct FennecConfig {
     pub cron: CronConfig,
     pub collective: CollectiveConfig,
     pub auxiliary: AuxiliaryConfigToml,
+    pub skills: SkillsConfigToml,
 }
 
 impl Default for FennecConfig {
@@ -31,8 +32,40 @@ impl Default for FennecConfig {
             cron: CronConfig::default(),
             collective: CollectiveConfig::default(),
             auxiliary: AuxiliaryConfigToml::default(),
+            skills: SkillsConfigToml::default(),
         }
     }
+}
+
+/// Configuration for the skills subsystem. The `[skills]` section is
+/// optional; defaults match prior behavior (guard off for agent
+/// writes).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SkillsConfigToml {
+    pub guard: SkillsGuardConfigToml,
+}
+
+/// Static safety scanner configuration. When `guard_agent_created`
+/// is true, the agent's `skill_manage` writes are scanned and
+/// refused on a `Dangerous` verdict. `disabled_categories` and
+/// `disabled_rules` opt out of specific checks for deployments
+/// where they produce false positives.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SkillsGuardConfigToml {
+    /// Run the scanner on every agent-created write. Default false:
+    /// the agent already has shell access, so scanning its own
+    /// writes is partial mitigation; the operator opts in.
+    pub guard_agent_created: bool,
+    /// Category names to skip. Valid: exfiltration, prompt_injection,
+    /// destructive, persistence, network, obfuscation, process_exec,
+    /// path_traversal, crypto_mining, supply_chain,
+    /// privilege_escalation, credential_exposure.
+    pub disabled_categories: Vec<String>,
+    /// Specific rule names to skip (e.g.
+    /// "supply_pip_unpinned" if your installs are routinely unpinned).
+    pub disabled_rules: Vec<String>,
 }
 
 /// Per-task auxiliary client config. One subsection per built-in

@@ -780,16 +780,21 @@ async fn build_agent(
         "skills loaded",
     );
     let skills_prompt = SkillsLoader::build_skills_prompt(&available_skills);
+    let guard_config =
+        fennec::skills::guard::GuardConfig::from_toml(&config.skills.guard);
     builder = builder
         .skills_prompt(skills_prompt)
         .tool(Box::new(SkillsTool::with_usage(
             available_skills,
             Arc::clone(&usage_store),
         )))
-        .tool(Box::new(fennec::tools::SkillManageTool::new(
-            skills_dir.clone(),
-            Arc::clone(&usage_store),
-        )));
+        .tool(Box::new(
+            fennec::tools::SkillManageTool::new(
+                skills_dir.clone(),
+                Arc::clone(&usage_store),
+            )
+            .with_guard(guard_config),
+        ));
 
     // Wire DelegateTool so the agent can spawn read-only sub-agents for
     // bounded research / investigation tasks. Toolkit is intentionally
