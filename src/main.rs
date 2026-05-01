@@ -14,7 +14,7 @@ use fennec::collective::mock::MockCollective;
 use fennec::collective::plurum::PlurumlClient;
 use fennec::collective::search::CollectiveSearch;
 use fennec::collective::traits::CollectiveLayer;
-use fennec::config::FennecConfig;
+use fennec::config::{FennecConfig, ProviderConfig};
 use fennec::cron::{CronScheduler, JobStore};
 use fennec::gateway::GatewayServer;
 use fennec::memory::embedding::{NoopEmbedding, OpenAIEmbedding};
@@ -121,6 +121,121 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
 
     std::env::var(env_var)
         .with_context(|| format!("API key not found: set provider.api_key in config or {} env var", env_var))
+}
+
+/// Build the auxiliary client. Used by background tasks (curator,
+/// future title generation, smart-approval LLM, etc.) so they
+/// don't dirty the main provider's prompt cache or pay primary-
+/// model rates.
+///
+/// Resolution chain:
+///
+///  1. The user's primary provider always leads — single-key setups
+///     work without extra config.
+///  2. Opportunistic entries for whichever other provider keys are
+///     configured (env vars or `[provider] api_key`). We call
+///     `build_provider` with each backend's name so the resulting
+///     `Arc<dyn Provider>` shares the existing routing logic.
+///
+/// Vision chain mirrors the text chain but skips Ollama (we don't
+/// currently model multimodal capability per provider, so the
+/// vision chain just excludes the local-only provider).
+fn build_auxiliary_client(
+    config: &FennecConfig,
+    primary: Arc<dyn Provider>,
+    secret_store: &SecretStore,
+) -> fennec::providers::AuxiliaryClient {
+    let mut text_chain: Vec<fennec::providers::ChainEntry> = Vec::new();
+    let mut vision_chain: Vec<fennec::providers::ChainEntry> = Vec::new();
+
+    // Primary always first.
+    let primary_name = config.provider.name.clone();
+    let primary_entry = fennec::providers::ChainEntry {
+        name: primary_name.clone(),
+        provider: primary,
+    };
+    text_chain.push(primary_entry.clone());
+    if primary_name != "ollama" {
+        vision_chain.push(primary_entry);
+    }
+
+    // Opportunistic additions. Each branch checks whether a key is
+    // available from env (the primary's `[provider] api_key` is
+    // already used above; here we check ONLY env vars to avoid
+    // double-adding the primary when the configured api_key
+    // happens to match an env var key).
+    let try_add = |name: &str,
+                   env_var: &str,
+                   text_chain: &mut Vec<fennec::providers::ChainEntry>,
+                   vision_chain: &mut Vec<fennec::providers::ChainEntry>,
+                   include_vision: bool| {
+        if text_chain.iter().any(|e| e.name == name) {
+            return; // already covered by primary
+        }
+        let key = match std::env::var(env_var) {
+            Ok(k) if !k.is_empty() => k,
+            _ => return,
+        };
+        // Build a config-on-the-fly so build_provider picks the right
+        // shape for each backend (Anthropic native vs OpenAI-compat).
+        let aux_config = FennecConfig {
+            provider: ProviderConfig {
+                name: name.to_string(),
+                model: String::new(), // empty → provider's own default
+                api_key: String::new(), // not used; we pass key directly
+                base_url: String::new(),
+                temperature: 0.7,
+                max_tokens: 8192,
+                fallback_models: Vec::new(),
+            },
+            ..config.clone()
+        };
+        let provider_box = build_provider(&aux_config, key, None);
+        let provider: Arc<dyn Provider> = Arc::from(provider_box);
+        let entry = fennec::providers::ChainEntry {
+            name: name.to_string(),
+            provider,
+        };
+        text_chain.push(entry.clone());
+        if include_vision {
+            vision_chain.push(entry);
+        }
+    };
+
+    try_add(
+        "openrouter",
+        "OPENROUTER_API_KEY",
+        &mut text_chain,
+        &mut vision_chain,
+        true,
+    );
+    try_add(
+        "anthropic",
+        "ANTHROPIC_API_KEY",
+        &mut text_chain,
+        &mut vision_chain,
+        true,
+    );
+    try_add(
+        "openai",
+        "OPENAI_API_KEY",
+        &mut text_chain,
+        &mut vision_chain,
+        true,
+    );
+    try_add(
+        "kimi",
+        "KIMI_API_KEY",
+        &mut text_chain,
+        &mut vision_chain,
+        false, // Kimi vision support is variable; conservative skip
+    );
+    let _ = secret_store; // reserved for future encrypted-aux-key
+                          // resolution; placeholder so callers can
+                          // pass it without breaking when we wire it.
+
+    let aux_config = fennec::providers::AuxiliaryConfig::from_toml(&config.auxiliary);
+    fennec::providers::AuxiliaryClient::new(aux_config, text_chain, vision_chain)
 }
 
 /// Build the LLM provider based on config.
@@ -257,6 +372,18 @@ async fn build_agent(
     // (which needs its own handle for sub-agent runs) while still being
     // passed into the AgentBuilder.
     let provider: Arc<dyn Provider> = Arc::from(provider);
+
+    // Build the auxiliary client chain. Primary provider goes
+    // first (so single-key setups Just Work), then opportunistic
+    // entries for whichever provider env vars are also set. The
+    // vision chain excludes Ollama (no vision support) and any
+    // provider not known to handle multimodal input.
+    let aux_client = build_auxiliary_client(
+        &config,
+        Arc::clone(&provider),
+        &secret_store,
+    );
+    let aux_client = Arc::new(aux_client);
 
     // Create embedding provider based on config.
     let embedder: Arc<dyn fennec::memory::embedding::EmbeddingProvider> =
@@ -657,6 +784,7 @@ async fn build_agent(
         .memory_context_limit(config.memory.context_limit)
         .half_life_days(config.memory.half_life_days)
         .prompt_guard(prompt_guard)
+        .auxiliary_client(Arc::clone(&aux_client))
         .build()
         .context("building agent")?;
 
