@@ -79,6 +79,7 @@ impl ChatMessage {
 }
 
 /// A request to the chat API.
+#[derive(Clone, Copy)]
 pub struct ChatRequest<'a> {
     pub system: Option<&'a str>,
     pub messages: &'a [ChatMessage],

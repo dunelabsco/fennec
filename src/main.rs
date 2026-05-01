@@ -14,7 +14,7 @@ use fennec::collective::mock::MockCollective;
 use fennec::collective::plurum::PlurumlClient;
 use fennec::collective::search::CollectiveSearch;
 use fennec::collective::traits::CollectiveLayer;
-use fennec::config::FennecConfig;
+use fennec::config::{FennecConfig, ProviderConfig};
 use fennec::cron::{CronScheduler, JobStore};
 use fennec::gateway::GatewayServer;
 use fennec::memory::embedding::{NoopEmbedding, OpenAIEmbedding};
@@ -97,6 +97,31 @@ enum Commands {
     Login,
     /// Run diagnostic checks — provider reachability, API key, memory DB, Plurum, config.
     Doctor,
+    /// Manage the skill curator — periodic background consolidation
+    /// of agent-created skills.
+    Curator {
+        #[command(subcommand)]
+        action: CuratorAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CuratorAction {
+    /// Print last-run timestamp, summary, paused state, and run count.
+    Status,
+    /// Run the curator now, ignoring the idle/interval gate.
+    Run,
+    /// Suspend automatic curator runs (manual `run` still works).
+    Pause,
+    /// Resume automatic curator runs.
+    Resume,
+    /// Pin a skill so it is exempt from auto-transitions and curator
+    /// consolidation.
+    Pin { name: String },
+    /// Remove a pin.
+    Unpin { name: String },
+    /// Restore a previously archived skill from `<home>/skills/.archive/`.
+    Restore { name: String },
 }
 
 /// Resolve the API key from config or provider-specific environment variable.
@@ -121,6 +146,121 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
 
     std::env::var(env_var)
         .with_context(|| format!("API key not found: set provider.api_key in config or {} env var", env_var))
+}
+
+/// Build the auxiliary client. Used by background tasks (curator,
+/// future title generation, smart-approval LLM, etc.) so they
+/// don't dirty the main provider's prompt cache or pay primary-
+/// model rates.
+///
+/// Resolution chain:
+///
+///  1. The user's primary provider always leads — single-key setups
+///     work without extra config.
+///  2. Opportunistic entries for whichever other provider keys are
+///     configured (env vars or `[provider] api_key`). We call
+///     `build_provider` with each backend's name so the resulting
+///     `Arc<dyn Provider>` shares the existing routing logic.
+///
+/// Vision chain mirrors the text chain but skips Ollama (we don't
+/// currently model multimodal capability per provider, so the
+/// vision chain just excludes the local-only provider).
+fn build_auxiliary_client(
+    config: &FennecConfig,
+    primary: Arc<dyn Provider>,
+    secret_store: &SecretStore,
+) -> fennec::providers::AuxiliaryClient {
+    let mut text_chain: Vec<fennec::providers::ChainEntry> = Vec::new();
+    let mut vision_chain: Vec<fennec::providers::ChainEntry> = Vec::new();
+
+    // Primary always first.
+    let primary_name = config.provider.name.clone();
+    let primary_entry = fennec::providers::ChainEntry {
+        name: primary_name.clone(),
+        provider: primary,
+    };
+    text_chain.push(primary_entry.clone());
+    if primary_name != "ollama" {
+        vision_chain.push(primary_entry);
+    }
+
+    // Opportunistic additions. Each branch checks whether a key is
+    // available from env (the primary's `[provider] api_key` is
+    // already used above; here we check ONLY env vars to avoid
+    // double-adding the primary when the configured api_key
+    // happens to match an env var key).
+    let try_add = |name: &str,
+                   env_var: &str,
+                   text_chain: &mut Vec<fennec::providers::ChainEntry>,
+                   vision_chain: &mut Vec<fennec::providers::ChainEntry>,
+                   include_vision: bool| {
+        if text_chain.iter().any(|e| e.name == name) {
+            return; // already covered by primary
+        }
+        let key = match std::env::var(env_var) {
+            Ok(k) if !k.is_empty() => k,
+            _ => return,
+        };
+        // Build a config-on-the-fly so build_provider picks the right
+        // shape for each backend (Anthropic native vs OpenAI-compat).
+        let aux_config = FennecConfig {
+            provider: ProviderConfig {
+                name: name.to_string(),
+                model: String::new(), // empty → provider's own default
+                api_key: String::new(), // not used; we pass key directly
+                base_url: String::new(),
+                temperature: 0.7,
+                max_tokens: 8192,
+                fallback_models: Vec::new(),
+            },
+            ..config.clone()
+        };
+        let provider_box = build_provider(&aux_config, key, None);
+        let provider: Arc<dyn Provider> = Arc::from(provider_box);
+        let entry = fennec::providers::ChainEntry {
+            name: name.to_string(),
+            provider,
+        };
+        text_chain.push(entry.clone());
+        if include_vision {
+            vision_chain.push(entry);
+        }
+    };
+
+    try_add(
+        "openrouter",
+        "OPENROUTER_API_KEY",
+        &mut text_chain,
+        &mut vision_chain,
+        true,
+    );
+    try_add(
+        "anthropic",
+        "ANTHROPIC_API_KEY",
+        &mut text_chain,
+        &mut vision_chain,
+        true,
+    );
+    try_add(
+        "openai",
+        "OPENAI_API_KEY",
+        &mut text_chain,
+        &mut vision_chain,
+        true,
+    );
+    try_add(
+        "kimi",
+        "KIMI_API_KEY",
+        &mut text_chain,
+        &mut vision_chain,
+        false, // Kimi vision support is variable; conservative skip
+    );
+    let _ = secret_store; // reserved for future encrypted-aux-key
+                          // resolution; placeholder so callers can
+                          // pass it without breaking when we wire it.
+
+    let aux_config = fennec::providers::AuxiliaryConfig::from_toml(&config.auxiliary);
+    fennec::providers::AuxiliaryClient::new(aux_config, text_chain, vision_chain)
 }
 
 /// Build the LLM provider based on config.
@@ -257,6 +397,18 @@ async fn build_agent(
     // (which needs its own handle for sub-agent runs) while still being
     // passed into the AgentBuilder.
     let provider: Arc<dyn Provider> = Arc::from(provider);
+
+    // Build the auxiliary client chain. Primary provider goes
+    // first (so single-key setups Just Work), then opportunistic
+    // entries for whichever provider env vars are also set. The
+    // vision chain excludes Ollama (no vision support) and any
+    // provider not known to handle multimodal input.
+    let aux_client = build_auxiliary_client(
+        &config,
+        Arc::clone(&provider),
+        &secret_store,
+    );
+    let aux_client = Arc::new(aux_client);
 
     // Create embedding provider based on config.
     let embedder: Arc<dyn fennec::memory::embedding::EmbeddingProvider> =
@@ -612,13 +764,38 @@ async fn build_agent(
         builder = builder.collective(search);
     }
 
-    // Load skills from ~/.fennec/skills/, filter by PATH requirements, and
-    // inject. Returns empty Vec if the directory doesn't exist yet.
+    // Skills directory: seed bundled skills (best-effort), then load
+    // everything with full provenance and lifecycle state populated so
+    // the curator and `skill_manage` can distinguish bundled / hub /
+    // agent-created skills and respect pin/state flags.
     let skills_dir = home_dir.join("skills");
-    let loaded_skills = SkillsLoader::load_from_directory(&skills_dir)
-        .context("loading skills directory")?;
+    match fennec::skills::sync::sync_bundled(&skills_dir) {
+        Ok(counts) => tracing::info!(
+            considered = counts.considered,
+            installed = counts.installed,
+            updated = counts.updated,
+            skipped_customized = counts.skipped_customized,
+            skipped_deleted = counts.skipped_deleted,
+            up_to_date = counts.up_to_date,
+            errors = counts.errors,
+            "bundled skills synced",
+        ),
+        Err(e) => tracing::warn!(error = %e, "bundled skill sync failed; continuing"),
+    }
+
+    let usage_store = Arc::new(fennec::skills::UsageStore::open(&skills_dir));
+    let bundled_manifest = fennec::skills::BundledManifest::load(&skills_dir);
+    let hub_lock = fennec::skills::HubLock::load(&skills_dir);
+    let loaded_skills = SkillsLoader::load_with_provenance(
+        &skills_dir,
+        Some(&bundled_manifest),
+        Some(&hub_lock),
+        Some(&usage_store),
+    )
+    .context("loading skills directory")?;
     let available_skills: Vec<Skill> = SkillsLoader::filter_available(&loaded_skills)
         .into_iter()
+        .filter(|s| s.state != fennec::skills::SkillState::Archived)
         .cloned()
         .collect();
     tracing::info!(
@@ -628,9 +805,21 @@ async fn build_agent(
         "skills loaded",
     );
     let skills_prompt = SkillsLoader::build_skills_prompt(&available_skills);
+    let guard_config =
+        fennec::skills::guard::GuardConfig::from_toml(&config.skills.guard);
     builder = builder
         .skills_prompt(skills_prompt)
-        .tool(Box::new(SkillsTool::new(available_skills)));
+        .tool(Box::new(SkillsTool::with_usage(
+            available_skills,
+            Arc::clone(&usage_store),
+        )))
+        .tool(Box::new(
+            fennec::tools::SkillManageTool::new(
+                skills_dir.clone(),
+                Arc::clone(&usage_store),
+            )
+            .with_guard(guard_config),
+        ));
 
     // Wire DelegateTool so the agent can spawn read-only sub-agents for
     // bounded research / investigation tasks. Toolkit is intentionally
@@ -657,6 +846,7 @@ async fn build_agent(
         .memory_context_limit(config.memory.context_limit)
         .half_life_days(config.memory.half_life_days)
         .prompt_guard(prompt_guard)
+        .auxiliary_client(Arc::clone(&aux_client))
         .build()
         .context("building agent")?;
 
@@ -1126,9 +1316,134 @@ async fn main() -> Result<()> {
         Commands::Doctor => {
             run_doctor(&config, &home_dir).await?;
         }
+        Commands::Curator { action } => {
+            run_curator_command(&config, &home_dir, action).await?;
+        }
     }
 
     Ok(())
+}
+
+/// Dispatch a `fennec curator <action>` invocation. Each action
+/// touches at most three filesystem entries (skills root, usage
+/// sidecar, curator state file) so they are cheap to wire here
+/// without going through the full agent build.
+async fn run_curator_command(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+    action: CuratorAction,
+) -> Result<()> {
+    use fennec::skills::curator::{
+        CuratorScheduleConfig, CuratorStateStore, RunContext, run_curator,
+    };
+    use fennec::skills::{UsageStore, archive};
+
+    let skills_dir = home_dir.join("skills");
+    std::fs::create_dir_all(&skills_dir).context("ensuring skills dir exists")?;
+    let logs_dir = home_dir.join("logs");
+    let usage = Arc::new(UsageStore::open(&skills_dir));
+    let state = Arc::new(CuratorStateStore::open(&skills_dir));
+
+    match action {
+        CuratorAction::Status => {
+            let snap = state.snapshot();
+            println!("Curator status");
+            println!("  paused: {}", snap.paused);
+            println!("  run_count: {}", snap.run_count);
+            match snap.last_run_at {
+                Some(t) => {
+                    println!("  last_run_at: {}", t);
+                    println!("  last_run_duration: {:.2}s", snap.last_run_duration_seconds);
+                    println!("  last_run_summary: {}", snap.last_run_summary);
+                    if let Some(p) = &snap.last_report_path {
+                        println!("  last_report: {}", p.display());
+                    }
+                }
+                None => {
+                    println!("  last_run_at: never");
+                }
+            }
+            // Show schedule decision against current state for
+            // operator visibility.
+            let sched = CuratorScheduleConfig::default();
+            let decision = fennec::skills::curator::should_auto_run(
+                &sched,
+                &snap,
+                None,
+                chrono::Utc::now(),
+            );
+            match decision {
+                fennec::skills::curator::AutoRunDecision::Run => {
+                    println!("  next: would run on next idle session");
+                }
+                fennec::skills::curator::AutoRunDecision::Skip(reason) => {
+                    println!("  next: skipped — {}", reason.as_human_string());
+                }
+            }
+        }
+        CuratorAction::Run => {
+            let primary = build_provider_for_curator(config, home_dir).await?;
+            let aux = primary.map(|p| Arc::new(p));
+            let mut ctx = RunContext::new(
+                skills_dir.clone(),
+                logs_dir,
+                Arc::clone(&usage),
+                Arc::clone(&state),
+            );
+            ctx.aux = aux;
+            let summary = run_curator(&ctx).await?;
+            println!("Curator finished");
+            println!("  duration: {:.2}s", summary.duration_seconds);
+            println!("  summary: {}", summary.one_line_summary);
+            if let Some(p) = summary.report_dir {
+                println!("  report: {}", p.display());
+            }
+        }
+        CuratorAction::Pause => {
+            state.set_paused(true).context("setting paused flag")?;
+            println!("Curator paused. Manual `fennec curator run` still works.");
+        }
+        CuratorAction::Resume => {
+            state.set_paused(false).context("clearing paused flag")?;
+            println!("Curator resumed.");
+        }
+        CuratorAction::Pin { name } => {
+            usage.set_pinned(&name, true);
+            println!("Pinned {:?}.", name);
+        }
+        CuratorAction::Unpin { name } => {
+            usage.set_pinned(&name, false);
+            println!("Unpinned {:?}.", name);
+        }
+        CuratorAction::Restore { name } => {
+            let dest = archive::restore(&skills_dir, &name)
+                .with_context(|| format!("restoring {:?}", name))?;
+            usage.set_state(&name, fennec::skills::SkillState::Active);
+            println!("Restored {:?} to {}.", name, dest.display());
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the auxiliary client for the curator CLI command. Returns
+/// `Ok(None)` when the operator hasn't configured any provider — the
+/// curator falls back to auto-only mode rather than failing.
+async fn build_provider_for_curator(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) -> Result<Option<fennec::providers::AuxiliaryClient>> {
+    let secret_store = SecretStore::new(home_dir.to_path_buf())
+        .context("creating secret store for curator")?;
+    let api_key = match resolve_api_key(config, &secret_store) {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            tracing::info!("no provider key for curator — running auto-transition phase only");
+            return Ok(None);
+        }
+    };
+    let primary: Arc<dyn Provider> = build_provider(config, api_key, None).into();
+    Ok(Some(build_auxiliary_client(config, primary, &secret_store)))
 }
 
 async fn run_doctor(config: &FennecConfig, home_dir: &std::path::Path) -> Result<()> {

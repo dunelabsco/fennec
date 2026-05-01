@@ -53,6 +53,10 @@ url = "2.5"
 # Maintained fork of the (now unmaintained) serde_yaml crate. Used for
 # parsing YAML frontmatter in skill files.
 serde_yaml_ng = "0.10"
+# Embed the repo's bundled skills/ directory into the fennec binary at
+# compile time so a fresh install ships with the full bundled-skill set
+# without a separate install step.
+include_dir = "0.7"
 
 [dev-dependencies]
 tempfile = "3.15"
