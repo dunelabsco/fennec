@@ -15,6 +15,8 @@ pub struct FennecConfig {
     pub gateway: GatewayConfig,
     pub cron: CronConfig,
     pub collective: CollectiveConfig,
+    pub auxiliary: AuxiliaryConfigToml,
+    pub skills: SkillsConfigToml,
 }
 
 impl Default for FennecConfig {
@@ -29,8 +31,78 @@ impl Default for FennecConfig {
             gateway: GatewayConfig::default(),
             cron: CronConfig::default(),
             collective: CollectiveConfig::default(),
+            auxiliary: AuxiliaryConfigToml::default(),
+            skills: SkillsConfigToml::default(),
         }
     }
+}
+
+/// Configuration for the skills subsystem. The `[skills]` section is
+/// optional; defaults match prior behavior (guard off for agent
+/// writes).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SkillsConfigToml {
+    pub guard: SkillsGuardConfigToml,
+}
+
+/// Static safety scanner configuration. When `guard_agent_created`
+/// is true, the agent's `skill_manage` writes are scanned and
+/// refused on a `Dangerous` verdict. `disabled_categories` and
+/// `disabled_rules` opt out of specific checks for deployments
+/// where they produce false positives.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SkillsGuardConfigToml {
+    /// Run the scanner on every agent-created write. Default false:
+    /// the agent already has shell access, so scanning its own
+    /// writes is partial mitigation; the operator opts in.
+    pub guard_agent_created: bool,
+    /// Category names to skip. Valid: exfiltration, prompt_injection,
+    /// destructive, persistence, network, obfuscation, process_exec,
+    /// path_traversal, crypto_mining, supply_chain,
+    /// privilege_escalation, credential_exposure.
+    pub disabled_categories: Vec<String>,
+    /// Specific rule names to skip (e.g.
+    /// "supply_pip_unpinned" if your installs are routinely unpinned).
+    pub disabled_rules: Vec<String>,
+}
+
+/// Per-task auxiliary client config. One subsection per built-in
+/// background-task kind plus a free-form `custom` map for plugin
+/// task names. All fields default to empty/zero — meaning "auto"
+/// resolution (walk the fallback chain) and provider-default
+/// timeouts. Existing installs without an `[auxiliary]` section
+/// see no behavior change.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AuxiliaryConfigToml {
+    pub curator: AuxiliaryTaskToml,
+    pub compression: AuxiliaryTaskToml,
+    pub web_extract: AuxiliaryTaskToml,
+    pub vision: AuxiliaryTaskToml,
+    pub session_search: AuxiliaryTaskToml,
+    pub smart_approval: AuxiliaryTaskToml,
+    pub title: AuxiliaryTaskToml,
+    /// Free-form per-task overrides keyed by task name. Plugin
+    /// background tasks register their custom name here.
+    pub custom: std::collections::HashMap<String, AuxiliaryTaskToml>,
+}
+
+/// Per-task config row.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AuxiliaryTaskToml {
+    /// Provider name (`"auto"` or a specific name like `"openai"`).
+    /// Empty/missing is treated as `"auto"`.
+    pub provider: String,
+    /// Task-specific model override. Empty = use whatever the
+    /// resolved provider's default is.
+    pub model: String,
+    /// Per-call timeout in seconds. `0` = use the provider's own
+    /// default. Useful for slow providers or large context windows
+    /// where the default is too short.
+    pub timeout_secs: u64,
 }
 
 impl FennecConfig {

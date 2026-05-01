@@ -6,6 +6,7 @@ pub mod openrouter;
 pub mod ollama;
 pub mod reliable;
 pub mod router;
+pub mod auxiliary;
 
 pub use traits::{Provider, ChatMessage, ChatRequest, ChatResponse, ToolCall, StreamEvent};
 pub use openai::OpenAIProvider;
@@ -13,3 +14,4 @@ pub use openrouter::OpenRouterProvider;
 pub use ollama::OllamaProvider;
 pub use reliable::ReliableProvider;
 pub use router::{RouterProvider, ModelSwitchTool};
+pub use auxiliary::{AuxiliaryClient, AuxiliaryConfig, AuxiliaryTaskConfig, ChainEntry, TaskKind};

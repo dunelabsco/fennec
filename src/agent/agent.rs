@@ -39,6 +39,13 @@ pub struct Agent {
     total_output_tokens: u64,
     total_cache_read_tokens: u64,
     turn_count: u64,
+    /// Auxiliary client for background tasks (curator, future
+    /// title generation, smart-approval LLM, etc.). Not used in
+    /// the main turn loop — kept here so consumers (curator,
+    /// plugin context) can grab a handle. Empty client when no
+    /// auxiliary providers are available; call sites check
+    /// `is_available()` before dispatching.
+    auxiliary_client: Arc<crate::providers::AuxiliaryClient>,
 }
 
 impl Agent {
@@ -422,6 +429,14 @@ impl Agent {
     }
 
     /// Get a reference to the shared provider.
+    /// Handle to the auxiliary client. Curator + future background
+    /// tasks call into this for non-prompt-cache-polluting LLM
+    /// calls. Always present (empty client when no providers are
+    /// available); call sites should `is_available()` first.
+    pub fn auxiliary_client(&self) -> &Arc<crate::providers::AuxiliaryClient> {
+        &self.auxiliary_client
+    }
+
     pub fn provider(&self) -> &Arc<dyn Provider> {
         &self.provider
     }
@@ -461,6 +476,7 @@ pub struct AgentBuilder {
     prompt_guard: Option<PromptGuard>,
     collective: Option<Arc<CollectiveSearch>>,
     skills_prompt: Option<String>,
+    auxiliary_client: Option<Arc<crate::providers::AuxiliaryClient>>,
 }
 
 impl AgentBuilder {
@@ -479,7 +495,20 @@ impl AgentBuilder {
             prompt_guard: None,
             collective: None,
             skills_prompt: None,
+            auxiliary_client: None,
         }
+    }
+
+    /// Wire in an auxiliary client. If not set, `Agent::build`
+    /// substitutes an empty client so consumers (curator, plugin
+    /// background tasks) can always call `auxiliary_client()` and
+    /// check `is_available()` without a None-check.
+    pub fn auxiliary_client(
+        mut self,
+        client: Arc<crate::providers::AuxiliaryClient>,
+    ) -> Self {
+        self.auxiliary_client = Some(client);
+        self
     }
 
     pub fn provider(mut self, provider: impl Into<Arc<dyn Provider>>) -> Self {
@@ -593,6 +622,17 @@ impl AgentBuilder {
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
             turn_count: 0,
+            // Empty AuxiliaryClient is constructible and usable —
+            // `is_available()` returns false, `call_for` returns
+            // an error. Consumers check `is_available()` before
+            // using it.
+            auxiliary_client: self.auxiliary_client.unwrap_or_else(|| {
+                Arc::new(crate::providers::AuxiliaryClient::new(
+                    crate::providers::AuxiliaryConfig::default(),
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }),
         })
     }
 }
