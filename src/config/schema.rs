@@ -198,6 +198,7 @@ pub struct ChannelsConfig {
     pub slack: SlackChannelEntry,
     pub whatsapp: WhatsAppChannelEntry,
     pub email: EmailChannelEntry,
+    pub webhook: WebhookChannelEntry,
 }
 
 impl Default for ChannelsConfig {
@@ -208,8 +209,105 @@ impl Default for ChannelsConfig {
             slack: SlackChannelEntry::default(),
             whatsapp: WhatsAppChannelEntry::default(),
             email: EmailChannelEntry::default(),
+            webhook: WebhookChannelEntry::default(),
         }
     }
+}
+
+/// Generic HTTP webhook channel: receives POSTs from external
+/// systems (CI, monitoring, GitHub/GitLab events, etc.), validates
+/// HMAC signatures, renders a prompt template against the payload,
+/// and feeds the result to the agent loop. Outbound is a no-op:
+/// webhooks are inbound-only, with replies routed through other
+/// configured channels (telegram/discord/slack/etc.) by the agent's
+/// regular send-message flow.
+///
+/// Routes are defined in `[channels.webhook.routes.<name>]`. Each
+/// route has its own secret (HMAC), event allowlist, prompt
+/// template, and optional skill list. A global secret in
+/// `channels.webhook.secret` acts as the fallback when a route
+/// doesn't supply its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhookChannelEntry {
+    /// Master switch. Off means the HTTP server doesn't bind at all.
+    pub enabled: bool,
+    /// HTTP listen address. Default `0.0.0.0` so the server is
+    /// reachable from the network; tighten to `127.0.0.1` for
+    /// local-only.
+    pub host: String,
+    /// HTTP listen port. Default 8644 matches the upstream default.
+    pub port: u16,
+    /// Optional global HMAC secret used when a route doesn't define
+    /// its own. Empty disables global fallback (each route must set
+    /// `secret`).
+    pub secret: String,
+    /// Idempotency cache TTL in seconds. Webhooks frequently retry
+    /// on failure; we de-dup by `(route, body-hash)` for this
+    /// window so a duplicate POST doesn't double-fire the agent.
+    /// Default 3600 (1 hour). Set 0 to disable.
+    pub idempotency_ttl_secs: u64,
+    /// Per-route rate limit, requests per minute. Default 30. The
+    /// limiter is a fixed-window counter; bursts within one minute
+    /// past this number get a 429 response.
+    pub rate_limit_per_minute: u32,
+    /// Per-route configuration map. The route name is the URL
+    /// segment: `POST /webhook/<name>`.
+    pub routes: std::collections::HashMap<String, WebhookRouteEntry>,
+}
+
+impl Default for WebhookChannelEntry {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "0.0.0.0".into(),
+            port: 8644,
+            secret: String::new(),
+            idempotency_ttl_secs: 3600,
+            rate_limit_per_minute: 30,
+            routes: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Configuration for one webhook route under
+/// `[channels.webhook.routes.<name>]`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WebhookRouteEntry {
+    /// Per-route HMAC secret. Falls back to `channels.webhook.secret`
+    /// when empty. The literal string `INSECURE_NO_AUTH` skips
+    /// signature checks entirely — only for testing on a trusted
+    /// network. A startup warning is logged when a route uses it.
+    pub secret: String,
+    /// Optional event-type allowlist. Empty means "all events
+    /// pass". For GitHub the event type is read from the
+    /// `X-GitHub-Event` header; for GitLab from `X-Gitlab-Event`;
+    /// otherwise from a top-level `event_type` field in the JSON
+    /// body.
+    pub events: Vec<String>,
+    /// Prompt template rendered against the JSON payload. Supports
+    /// dot-notation placeholders: `{pull_request.title}` looks up
+    /// `payload["pull_request"]["title"]`. Missing keys render as
+    /// the empty string with a debug log; the agent receives the
+    /// rendered prompt as a user message.
+    pub prompt: String,
+    /// Optional list of skill names to load before the agent
+    /// answers. Skills are loaded on top of the always-on set; the
+    /// route can scope work to a specific tool surface.
+    pub skills: Vec<String>,
+    /// Where the rendered prompt's response should be delivered.
+    /// Possible values: `"log"` (just log the response, no
+    /// outbound message — the default), `"telegram"` / `"discord"`
+    /// / `"slack"` / `"email"` (route through that channel via the
+    /// usual send pipeline; needs `deliver_target` to specify
+    /// `chat_id`).
+    pub deliver: String,
+    /// Free-form metadata for the deliver path: `chat_id` for
+    /// telegram/discord/slack, `to` for email, GitHub repo + PR
+    /// number for `github_comment` (later phase). Stored as a
+    /// string→string map for now to avoid schema lock-in.
+    pub deliver_extra: std::collections::HashMap<String, String>,
 }
 
 /// Generic channel entry (Telegram, Discord).

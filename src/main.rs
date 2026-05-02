@@ -827,6 +827,16 @@ async fn run_gateway(
         tracing::info!("Email channel enabled");
     }
 
+    if let Some(ch) = fennec::channels::WebhookChannel::from_config(&ch_config.webhook) {
+        channels.push(Arc::new(ch));
+        tracing::info!(
+            host = %ch_config.webhook.host,
+            port = ch_config.webhook.port,
+            routes = ch_config.webhook.routes.len(),
+            "Webhook channel enabled"
+        );
+    }
+
     // 3a. Populate the channel map so tools (e.g. ask_user) can reach channels.
     {
         let mut map = channel_map.write();
