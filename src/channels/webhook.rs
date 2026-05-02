@@ -18,13 +18,30 @@
 //! against the JSON payload, and synthesizes an inbound message
 //! that arrives at the bus tagged `channel = "webhook:<route>"`.
 //!
-//! HMAC formats supported (in priority order):
-//!   - GitHub: `X-Hub-Signature-256: sha256=<hex>` over the raw
-//!     request body
-//!   - GitLab: `X-Gitlab-Token: <secret>` (plain shared secret, not
-//!     a HMAC, but the upstream behavior is the same — match against
-//!     the route's secret)
-//!   - Generic: `X-Webhook-Signature: sha256=<hex>` over the raw body
+//! Signature formats supported (in priority order, per a fresh
+//! check of GitHub and GitLab live docs):
+//!
+//!   1. **Standard Webhooks** (GitLab's recommended new mode, also
+//!      Svix and others): three headers `webhook-id`,
+//!      `webhook-timestamp`, `webhook-signature: v1,<base64>`. The
+//!      signed message is `{id}.{timestamp}.{body}`. The secret is
+//!      `whsec_<base64>`; we strip the prefix and base64-decode to
+//!      get the raw HMAC key. Multiple space-delimited signatures
+//!      are accepted (key rotation). The `webhook-timestamp` must
+//!      be within `STANDARD_WEBHOOKS_TOLERANCE_SECS` of now.
+//!   2. **GitHub**: `X-Hub-Signature-256: sha256=<hex>` —
+//!      HMAC-SHA256 over the raw request body, secret used directly.
+//!   3. **GitLab legacy "Secret Token"**: `X-Gitlab-Token: <token>`,
+//!      plain shared-secret comparison. Weaker than the above but
+//!      still GitLab's default for older webhooks.
+//!   4. **Generic**: `X-Webhook-Signature: sha256=<hex>` —
+//!      GitHub-shaped HMAC for non-GitHub sources.
+//!
+//! GitHub's deprecated `X-Hub-Signature` (HMAC-SHA1) is intentionally
+//! not supported. SHA-1 is cryptographically broken and GitHub
+//! itself recommends `-256` only; accepting `-1` would weaken the
+//! security posture for negligible compatibility gain (every active
+//! GitHub webhook sends both headers; we just ignore the SHA-1 one).
 //!
 //! Idempotency: the channel keeps a per-process LRU keyed by
 //! `(route_name, body_sha256)`. If a duplicate (route, body) arrives
@@ -50,6 +67,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -70,6 +88,12 @@ pub const INSECURE_NO_AUTH: &str = "INSECURE_NO_AUTH";
 /// Default fallback when a route doesn't set `prompt`. Just relays
 /// the payload as JSON.
 pub const DEFAULT_PROMPT: &str = "Webhook event {event} on route {route}: {payload}";
+
+/// Tolerance window for `webhook-timestamp` in the Standard Webhooks
+/// signature scheme. Requests whose timestamp is more than this many
+/// seconds away from local clock are rejected as replay attempts.
+/// 5 minutes matches the typical recommendation from the spec.
+pub const STANDARD_WEBHOOKS_TOLERANCE_SECS: i64 = 300;
 
 /// The webhook channel, owning its config snapshot and the per-
 /// process state (idempotency cache + rate-limiter buckets).
@@ -408,38 +432,130 @@ async fn webhook_handler(
 }
 
 /// Verify a webhook signature against the body using the supplied
-/// secret. Tries (in order) GitHub-style `X-Hub-Signature-256`,
-/// GitLab-style `X-Gitlab-Token` (plain shared-secret comparison,
-/// not a HMAC), then generic `X-Webhook-Signature`.
+/// secret. Priority order:
+///
+///   1. Standard Webhooks (GitLab signing-token, Svix, etc.) when
+///      all three `webhook-*` headers are present.
+///   2. GitHub `X-Hub-Signature-256`.
+///   3. GitLab legacy `X-Gitlab-Token` (plain shared-secret
+///      comparison, kept for backward compatibility with older
+///      GitLab "Secret Token" webhooks).
+///   4. Generic `X-Webhook-Signature` (HMAC-SHA256 same as GitHub).
 pub fn verify_signature(secret: &str, body: &[u8], headers: &HeaderMap) -> bool {
-    // GitHub: HMAC-SHA256 of body, hex-encoded, prefixed `sha256=`.
+    // 1. Standard Webhooks: detected by presence of `webhook-signature`.
+    if headers.get("webhook-signature").is_some() {
+        return verify_standard_webhooks(secret, body, headers);
+    }
+    // 2. GitHub: HMAC-SHA256 of body, hex-encoded, prefixed `sha256=`.
     if let Some(sig) = headers
         .get("X-Hub-Signature-256")
         .and_then(|v| v.to_str().ok())
     {
         let hex = sig.strip_prefix("sha256=").unwrap_or(sig);
-        return verify_hmac(secret, body, hex);
+        return verify_hmac_hex(secret.as_bytes(), body, hex);
     }
-    // GitLab: token-only header. The whole point of GitLab's
-    // webhook signature is "shared secret in a header", and we
-    // honor that even though it's weaker than HMAC-of-body.
+    // 3. GitLab legacy: token-only header.
     if let Some(token) = headers.get("X-Gitlab-Token").and_then(|v| v.to_str().ok()) {
         return constant_time_eq(secret.as_bytes(), token.as_bytes());
     }
-    // Generic: HMAC-SHA256 of body. Same shape as GitHub but
-    // differently-named header.
+    // 4. Generic: HMAC-SHA256 of body, GitHub-shaped header.
     if let Some(sig) = headers
         .get("X-Webhook-Signature")
         .and_then(|v| v.to_str().ok())
     {
         let hex = sig.strip_prefix("sha256=").unwrap_or(sig);
-        return verify_hmac(secret, body, hex);
+        return verify_hmac_hex(secret.as_bytes(), body, hex);
     }
     false
 }
 
-fn verify_hmac(secret: &str, body: &[u8], expected_hex: &str) -> bool {
-    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+/// Verify a Standard Webhooks signature. Required headers:
+/// `webhook-id`, `webhook-timestamp`, `webhook-signature`. Returns
+/// `false` on any malformed input — the caller can't tell parsing
+/// failure from signature failure, but for an inbound HTTP request
+/// either should produce 401.
+///
+/// `secret` is the user's webhook secret as configured. Per the
+/// spec, the "real" key is `secret` with the `whsec_` prefix
+/// stripped and the remainder base64-decoded. If `secret` doesn't
+/// have the prefix we treat it as already-raw key bytes; this
+/// keeps configurations friendly for users who don't know the
+/// prefix convention.
+fn verify_standard_webhooks(secret: &str, body: &[u8], headers: &HeaderMap) -> bool {
+    let webhook_id = match headers.get("webhook-id").and_then(|v| v.to_str().ok()) {
+        Some(s) => s,
+        None => return false,
+    };
+    let webhook_ts = match headers.get("webhook-timestamp").and_then(|v| v.to_str().ok()) {
+        Some(s) => s,
+        None => return false,
+    };
+    let signature_header = match headers.get("webhook-signature").and_then(|v| v.to_str().ok()) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    // Replay protection: timestamp must be within tolerance.
+    let ts: i64 = match webhook_ts.parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let now = chrono::Utc::now().timestamp();
+    if (now - ts).abs() > STANDARD_WEBHOOKS_TOLERANCE_SECS {
+        tracing::warn!(
+            webhook_timestamp = ts,
+            now = now,
+            tolerance = STANDARD_WEBHOOKS_TOLERANCE_SECS,
+            "Standard Webhooks: timestamp outside tolerance window — possible replay"
+        );
+        return false;
+    }
+
+    // Derive raw HMAC key. Spec: `whsec_<base64>`.
+    let key_bytes: Vec<u8> = match secret.strip_prefix("whsec_") {
+        Some(b64) => match B64.decode(b64.trim()) {
+            Ok(b) => b,
+            Err(_) => return false,
+        },
+        None => secret.as_bytes().to_vec(),
+    };
+
+    // Build signed message: "{id}.{ts}.{body}".
+    let mut signed =
+        Vec::with_capacity(webhook_id.len() + webhook_ts.len() + body.len() + 2);
+    signed.extend_from_slice(webhook_id.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(webhook_ts.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(body);
+
+    let mut mac = match HmacSha256::new_from_slice(&key_bytes) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(&signed);
+    let computed = mac.finalize().into_bytes();
+
+    // Multiple signatures may appear space-delimited (key rotation):
+    //   webhook-signature: v1,sigA v1,sigB v1a,otherSig
+    // Any one matching is enough. Unknown version prefixes (`v1a,`,
+    // future versions) are skipped, not rejected.
+    for entry in signature_header.split_whitespace() {
+        let Some(b64_sig) = entry.strip_prefix("v1,") else {
+            continue;
+        };
+        let Ok(sig_bytes) = B64.decode(b64_sig) else {
+            continue;
+        };
+        if constant_time_eq(&computed, &sig_bytes) {
+            return true;
+        }
+    }
+    false
+}
+
+fn verify_hmac_hex(key: &[u8], body: &[u8], expected_hex: &str) -> bool {
+    let mut mac = match HmacSha256::new_from_slice(key) {
         Ok(m) => m,
         Err(_) => return false,
     };
@@ -630,6 +746,212 @@ mod tests {
     fn no_signature_header_fails() {
         let headers = HeaderMap::new();
         assert!(!verify_signature("k", b"body", &headers));
+    }
+
+    // -- Standard Webhooks signing-token format --------------------
+
+    /// Helper: produce a Standard-Webhooks-shaped signature header
+    /// for the given key + id + timestamp + body.
+    fn standard_signature(key_bytes: &[u8], id: &str, ts: &str, body: &[u8]) -> String {
+        let mut signed = Vec::new();
+        signed.extend_from_slice(id.as_bytes());
+        signed.push(b'.');
+        signed.extend_from_slice(ts.as_bytes());
+        signed.push(b'.');
+        signed.extend_from_slice(body);
+        let mut mac = HmacSha256::new_from_slice(key_bytes).unwrap();
+        mac.update(&signed);
+        format!("v1,{}", B64.encode(mac.finalize().into_bytes()))
+    }
+
+    fn now_ts() -> String {
+        chrono::Utc::now().timestamp().to_string()
+    }
+
+    #[test]
+    fn standard_webhooks_verifies_with_raw_key() {
+        let key = b"raw-secret-bytes";
+        let id = "msg_1";
+        let ts = now_ts();
+        let body = b"{\"x\":1}";
+        let sig = standard_signature(key, id, &ts, body);
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-id", HeaderValue::from_str(id).unwrap());
+        headers.insert("webhook-timestamp", HeaderValue::from_str(&ts).unwrap());
+        headers.insert("webhook-signature", HeaderValue::from_str(&sig).unwrap());
+        // Pass the secret as-is (no whsec_ prefix); the verifier
+        // treats it as raw bytes.
+        assert!(verify_signature(
+            std::str::from_utf8(key).unwrap(),
+            body,
+            &headers
+        ));
+    }
+
+    #[test]
+    fn standard_webhooks_verifies_with_whsec_prefix() {
+        // Realistic shape: secret is whsec_<base64-of-key>.
+        let raw_key: Vec<u8> = (0..32u8).collect(); // 32 bytes of test key
+        let secret = format!("whsec_{}", B64.encode(&raw_key));
+        let id = "msg_2";
+        let ts = now_ts();
+        let body = b"hello";
+        let sig = standard_signature(&raw_key, id, &ts, body);
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-id", HeaderValue::from_str(id).unwrap());
+        headers.insert("webhook-timestamp", HeaderValue::from_str(&ts).unwrap());
+        headers.insert("webhook-signature", HeaderValue::from_str(&sig).unwrap());
+        assert!(verify_signature(&secret, body, &headers));
+    }
+
+    #[test]
+    fn standard_webhooks_rejects_old_timestamp() {
+        let key = b"k";
+        let id = "msg_old";
+        // 10 minutes in the past — well outside the 5-minute tolerance.
+        let ts = (chrono::Utc::now().timestamp() - 600).to_string();
+        let body = b"old";
+        let sig = standard_signature(key, id, &ts, body);
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-id", HeaderValue::from_str(id).unwrap());
+        headers.insert("webhook-timestamp", HeaderValue::from_str(&ts).unwrap());
+        headers.insert("webhook-signature", HeaderValue::from_str(&sig).unwrap());
+        assert!(!verify_signature("k", body, &headers));
+    }
+
+    #[test]
+    fn standard_webhooks_rejects_future_timestamp() {
+        let key = b"k";
+        let id = "msg_future";
+        let ts = (chrono::Utc::now().timestamp() + 600).to_string();
+        let body = b"future";
+        let sig = standard_signature(key, id, &ts, body);
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-id", HeaderValue::from_str(id).unwrap());
+        headers.insert("webhook-timestamp", HeaderValue::from_str(&ts).unwrap());
+        headers.insert("webhook-signature", HeaderValue::from_str(&sig).unwrap());
+        assert!(!verify_signature("k", body, &headers));
+    }
+
+    #[test]
+    fn standard_webhooks_rejects_wrong_key() {
+        let id = "msg_wk";
+        let ts = now_ts();
+        let body = b"x";
+        let sig = standard_signature(b"right", id, &ts, body);
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-id", HeaderValue::from_str(id).unwrap());
+        headers.insert("webhook-timestamp", HeaderValue::from_str(&ts).unwrap());
+        headers.insert("webhook-signature", HeaderValue::from_str(&sig).unwrap());
+        assert!(!verify_signature("wrong", body, &headers));
+    }
+
+    #[test]
+    fn standard_webhooks_rejects_tampered_body() {
+        let key = b"k";
+        let id = "msg_tb";
+        let ts = now_ts();
+        let sig = standard_signature(key, id, &ts, b"original");
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-id", HeaderValue::from_str(id).unwrap());
+        headers.insert("webhook-timestamp", HeaderValue::from_str(&ts).unwrap());
+        headers.insert("webhook-signature", HeaderValue::from_str(&sig).unwrap());
+        assert!(!verify_signature("k", b"tampered", &headers));
+    }
+
+    #[test]
+    fn standard_webhooks_rejects_tampered_id() {
+        let key = b"k";
+        let id = "msg_real";
+        let ts = now_ts();
+        let body = b"x";
+        let sig = standard_signature(key, id, &ts, body);
+        let mut headers = HeaderMap::new();
+        // Lying about the id mid-flight invalidates the signature.
+        headers.insert("webhook-id", HeaderValue::from_str("msg_fake").unwrap());
+        headers.insert("webhook-timestamp", HeaderValue::from_str(&ts).unwrap());
+        headers.insert("webhook-signature", HeaderValue::from_str(&sig).unwrap());
+        assert!(!verify_signature("k", body, &headers));
+    }
+
+    #[test]
+    fn standard_webhooks_accepts_one_of_multiple_signatures() {
+        let key_old = b"old-key";
+        let key_new = b"new-key";
+        let id = "msg_rot";
+        let ts = now_ts();
+        let body = b"rotation-test";
+        // Two signatures, space-delimited (key rotation).
+        let sig_old = standard_signature(key_old, id, &ts, body);
+        let sig_new = standard_signature(key_new, id, &ts, body);
+        let combined = format!("{} {}", sig_old, sig_new);
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-id", HeaderValue::from_str(id).unwrap());
+        headers.insert("webhook-timestamp", HeaderValue::from_str(&ts).unwrap());
+        headers.insert("webhook-signature", HeaderValue::from_str(&combined).unwrap());
+        // Verifying with the new key works.
+        assert!(verify_signature(
+            std::str::from_utf8(key_new).unwrap(),
+            body,
+            &headers
+        ));
+        // Verifying with the old key also still works (during a
+        // rotation window the source emits both).
+        assert!(verify_signature(
+            std::str::from_utf8(key_old).unwrap(),
+            body,
+            &headers
+        ));
+    }
+
+    #[test]
+    fn standard_webhooks_skips_unknown_version_prefixes() {
+        let key = b"k";
+        let id = "msg_uv";
+        let ts = now_ts();
+        let body = b"x";
+        let sig = standard_signature(key, id, &ts, body);
+        // Mix in a future version prefix the verifier doesn't know.
+        let combined = format!("v2,unknown-base64-content {}", sig);
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-id", HeaderValue::from_str(id).unwrap());
+        headers.insert("webhook-timestamp", HeaderValue::from_str(&ts).unwrap());
+        headers.insert("webhook-signature", HeaderValue::from_str(&combined).unwrap());
+        assert!(verify_signature("k", body, &headers));
+    }
+
+    #[test]
+    fn standard_webhooks_missing_id_or_timestamp_fails() {
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-signature", HeaderValue::from_static("v1,xx"));
+        assert!(!verify_signature("k", b"x", &headers));
+        // With only id but no timestamp.
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-signature", HeaderValue::from_static("v1,xx"));
+        headers.insert("webhook-id", HeaderValue::from_static("a"));
+        assert!(!verify_signature("k", b"x", &headers));
+    }
+
+    #[test]
+    fn standard_webhooks_takes_priority_over_github_header() {
+        // A request that somehow carries BOTH `webhook-signature` and
+        // `X-Hub-Signature-256` should be dispatched to the Standard
+        // Webhooks path (newer + stronger). With a valid `webhook-*`
+        // bundle and a garbage GitHub header, verification still passes.
+        let key = b"k";
+        let id = "msg_pri";
+        let ts = now_ts();
+        let body = b"hello";
+        let sig = standard_signature(key, id, &ts, body);
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-id", HeaderValue::from_str(id).unwrap());
+        headers.insert("webhook-timestamp", HeaderValue::from_str(&ts).unwrap());
+        headers.insert("webhook-signature", HeaderValue::from_str(&sig).unwrap());
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_static("sha256=garbage"),
+        );
+        assert!(verify_signature("k", body, &headers));
     }
 
     // -- prompt template --------------------------------------------
