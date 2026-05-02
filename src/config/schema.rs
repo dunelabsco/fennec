@@ -198,6 +198,7 @@ pub struct ChannelsConfig {
     pub slack: SlackChannelEntry,
     pub whatsapp: WhatsAppChannelEntry,
     pub email: EmailChannelEntry,
+    pub signal: SignalChannelEntry,
 }
 
 impl Default for ChannelsConfig {
@@ -208,6 +209,59 @@ impl Default for ChannelsConfig {
             slack: SlackChannelEntry::default(),
             whatsapp: WhatsAppChannelEntry::default(),
             email: EmailChannelEntry::default(),
+            signal: SignalChannelEntry::default(),
+        }
+    }
+}
+
+/// Signal channel — connects to a `signal-cli` daemon over HTTP.
+///
+/// The daemon must be running externally:
+///
+/// ```text
+/// signal-cli daemon --http=127.0.0.1:8080
+/// ```
+///
+/// Fennec speaks JSON-RPC 2.0 to `POST /api/v1/rpc` for outbound
+/// sends and consumes the SSE stream at `GET /api/v1/events` for
+/// inbound. There is no auth — the daemon's security model is
+/// "bind to localhost"; do not expose `http_url` to the network.
+///
+/// Group messages are opt-in via `group_allowed_users`. Default
+/// is empty (groups disabled). Set `*` to allow every group, or a
+/// comma-separated list of group ids for explicit allowlisting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SignalChannelEntry {
+    /// Master switch.
+    pub enabled: bool,
+    /// signal-cli HTTP daemon URL. Default `http://127.0.0.1:8080`.
+    pub http_url: String,
+    /// Sender's E.164 phone number, e.g. `+15551234567`.
+    pub account: String,
+    /// DM allowlist — Signal phone numbers / UUIDs that may
+    /// interact with the agent. Empty list means everyone.
+    pub allowed_users: Vec<String>,
+    /// Group allowlist — group ids (base64) or `*` for all groups.
+    /// Empty disables groups entirely (default).
+    pub group_allowed_users: Vec<String>,
+    /// Drop incoming Signal stories. Default true.
+    pub ignore_stories: bool,
+    /// Default destination for `send_message` calls without an
+    /// explicit chat id. Empty → falls back to most-recent inbound.
+    pub home_chat_id: String,
+}
+
+impl Default for SignalChannelEntry {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            http_url: "http://127.0.0.1:8080".to_string(),
+            account: String::new(),
+            allowed_users: Vec::new(),
+            group_allowed_users: Vec::new(),
+            ignore_stories: true,
+            home_chat_id: String::new(),
         }
     }
 }
