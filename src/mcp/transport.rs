@@ -156,7 +156,7 @@ impl Transport for StdioTransport {
                     continue;
                 }
             };
-            if response.id != Some(id) {
+            if response.id.as_u64() != Some(id) {
                 tracing::debug!(
                     "MCP response with unexpected id {:?} while waiting for {}; skipping",
                     response.id,
@@ -248,7 +248,7 @@ impl Transport for HttpTransport {
         let response: JsonRpcResponse = serde_json::from_str(&body)
             .context("parsing JSON-RPC response from MCP HTTP server")?;
 
-        if response.id != Some(id) {
+        if response.id.as_u64() != Some(id) {
             tracing::debug!(
                 "MCP HTTP response id {:?} does not match request id {}",
                 response.id,

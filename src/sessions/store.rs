@@ -15,6 +15,22 @@ pub struct SearchHit {
     pub score: f64,
 }
 
+/// One message read from a session, in time order. Returned by
+/// [`SessionStore::list_messages_for_session`] and
+/// [`SessionStore::list_messages_after`] (the MCP server's
+/// `messages_read` and event-bridge polling both consume this).
+#[derive(Debug, Clone)]
+pub struct MessageRow {
+    /// Auto-increment primary key. Used by the MCP server's event
+    /// bridge as a polling cursor — ask for messages with id > the
+    /// last-seen cursor and forward them as `message` events.
+    pub id: i64,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
+}
+
 /// Metadata for a session.
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
@@ -212,6 +228,128 @@ impl SessionStore {
         .await?
     }
 
+    /// Get a single session by id.
+    pub async fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, channel, started_at, ended_at, summary
+                 FROM sessions
+                 WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![session_id])?;
+            if let Some(row) = rows.next()? {
+                Ok::<_, anyhow::Error>(Some(SessionRecord {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    started_at: row.get(2)?,
+                    ended_at: row.get(3)?,
+                    summary: row.get(4)?,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?
+    }
+
+    /// List recent messages for a single session, oldest first.
+    /// `limit` caps the number of rows returned. Used by the MCP
+    /// server's `messages_read` tool.
+    pub async fn list_messages_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageRow>> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, role, content, timestamp
+                 FROM session_messages
+                 WHERE session_id = ?1
+                 ORDER BY id ASC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![session_id, limit as i64], |row| {
+                Ok(MessageRow {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    timestamp: row.get(4)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok::<_, anyhow::Error>(out)
+        })
+        .await?
+    }
+
+    /// List every message inserted with rowid greater than `after_id`,
+    /// across every session, oldest first. The MCP server's event
+    /// bridge calls this on each poll: it remembers the highest id
+    /// it has emitted as `message` events and forwards anything new.
+    /// `limit` is a safety cap so a backlog after a long idle gap
+    /// can't pull thousands of rows in one tick.
+    pub async fn list_messages_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<MessageRow>> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, role, content, timestamp
+                 FROM session_messages
+                 WHERE id > ?1
+                 ORDER BY id ASC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![after_id, limit as i64], |row| {
+                Ok(MessageRow {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    timestamp: row.get(4)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok::<_, anyhow::Error>(out)
+        })
+        .await?
+    }
+
+    /// Highest message id currently in the store. Used by the event
+    /// bridge to seed its cursor at startup so we don't replay every
+    /// message in history as "new".
+    pub async fn max_message_id(&self) -> Result<i64> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(id), 0) FROM session_messages",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            Ok::<_, anyhow::Error>(id)
+        })
+        .await?
+    }
+
     /// List the most recent sessions.
     pub async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>> {
         let conn = Arc::clone(&self.conn);
@@ -321,6 +459,91 @@ mod tests {
         // Either finds the message or returns empty — the critical
         // invariant is that the call does not error.
         let _ = hits;
+    }
+
+    #[tokio::test]
+    async fn list_messages_for_session_returns_in_time_order() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        store.add_message(&sid, "user", "first").await.unwrap();
+        store.add_message(&sid, "assistant", "second").await.unwrap();
+        store.add_message(&sid, "user", "third").await.unwrap();
+        let rows = store
+            .list_messages_for_session(&sid, 100)
+            .await
+            .unwrap();
+        let contents: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(contents, vec!["first", "second", "third"]);
+    }
+
+    #[tokio::test]
+    async fn list_messages_for_session_respects_limit() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        for i in 0..5 {
+            store
+                .add_message(&sid, "user", &format!("msg{}", i))
+                .await
+                .unwrap();
+        }
+        let rows = store
+            .list_messages_for_session(&sid, 3)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_messages_after_pagination_works() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        for i in 0..4 {
+            store
+                .add_message(&sid, "user", &format!("m{}", i))
+                .await
+                .unwrap();
+        }
+        let all = store
+            .list_messages_for_session(&sid, 100)
+            .await
+            .unwrap();
+        let cursor = all[1].id;
+        let after = store.list_messages_after(cursor, 100).await.unwrap();
+        let contents: Vec<&str> = after.iter().map(|r| r.content.as_str()).collect();
+        // Cursor was message #2; we should get #3 and #4 (m2, m3).
+        assert_eq!(contents, vec!["m2", "m3"]);
+    }
+
+    #[tokio::test]
+    async fn max_message_id_zero_when_empty() {
+        let (store, _dir) = make_store();
+        assert_eq!(store.max_message_id().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn max_message_id_tracks_inserts() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        store.add_message(&sid, "user", "x").await.unwrap();
+        let after_one = store.max_message_id().await.unwrap();
+        store.add_message(&sid, "user", "y").await.unwrap();
+        let after_two = store.max_message_id().await.unwrap();
+        assert!(after_two > after_one);
+    }
+
+    #[tokio::test]
+    async fn get_session_returns_record() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        let rec = store.get_session(&sid).await.unwrap();
+        assert!(rec.is_some());
+        assert_eq!(rec.unwrap().channel, "cli");
+    }
+
+    #[tokio::test]
+    async fn get_session_none_when_missing() {
+        let (store, _dir) = make_store();
+        assert!(store.get_session("nope").await.unwrap().is_none());
     }
 
     /// Regression: the store's FK declaration (session_messages
