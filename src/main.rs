@@ -827,6 +827,15 @@ async fn run_gateway(
         tracing::info!("Email channel enabled");
     }
 
+    if let Some(ch) = fennec::channels::SignalChannel::from_config(&ch_config.signal) {
+        channels.push(Arc::new(ch));
+        tracing::info!(
+            account = %ch_config.signal.account,
+            http_url = %ch_config.signal.http_url,
+            "Signal channel enabled"
+        );
+    }
+
     // 3a. Populate the channel map so tools (e.g. ask_user) can reach channels.
     {
         let mut map = channel_map.write();

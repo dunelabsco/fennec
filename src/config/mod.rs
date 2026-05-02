@@ -1,2 +1,2 @@
 pub mod schema;
-pub use schema::FennecConfig;
+pub use schema::{FennecConfig, SignalChannelEntry};

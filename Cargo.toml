@@ -50,6 +50,10 @@ imagesize = "0.14"
 subtle = "2.6"
 hmac = "0.12"
 url = "2.5"
+# Used by the Signal channel to URL-encode the account phone
+# number into the SSE listener path (signal-cli daemon expects
+# it as a query parameter).
+urlencoding = "2.1"
 # Maintained fork of the (now unmaintained) serde_yaml crate. Used for
 # parsing YAML frontmatter in skill files.
 serde_yaml_ng = "0.10"
