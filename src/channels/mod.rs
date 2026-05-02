@@ -6,6 +6,7 @@ pub mod discord;
 pub mod slack;
 pub mod whatsapp;
 pub mod email;
+pub mod webhook;
 
 pub use traits::{Channel, ChannelMessage, SendMessage};
 pub use cli::CliChannel;
@@ -15,6 +16,7 @@ pub use discord::DiscordChannel;
 pub use slack::SlackChannel;
 pub use whatsapp::WhatsAppChannel;
 pub use email::EmailChannel;
+pub use webhook::WebhookChannel;
 
 use std::collections::HashMap;
 use std::sync::Arc;
