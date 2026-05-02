@@ -16,7 +16,14 @@ use super::thinking::{self, ThinkingLevel};
 /// The core agent that orchestrates provider calls, tool execution, and memory.
 pub struct Agent {
     provider: Arc<dyn Provider>,
-    tools: Vec<Box<dyn Tool>>,
+    /// Tools the agent can dispatch to. Stored as `Arc<dyn Tool>` so a
+    /// single tool instance can be shared across multiple Agent
+    /// instances (the OpenAI-compat channel constructs a fresh agent
+    /// per HTTP request and reuses the same tool registry — see
+    /// E-2-3). The legacy `AgentBuilder::tool(Box<dyn Tool>)` API is
+    /// preserved by transparently converting `Box -> Arc` at insertion
+    /// time, so existing call sites don't change.
+    tools: Vec<Arc<dyn Tool>>,
     tool_specs: Vec<ToolSpec>,
     memory: Arc<dyn Memory>,
     prompt_builder: SystemPromptBuilder,
@@ -41,7 +48,74 @@ pub struct Agent {
     turn_count: u64,
 }
 
+/// Result of a single `turn_with_history` call.
+///
+/// `response` is the assistant's final text reply (same shape as
+/// `Agent::turn`'s return). `new_messages` is the slice of
+/// `ChatMessage`s that the turn appended on top of the supplied
+/// history — typically two entries (the user's message and the
+/// assistant's response), more if the agent ran tool calls in
+/// between.
+///
+/// The OpenAI-compat channel uses these to:
+///   - return `response` to the HTTP caller,
+///   - persist `new_messages` into the per-session conversation
+///     store and the response chain.
+#[derive(Debug, Clone)]
+pub struct TurnWithHistoryResult {
+    pub response: String,
+    pub new_messages: Vec<ChatMessage>,
+}
+
 impl Agent {
+    /// Execute a single turn against a caller-supplied conversation
+    /// history, instead of the agent's own accumulating history.
+    /// The agent's own `history` field is preserved; this is a
+    /// strictly additive variant that doesn't observe or mutate
+    /// the agent's default-session state.
+    ///
+    /// Used by the OpenAI-compat channel for session-scoped
+    /// conversations: each `/v1/chat/completions` (with
+    /// `X-Fennec-Session-Id`) and `/v1/responses` request loads its
+    /// own history from disk, runs the turn, then persists the new
+    /// messages back. The default-session agent path (CLI, channel
+    /// listeners) is untouched.
+    ///
+    /// Implementation: swap `self.history` for the supplied vec,
+    /// call `turn()`, capture the mutated history, swap back. On
+    /// error the original `self.history` is restored before the
+    /// error propagates.
+    pub async fn turn_with_history(
+        &mut self,
+        supplied_history: Vec<ChatMessage>,
+        user_message: &str,
+    ) -> Result<TurnWithHistoryResult> {
+        let pre_len = supplied_history.len();
+        // Stash the agent's own history; install the caller's.
+        let original = std::mem::replace(&mut self.history, supplied_history);
+        // Run the turn. `self.history` now holds the supplied
+        // messages and may have grown if turn() succeeded; or it
+        // may be in a half-mutated state if turn() failed midway.
+        let result = self.turn(user_message).await;
+        // Take whatever final state turn() left and restore the
+        // agent's own history. After this, self.history matches
+        // pre-call exactly; the supplied-history-plus-new-messages
+        // lives in `final_history`.
+        let final_history = std::mem::replace(&mut self.history, original);
+        let response = result?;
+        // The new messages are everything turn() added on top of
+        // the supplied prefix.
+        let new_messages = if final_history.len() > pre_len {
+            final_history[pre_len..].to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(TurnWithHistoryResult {
+            response,
+            new_messages,
+        })
+    }
+
     /// Execute a single conversational turn.
     ///
     /// On the first turn the system prompt is built (with memory context) and
@@ -447,9 +521,20 @@ impl Agent {
 // ---------------------------------------------------------------------------
 
 /// Builder for constructing an [`Agent`] with validated configuration.
+///
+/// Tools are stored as `Arc<dyn Tool>` (shared) rather than
+/// `Box<dyn Tool>` (owned), so a single tool instance can be reused
+/// across many `Agent` constructions. The legacy
+/// `tool(Box<dyn Tool>)` and `tools(Vec<Box<dyn Tool>>)` setters
+/// transparently convert via `Arc::from(Box)` so existing call sites
+/// don't have to change. New callers (the OpenAI-compat session-
+/// scoped agent factory) can use `tool_arc(Arc<dyn Tool>)` and
+/// `tools_arc(Vec<Arc<dyn Tool>>)` to share a pre-built tool
+/// registry across many fresh agents without reconstructing each
+/// tool per request.
 pub struct AgentBuilder {
     provider: Option<Arc<dyn Provider>>,
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
     memory: Option<Arc<dyn Memory>>,
     identity_name: Option<String>,
     identity_persona: Option<String>,
@@ -487,12 +572,35 @@ impl AgentBuilder {
         self
     }
 
+    /// Add a single tool. Accepts the legacy `Box<dyn Tool>` shape
+    /// to preserve every existing call site (every `Box::new(SomeTool::new(...))`
+    /// across main.rs, channel constructors, tests, etc. continues
+    /// to work unchanged). Internally the box is converted to an
+    /// `Arc` so the tool can later be shared across multiple Agent
+    /// instances.
     pub fn tool(mut self, tool: Box<dyn Tool>) -> Self {
+        self.tools.push(Arc::from(tool));
+        self
+    }
+
+    /// Replace the tool list. Same compatibility shim as
+    /// [`Self::tool`] — accepts `Box<dyn Tool>` for back-compat.
+    pub fn tools(mut self, tools: Vec<Box<dyn Tool>>) -> Self {
+        self.tools = tools.into_iter().map(Arc::from).collect();
+        self
+    }
+
+    /// Add a single Arc-shared tool. Used by callers that already
+    /// hold an `Arc<dyn Tool>` (the OpenAI-compat per-request agent
+    /// factory in particular) and want to skip the `Box -> Arc`
+    /// indirection.
+    pub fn tool_arc(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
     }
 
-    pub fn tools(mut self, tools: Vec<Box<dyn Tool>>) -> Self {
+    /// Replace the tool list with pre-shared Arc'd tools.
+    pub fn tools_arc(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
         self
     }
