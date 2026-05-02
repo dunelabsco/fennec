@@ -35,7 +35,7 @@
 //! monitor pings `/api/v1/check` every 30s and force-reconnects
 //! when the SSE has been silent for more than 120s.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +44,6 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use rand::Rng;
 use reqwest::Client;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -247,6 +246,23 @@ impl SignalChannel {
 
     fn is_echo_timestamp(&self, ts: i64) -> bool {
         self.state.recent_sent_timestamps.lock().contains(&ts)
+    }
+
+    /// Bump a chat's consecutive-failure counter; arm exponential
+    /// backoff once it crosses `TYPING_FAILURE_THRESHOLD`.
+    fn record_typing_failure(&self, chat_id: &str) {
+        let mut map = self.state.typing_failures.lock();
+        let entry = map.entry(chat_id.to_string()).or_default();
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        if entry.consecutive_failures >= TYPING_FAILURE_THRESHOLD {
+            let next = if entry.last_backoff.is_zero() {
+                TYPING_BACKOFF_INITIAL
+            } else {
+                (entry.last_backoff * 2).min(TYPING_BACKOFF_MAX)
+            };
+            entry.last_backoff = next;
+            entry.cooldown_until = Some(std::time::Instant::now() + next);
+        }
     }
 
     /// Long-running SSE listener. Reconnects with exponential
@@ -535,33 +551,76 @@ impl Channel for SignalChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let recipient = message.recipient.as_str();
-        let body = strip_markdown_simple(&message.content);
-        let (params, response_method): (Value, &str) =
-            if let Some(group_id) = recipient.strip_prefix(GROUP_PREFIX) {
-                (
-                    json!({
-                        "account": self.config.account,
-                        "groupId": group_id,
-                        "message": body,
-                    }),
-                    "send",
-                )
-            } else {
-                let resolved = self.resolve_recipient(recipient).await;
-                (
-                    json!({
-                        "account": self.config.account,
-                        "recipient": [resolved],
-                        "message": body,
-                    }),
-                    "send",
-                )
-            };
-        let result = self.rpc(response_method, params).await?;
+        let (body, styles) = render_for_signal(&message.content);
+        let mut params = if let Some(group_id) = recipient.strip_prefix(GROUP_PREFIX) {
+            json!({
+                "account": self.config.account,
+                "groupId": group_id,
+                "message": body,
+            })
+        } else {
+            let resolved = self.resolve_recipient(recipient).await;
+            json!({
+                "account": self.config.account,
+                "recipient": [resolved],
+                "message": body,
+            })
+        };
+        if let Some(s) = styles {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("textStyles".into(), json!(s));
+            }
+        }
+        let result = self.rpc("send", params).await?;
         if let Some(ts) = result.get("timestamp").and_then(|v| v.as_i64()) {
             self.record_sent_timestamp(ts);
         }
         Ok(())
+    }
+
+    async fn send_typing(&self, chat_id: &str) -> Result<()> {
+        // Per-chat cooldown: skip the RPC entirely while in backoff.
+        if let Some(until) = self
+            .state
+            .typing_failures
+            .lock()
+            .get(chat_id)
+            .and_then(|s| s.cooldown_until)
+        {
+            if std::time::Instant::now() < until {
+                return Ok(());
+            }
+        }
+
+        let params = if let Some(group_id) = chat_id.strip_prefix(GROUP_PREFIX) {
+            json!({
+                "account": self.config.account,
+                "groupId": group_id,
+                "stop": false,
+            })
+        } else {
+            let resolved = self.resolve_recipient(chat_id).await;
+            json!({
+                "account": self.config.account,
+                "recipient": [resolved],
+                "stop": false,
+            })
+        };
+
+        match self.rpc("sendTyping", params).await {
+            Ok(_) => {
+                let mut map = self.state.typing_failures.lock();
+                map.remove(chat_id);
+                Ok(())
+            }
+            Err(e) => {
+                self.record_typing_failure(chat_id);
+                tracing::debug!(chat_id = %chat_id, error = %e, "signal sendTyping failed");
+                // Typing is best-effort — don't surface as a hard error
+                // so the actual response send still proceeds.
+                Ok(())
+            }
+        }
     }
 
     async fn listen(&self, tx: mpsc::Sender<InboundMessage>) -> Result<()> {
@@ -592,19 +651,413 @@ impl Channel for SignalChannel {
     }
 }
 
-/// Strip markdown markers we don't translate yet (bold, italic,
-/// strikethrough). Code spans and code blocks are passed through
-/// verbatim — Signal renders them as monospace if backticks
-/// survive in the body, but we don't compute textStyles in this
-/// pass. A future enhancement (matching upstream's
-/// `_markdown_to_signal`) can compute UTF-16 textStyle ranges.
-fn strip_markdown_simple(input: &str) -> String {
-    // Pass through. Upstream does style-range conversion to Signal's
-    // bodyRanges; we keep it simple for E-3 and let Signal render
-    // markdown inline in the message body (which it does for
-    // backticks; bold/italic stay as **…**). A follow-up can wire
-    // textStyles when there's a concrete need.
-    input.to_string()
+// -- Markdown → Signal textStyles converter -----------------------
+
+/// Signal's recognized text-style names. Sent as the third
+/// component of each `textStyles` entry (`<start>:<length>:<STYLE>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalStyle {
+    Bold,
+    Italic,
+    Strikethrough,
+    Monospace,
+}
+
+impl SignalStyle {
+    fn name(self) -> &'static str {
+        match self {
+            SignalStyle::Bold => "BOLD",
+            SignalStyle::Italic => "ITALIC",
+            SignalStyle::Strikethrough => "STRIKETHROUGH",
+            SignalStyle::Monospace => "MONOSPACE",
+        }
+    }
+}
+
+/// One style range, in UTF-16 code-unit offsets. Signal expects
+/// offsets to count UTF-16 units (the same unit JavaScript uses) —
+/// emoji and CJK chars take 2 units each, ASCII takes 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyleRange {
+    pub start: usize,
+    pub length: usize,
+    pub style: SignalStyle,
+}
+
+impl StyleRange {
+    fn to_param(&self) -> String {
+        format!("{}:{}:{}", self.start, self.length, self.style.name())
+    }
+}
+
+/// Result of `markdown_to_signal`. `text` is the clean body Signal
+/// renders; `styles` are the bodyRanges to attach as `textStyles`
+/// in the `send` RPC. Empty `styles` means no formatting was
+/// detected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownToSignalResult {
+    pub text: String,
+    pub styles: Vec<StyleRange>,
+}
+
+/// Convert markdown to Signal's clean text + bodyRange offsets.
+///
+/// Recognized markers (priority order — earlier wins to avoid
+/// `*` confusion inside ` `code` `):
+///
+///   1. Triple-backtick fenced code block → MONOSPACE (multi-line)
+///   2. Headings (`#`, `##`, `###`...) → BOLD (per-line)
+///   3. Inline backtick code → MONOSPACE
+///   4. `**bold**` or `__bold__` → BOLD
+///   5. `~~strike~~` → STRIKETHROUGH
+///   6. `*italic*` or `_italic_` → ITALIC (single asterisk/underscore)
+///
+/// Offsets are computed in **UTF-16 code units** to match Signal's
+/// expectation. ASCII is 1 unit; most BMP CJK is 1 unit; emoji and
+/// supplementary-plane chars are 2 units each.
+pub fn markdown_to_signal(input: &str) -> MarkdownToSignalResult {
+    // Pass 1: extract triple-backtick fenced blocks and inline
+    // backticks first, replacing each match with a sentinel that
+    // survives the later inline-marker passes. The body of the code
+    // span is preserved verbatim.
+    //
+    // Algorithm:
+    //   - Tokenize into "literal" and "code" runs by walking the
+    //     string and toggling on backtick boundaries.
+    //   - For each "literal" run, apply the inline-marker rewrites
+    //     (bold/italic/strike), tracking UTF-16 offsets.
+    //   - Concatenate runs to produce the final text + style list.
+    //
+    // This avoids the regex-overlapping problem where `**a*b**` or
+    // `*` inside backticks gets misread.
+
+    // Step 1: split into code spans + literals.
+    let runs = tokenize_code_runs(input);
+
+    let mut text = String::new();
+    let mut styles: Vec<StyleRange> = Vec::new();
+    let mut utf16_cursor: usize = 0;
+
+    for run in runs {
+        match run {
+            Run::Literal(s) => {
+                let (rendered, mut sub_styles) = render_literal(&s, utf16_cursor);
+                let len_units = utf16_units(&rendered);
+                text.push_str(&rendered);
+                styles.append(&mut sub_styles);
+                utf16_cursor += len_units;
+            }
+            Run::Code(body) => {
+                let len_units = utf16_units(&body);
+                if len_units > 0 {
+                    styles.push(StyleRange {
+                        start: utf16_cursor,
+                        length: len_units,
+                        style: SignalStyle::Monospace,
+                    });
+                }
+                text.push_str(&body);
+                utf16_cursor += len_units;
+            }
+        }
+    }
+
+    MarkdownToSignalResult { text, styles }
+}
+
+/// One token from the input — either a literal run that may carry
+/// inline bold/italic/strike markers, or a code span (passed through
+/// verbatim with monospace style). Multi-line code blocks are trimmed
+/// of their leading newline at tokenization time.
+enum Run {
+    Literal(String),
+    Code(String),
+}
+
+/// Split the input into alternating literal and code runs.
+///
+/// Triple backticks open / close a multi-line code block; a single
+/// backtick toggles an inline code span. Mismatched / unclosed
+/// markers are treated as literal characters (Signal renders them
+/// as-is).
+fn tokenize_code_runs(input: &str) -> Vec<Run> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '`' {
+            buf.push(c);
+            continue;
+        }
+        // Determine fence width: 1 (inline) or 3 (multi-line).
+        let mut backticks = 1;
+        while chars.peek() == Some(&'`') {
+            chars.next();
+            backticks += 1;
+            if backticks == 3 {
+                break;
+            }
+        }
+        // Look for the matching closing fence of the same width.
+        // We walk the remaining chars; if we don't find a close,
+        // treat the opening fence as literal.
+        let mut body = String::new();
+        let mut closed = false;
+        let multiline = backticks == 3;
+        while let Some(&next) = chars.peek() {
+            if next == '`' {
+                let mut close_count = 0;
+                while chars.peek() == Some(&'`') {
+                    chars.next();
+                    close_count += 1;
+                    if close_count == backticks {
+                        break;
+                    }
+                }
+                if close_count == backticks {
+                    closed = true;
+                    break;
+                } else {
+                    // Partial fence — push back into the body.
+                    for _ in 0..close_count {
+                        body.push('`');
+                    }
+                }
+            } else {
+                body.push(next);
+                chars.next();
+            }
+        }
+        if closed {
+            // Flush the literal buffer first.
+            if !buf.is_empty() {
+                out.push(Run::Literal(std::mem::take(&mut buf)));
+            }
+            // Trim leading newline of multi-line code block, if
+            // present (matches the convention `` ```\nbody\n``` ``).
+            let trimmed = if multiline {
+                body.strip_prefix('\n')
+                    .map(String::from)
+                    .unwrap_or(body)
+            } else {
+                body
+            };
+            out.push(Run::Code(trimmed));
+        } else {
+            // Unmatched fence: treat literally.
+            for _ in 0..backticks {
+                buf.push('`');
+            }
+            buf.push_str(&body);
+        }
+    }
+    if !buf.is_empty() {
+        out.push(Run::Literal(buf));
+    }
+    out
+}
+
+/// Apply inline markers (bold / italic / strike, plus heading-line
+/// bolding) to a literal run. Returns the cleaned text plus any
+/// styles, with offsets relative to `start_utf16` (the UTF-16
+/// position of this run inside the full output string).
+fn render_literal(input: &str, start_utf16: usize) -> (String, Vec<StyleRange>) {
+    let mut out_styles: Vec<StyleRange> = Vec::new();
+    let mut out = String::with_capacity(input.len());
+    let mut cursor_utf16 = start_utf16;
+
+    // Process line by line to handle headings (`# ...` → BOLD on
+    // the heading text). Inline markers apply within each line.
+    let lines: Vec<&str> = input.split_inclusive('\n').collect();
+    for line in lines {
+        // Strip trailing newline for marker detection; restore
+        // afterward.
+        let (body, trailing) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        // Heading detection: lines starting with 1-6 `#` characters
+        // followed by a space.
+        let heading_match = body
+            .chars()
+            .take_while(|c| *c == '#')
+            .count();
+        let after_hashes = body.chars().skip(heading_match).next();
+        if heading_match >= 1
+            && heading_match <= 6
+            && after_hashes == Some(' ')
+        {
+            // Strip `### ` prefix; rest of line is bolded.
+            let rest: String = body
+                .chars()
+                .skip(heading_match + 1)
+                .collect();
+            let (rendered, mut styles) = render_inline(&rest, cursor_utf16);
+            let body_units = utf16_units(&rendered);
+            if body_units > 0 {
+                out_styles.push(StyleRange {
+                    start: cursor_utf16,
+                    length: body_units,
+                    style: SignalStyle::Bold,
+                });
+            }
+            // Inline styles inside the heading also apply.
+            out_styles.append(&mut styles);
+            out.push_str(&rendered);
+            cursor_utf16 += body_units;
+        } else {
+            let (rendered, mut styles) = render_inline(body, cursor_utf16);
+            let body_units = utf16_units(&rendered);
+            out_styles.append(&mut styles);
+            out.push_str(&rendered);
+            cursor_utf16 += body_units;
+        }
+        if !trailing.is_empty() {
+            out.push_str(trailing);
+            cursor_utf16 += utf16_units(trailing);
+        }
+    }
+
+    (out, out_styles)
+}
+
+/// Apply inline markers — `**bold**`, `__bold__`, `~~strike~~`,
+/// `*italic*`, `_italic_` — to a single line of text. Markers are
+/// processed in priority order (longest first) to avoid eating
+/// part of a longer marker.
+fn render_inline(input: &str, start_utf16: usize) -> (String, Vec<StyleRange>) {
+    // Order matters: ** before *, ~~ before ~, __ before _.
+    // We apply each marker pattern one at a time, scanning the
+    // current state of the string for the marker, recording the
+    // style range, and stripping the marker chars.
+    let patterns: &[(&str, &str, SignalStyle)] = &[
+        ("**", "**", SignalStyle::Bold),
+        ("__", "__", SignalStyle::Bold),
+        ("~~", "~~", SignalStyle::Strikethrough),
+        ("*", "*", SignalStyle::Italic),
+        ("_", "_", SignalStyle::Italic),
+    ];
+
+    let mut current = input.to_string();
+    let mut styles: Vec<StyleRange> = Vec::new();
+
+    for (open, close, style) in patterns {
+        current = apply_inline_pattern(&current, open, close, *style, start_utf16, &mut styles);
+    }
+
+    (current, styles)
+}
+
+/// Strip every well-formed `<open>...<close>` pair from `input`,
+/// recording each match's range as a style. Offsets are
+/// `start_utf16 + (UTF-16 index in output)`.
+///
+/// "Well-formed" means: opener present, closer present after the
+/// opener, and the content between them is non-empty. Mismatched
+/// markers are left as literal characters.
+fn apply_inline_pattern(
+    input: &str,
+    open: &str,
+    close: &str,
+    style: SignalStyle,
+    start_utf16: usize,
+    styles: &mut Vec<StyleRange>,
+) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    let mut utf16_in_output: usize = 0;
+
+    while let Some(c) = chars.clone().next() {
+        // Try to match the opener at this position.
+        if try_consume_marker(&mut chars, open) {
+            // Find a matching closer.
+            let mut content = String::new();
+            let mut closed = false;
+            while let Some(&next) = chars.clone().next().as_ref() {
+                if try_consume_marker(&mut chars, close) {
+                    closed = true;
+                    break;
+                }
+                content.push(next);
+                chars.next();
+            }
+            if closed && !content.is_empty() {
+                let content_units = utf16_units(&content);
+                styles.push(StyleRange {
+                    start: start_utf16 + utf16_in_output,
+                    length: content_units,
+                    style,
+                });
+                out.push_str(&content);
+                utf16_in_output += content_units;
+            } else {
+                // Unmatched opener (or empty content) — emit literally.
+                out.push_str(open);
+                utf16_in_output += utf16_units(open);
+                out.push_str(&content);
+                utf16_in_output += utf16_units(&content);
+            }
+        } else {
+            chars.next();
+            out.push(c);
+            utf16_in_output += utf16_unit_for_char(c);
+        }
+    }
+
+    out
+}
+
+/// If the next characters in `chars` form `marker`, consume them and
+/// return true. Otherwise return false without modifying `chars`.
+///
+/// `marker` is always 1 or 2 ASCII bytes — we use a cheap clone of
+/// the underlying `Chars` iterator (no allocation, just a slice
+/// pointer copy) to look ahead without committing.
+fn try_consume_marker(
+    chars: &mut std::str::Chars<'_>,
+    marker: &str,
+) -> bool {
+    let bytes = marker.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut probe = chars.clone();
+    for &b in bytes {
+        match probe.next() {
+            Some(c) if (c as u32) <= 0x7F && c as u8 == b => continue,
+            _ => return false,
+        }
+    }
+    // All bytes matched — advance the real iterator.
+    for _ in bytes {
+        chars.next();
+    }
+    true
+}
+
+/// UTF-16 code unit count for a single char (1 for BMP, 2 for
+/// supplementary-plane / emoji).
+fn utf16_unit_for_char(c: char) -> usize {
+    c.len_utf16()
+}
+
+/// UTF-16 code unit count for a string.
+fn utf16_units(s: &str) -> usize {
+    s.chars().map(|c| c.len_utf16()).sum()
+}
+
+/// Pre-format the body for outbound `send`. Returns
+/// `(plain_text, optional textStyles param)`. Empty `textStyles`
+/// → omit the param from the RPC.
+fn render_for_signal(input: &str) -> (String, Option<Vec<String>>) {
+    let result = markdown_to_signal(input);
+    let styles = if result.styles.is_empty() {
+        None
+    } else {
+        Some(result.styles.iter().map(StyleRange::to_param).collect())
+    };
+    (result.text, styles)
 }
 
 #[cfg(test)]
@@ -921,5 +1374,212 @@ mod tests {
             assert!(j >= base);
             assert!(j <= base + base / 5 + Duration::from_millis(1));
         }
+    }
+
+    // -- markdown converter -----------------------------------------
+
+    fn md(input: &str) -> MarkdownToSignalResult {
+        markdown_to_signal(input)
+    }
+
+    #[test]
+    fn markdown_plain_text_no_styles() {
+        let r = md("hello world");
+        assert_eq!(r.text, "hello world");
+        assert!(r.styles.is_empty());
+    }
+
+    #[test]
+    fn markdown_bold_double_asterisk() {
+        let r = md("hi **bold** there");
+        assert_eq!(r.text, "hi bold there");
+        assert_eq!(r.styles.len(), 1);
+        assert_eq!(r.styles[0].start, 3);
+        assert_eq!(r.styles[0].length, 4);
+        assert_eq!(r.styles[0].style, SignalStyle::Bold);
+    }
+
+    #[test]
+    fn markdown_bold_double_underscore() {
+        let r = md("__bold__");
+        assert_eq!(r.text, "bold");
+        assert_eq!(r.styles.len(), 1);
+        assert_eq!(r.styles[0].style, SignalStyle::Bold);
+        assert_eq!(r.styles[0].length, 4);
+    }
+
+    #[test]
+    fn markdown_italic_single_asterisk() {
+        let r = md("an *italic* word");
+        assert_eq!(r.text, "an italic word");
+        assert_eq!(r.styles.len(), 1);
+        assert_eq!(r.styles[0].start, 3);
+        assert_eq!(r.styles[0].length, 6);
+        assert_eq!(r.styles[0].style, SignalStyle::Italic);
+    }
+
+    #[test]
+    fn markdown_strikethrough() {
+        let r = md("~~old~~");
+        assert_eq!(r.text, "old");
+        assert_eq!(r.styles.len(), 1);
+        assert_eq!(r.styles[0].style, SignalStyle::Strikethrough);
+    }
+
+    #[test]
+    fn markdown_inline_code_monospace() {
+        let r = md("run `cargo test` now");
+        assert_eq!(r.text, "run cargo test now");
+        assert_eq!(r.styles.len(), 1);
+        assert_eq!(r.styles[0].start, 4);
+        assert_eq!(r.styles[0].length, 10);
+        assert_eq!(r.styles[0].style, SignalStyle::Monospace);
+    }
+
+    #[test]
+    fn markdown_fenced_code_block() {
+        let r = md("before\n```\nfn x() {}\n```\nafter");
+        // Leading newline of multi-line block is trimmed; trailing
+        // newline (before the closing fence) is preserved verbatim
+        // in the body.
+        assert!(r.text.contains("fn x() {}"));
+        assert_eq!(r.styles.len(), 1);
+        assert_eq!(r.styles[0].style, SignalStyle::Monospace);
+    }
+
+    #[test]
+    fn markdown_heading_bolded() {
+        let r = md("# Title\nbody");
+        assert_eq!(r.text, "Title\nbody");
+        // Heading text is bolded.
+        assert_eq!(r.styles.len(), 1);
+        assert_eq!(r.styles[0].start, 0);
+        assert_eq!(r.styles[0].length, 5);
+        assert_eq!(r.styles[0].style, SignalStyle::Bold);
+    }
+
+    #[test]
+    fn markdown_inside_code_span_not_styled() {
+        // `*` inside backticks is literal — no italic style emitted.
+        let r = md("`*not italic*`");
+        assert_eq!(r.text, "*not italic*");
+        // Only the monospace style should fire.
+        assert_eq!(r.styles.len(), 1);
+        assert_eq!(r.styles[0].style, SignalStyle::Monospace);
+    }
+
+    #[test]
+    fn markdown_unmatched_marker_passthrough() {
+        let r = md("a *unmatched and trailing");
+        // Unmatched `*` is preserved verbatim, no italic recorded.
+        assert_eq!(r.text, "a *unmatched and trailing");
+        assert!(r.styles.is_empty());
+    }
+
+    #[test]
+    fn markdown_emoji_uses_utf16_offsets() {
+        // 🦊 is U+1F98A → 2 UTF-16 units.
+        let r = md("🦊 **bold**");
+        assert_eq!(r.text, "🦊 bold");
+        assert_eq!(r.styles.len(), 1);
+        // 🦊 = 2 units, space = 1 unit → bold starts at offset 3.
+        assert_eq!(r.styles[0].start, 3);
+        assert_eq!(r.styles[0].length, 4);
+        assert_eq!(r.styles[0].style, SignalStyle::Bold);
+    }
+
+    #[test]
+    fn markdown_mixed_bold_and_italic() {
+        let r = md("**B** and *i*");
+        assert_eq!(r.text, "B and i");
+        assert_eq!(r.styles.len(), 2);
+        let bold = r.styles.iter().find(|s| s.style == SignalStyle::Bold).unwrap();
+        let italic = r
+            .styles
+            .iter()
+            .find(|s| s.style == SignalStyle::Italic)
+            .unwrap();
+        assert_eq!(bold.start, 0);
+        assert_eq!(bold.length, 1);
+        assert_eq!(italic.start, 6);
+        assert_eq!(italic.length, 1);
+    }
+
+    #[test]
+    fn render_for_signal_no_styles_returns_none() {
+        let (text, styles) = render_for_signal("plain text");
+        assert_eq!(text, "plain text");
+        assert!(styles.is_none());
+    }
+
+    #[test]
+    fn render_for_signal_emits_param_strings() {
+        let (text, styles) = render_for_signal("**bold**");
+        assert_eq!(text, "bold");
+        let s = styles.expect("expected styles");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0], "0:4:BOLD");
+    }
+
+    // -- typing indicator backoff -----------------------------------
+
+    #[test]
+    fn typing_failure_below_threshold_no_cooldown() {
+        let ch = channel("+15551234567");
+        ch.record_typing_failure("+19998887777");
+        ch.record_typing_failure("+19998887777");
+        let map = ch.state.typing_failures.lock();
+        let entry = map.get("+19998887777").unwrap();
+        assert_eq!(entry.consecutive_failures, 2);
+        assert!(entry.cooldown_until.is_none());
+    }
+
+    #[test]
+    fn typing_failure_threshold_arms_initial_backoff() {
+        let ch = channel("+15551234567");
+        for _ in 0..3 {
+            ch.record_typing_failure("+19998887777");
+        }
+        let map = ch.state.typing_failures.lock();
+        let entry = map.get("+19998887777").unwrap();
+        assert_eq!(entry.consecutive_failures, 3);
+        assert_eq!(entry.last_backoff, TYPING_BACKOFF_INITIAL);
+        assert!(entry.cooldown_until.is_some());
+    }
+
+    #[test]
+    fn typing_failure_subsequent_doubles_backoff() {
+        let ch = channel("+15551234567");
+        for _ in 0..4 {
+            ch.record_typing_failure("+19998887777");
+        }
+        let map = ch.state.typing_failures.lock();
+        let entry = map.get("+19998887777").unwrap();
+        assert_eq!(entry.last_backoff, TYPING_BACKOFF_INITIAL * 2);
+    }
+
+    #[test]
+    fn typing_failure_caps_at_max() {
+        let ch = channel("+15551234567");
+        for _ in 0..20 {
+            ch.record_typing_failure("+19998887777");
+        }
+        let map = ch.state.typing_failures.lock();
+        let entry = map.get("+19998887777").unwrap();
+        assert_eq!(entry.last_backoff, TYPING_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn typing_failure_per_chat_isolated() {
+        let ch = channel("+15551234567");
+        for _ in 0..3 {
+            ch.record_typing_failure("+11111111111");
+        }
+        ch.record_typing_failure("+22222222222");
+        let map = ch.state.typing_failures.lock();
+        let a = map.get("+11111111111").unwrap();
+        let b = map.get("+22222222222").unwrap();
+        assert!(a.cooldown_until.is_some());
+        assert!(b.cooldown_until.is_none());
     }
 }
