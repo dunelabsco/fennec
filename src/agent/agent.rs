@@ -48,7 +48,74 @@ pub struct Agent {
     turn_count: u64,
 }
 
+/// Result of a single `turn_with_history` call.
+///
+/// `response` is the assistant's final text reply (same shape as
+/// `Agent::turn`'s return). `new_messages` is the slice of
+/// `ChatMessage`s that the turn appended on top of the supplied
+/// history — typically two entries (the user's message and the
+/// assistant's response), more if the agent ran tool calls in
+/// between.
+///
+/// The OpenAI-compat channel uses these to:
+///   - return `response` to the HTTP caller,
+///   - persist `new_messages` into the per-session conversation
+///     store and the response chain.
+#[derive(Debug, Clone)]
+pub struct TurnWithHistoryResult {
+    pub response: String,
+    pub new_messages: Vec<ChatMessage>,
+}
+
 impl Agent {
+    /// Execute a single turn against a caller-supplied conversation
+    /// history, instead of the agent's own accumulating history.
+    /// The agent's own `history` field is preserved; this is a
+    /// strictly additive variant that doesn't observe or mutate
+    /// the agent's default-session state.
+    ///
+    /// Used by the OpenAI-compat channel for session-scoped
+    /// conversations: each `/v1/chat/completions` (with
+    /// `X-Fennec-Session-Id`) and `/v1/responses` request loads its
+    /// own history from disk, runs the turn, then persists the new
+    /// messages back. The default-session agent path (CLI, channel
+    /// listeners) is untouched.
+    ///
+    /// Implementation: swap `self.history` for the supplied vec,
+    /// call `turn()`, capture the mutated history, swap back. On
+    /// error the original `self.history` is restored before the
+    /// error propagates.
+    pub async fn turn_with_history(
+        &mut self,
+        supplied_history: Vec<ChatMessage>,
+        user_message: &str,
+    ) -> Result<TurnWithHistoryResult> {
+        let pre_len = supplied_history.len();
+        // Stash the agent's own history; install the caller's.
+        let original = std::mem::replace(&mut self.history, supplied_history);
+        // Run the turn. `self.history` now holds the supplied
+        // messages and may have grown if turn() succeeded; or it
+        // may be in a half-mutated state if turn() failed midway.
+        let result = self.turn(user_message).await;
+        // Take whatever final state turn() left and restore the
+        // agent's own history. After this, self.history matches
+        // pre-call exactly; the supplied-history-plus-new-messages
+        // lives in `final_history`.
+        let final_history = std::mem::replace(&mut self.history, original);
+        let response = result?;
+        // The new messages are everything turn() added on top of
+        // the supplied prefix.
+        let new_messages = if final_history.len() > pre_len {
+            final_history[pre_len..].to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(TurnWithHistoryResult {
+            response,
+            new_messages,
+        })
+    }
+
     /// Execute a single conversational turn.
     ///
     /// On the first turn the system prompt is built (with memory context) and

@@ -828,18 +828,36 @@ async fn run_gateway(
         tracing::info!("Email channel enabled");
     }
 
-    if let Some(ch) = fennec::channels::OpenAiCompatChannel::from_config_with_agent(
-        &ch_config.openai_compat,
-        Arc::clone(&agent),
-    ) {
-        channels.push(Arc::new(ch));
-        tracing::info!(
-            host = %ch_config.openai_compat.host,
-            port = ch_config.openai_compat.port,
-            model = %ch_config.openai_compat.model_name,
-            backend = "agent",
-            "OpenAI-compat channel enabled"
+    if ch_config.openai_compat.enabled {
+        // Construct the session + response stores so the channel can
+        // honor `X-Fennec-Session-Id` and serve `/v1/responses`.
+        let openai_session_store = Arc::new(
+            fennec::sessions::SessionStore::new(&home_dir.join("sessions.db"))
+                .context("opening sessions.db for openai_compat")?,
         );
+        let openai_response_store = Arc::new(
+            fennec::channels::openai_compat::ResponseStore::new(
+                &home_dir.join("openai_responses.db"),
+            )
+            .context("opening openai_responses.db")?,
+        );
+        if let Some(ch) =
+            fennec::channels::OpenAiCompatChannel::from_config_with_sessions(
+                &ch_config.openai_compat,
+                Arc::clone(&agent),
+                openai_session_store,
+                openai_response_store,
+            )
+        {
+            channels.push(Arc::new(ch));
+            tracing::info!(
+                host = %ch_config.openai_compat.host,
+                port = ch_config.openai_compat.port,
+                model = %ch_config.openai_compat.model_name,
+                backend = "agent",
+                "OpenAI-compat channel enabled (session + response stores wired)"
+            );
+        }
     }
     // Drop the unused-variable warning — `provider` is now optional
     // (the agent owns it internally). Keeping the binding so the

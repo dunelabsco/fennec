@@ -86,11 +86,19 @@ impl ChatBackend {
 
 /// Server state that handlers share. Cloned cheaply via the inner
 /// `Arc`s.
+///
+/// `session_store` and `response_store` are optional because the
+/// passthrough variant doesn't need them; only the agent variant
+/// with session scoping does. When wired, the channel handles the
+/// `X-Fennec-Session-Id` header on `/v1/chat/completions` and
+/// serves `/v1/responses` chain walks.
 #[derive(Clone)]
 pub struct ServerState {
     pub backend: ChatBackend,
     pub api_key: Arc<String>,
     pub model_name: Arc<String>,
+    pub session_store: Option<Arc<crate::sessions::SessionStore>>,
+    pub response_store: Option<Arc<super::response_store::ResponseStore>>,
 }
 
 impl ServerState {
@@ -106,10 +114,15 @@ impl ServerState {
             backend: ChatBackend::Provider(provider),
             api_key,
             model_name,
+            session_store: None,
+            response_store: None,
         }
     }
 
-    /// Construct with a full-agent backend.
+    /// Construct with a full-agent backend, no session scoping.
+    /// Existing chat_completions_agent path uses this — callers that
+    /// don't supply `X-Fennec-Session-Id` get the agent's default
+    /// state.
     pub fn from_agent(
         agent: Arc<Mutex<Agent>>,
         api_key: Arc<String>,
@@ -119,6 +132,29 @@ impl ServerState {
             backend: ChatBackend::Agent(agent),
             api_key,
             model_name,
+            session_store: None,
+            response_store: None,
+        }
+    }
+
+    /// Construct with a full-agent backend AND session scoping.
+    /// Each request that carries `X-Fennec-Session-Id` (or arrives
+    /// at `/v1/responses`) loads its own conversation history from
+    /// `session_store` and persists back, leaving the default-session
+    /// agent state untouched.
+    pub fn from_agent_with_sessions(
+        agent: Arc<Mutex<Agent>>,
+        api_key: Arc<String>,
+        model_name: Arc<String>,
+        session_store: Arc<crate::sessions::SessionStore>,
+        response_store: Arc<super::response_store::ResponseStore>,
+    ) -> Self {
+        Self {
+            backend: ChatBackend::Agent(agent),
+            api_key,
+            model_name,
+            session_store: Some(session_store),
+            response_store: Some(response_store),
         }
     }
 }
@@ -222,6 +258,18 @@ pub async fn chat_completions(
         .and_then(|o| o.include_usage)
         .unwrap_or(false);
 
+    // Read X-Fennec-Session-Id header. When present and a session
+    // store is wired, the request is treated as session-scoped:
+    // history is loaded from the store, run through the agent, and
+    // persisted back. Absent or store-not-configured: existing
+    // single-shared-agent behavior.
+    let session_id = headers
+        .get("x-fennec-session-id")
+        .or_else(|| headers.get("X-Fennec-Session-Id"))
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .filter(|s| !s.is_empty());
+
     match &state.backend {
         ChatBackend::Provider(provider) => {
             chat_completions_provider(
@@ -234,6 +282,30 @@ pub async fn chat_completions(
             .await
         }
         ChatBackend::Agent(agent) => {
+            // Session-scoped path: only when X-Fennec-Session-Id +
+            // session_store are both present, AND streaming wasn't
+            // requested. The session-scoped flow is non-streaming
+            // because turn_with_history needs the full conversation
+            // before the agent runs; streaming through that path
+            // would require a separate primitive.
+            if let (Some(sid), Some(store)) =
+                (session_id.as_deref(), state.session_store.as_ref())
+            {
+                if !stream_requested {
+                    return chat_completions_agent_session_scoped(
+                        Arc::clone(agent),
+                        Arc::clone(store),
+                        sid.to_string(),
+                        request,
+                        model_name,
+                    )
+                    .await;
+                }
+                tracing::debug!(
+                    "openai_compat: stream=true with X-Fennec-Session-Id falls back \
+                     to default-session streaming (session-scoped streaming not yet supported)"
+                );
+            }
             chat_completions_agent(
                 Arc::clone(agent),
                 request,
@@ -244,6 +316,108 @@ pub async fn chat_completions(
             .await
         }
     }
+}
+
+/// Session-scoped chat completions: load per-session history,
+/// run the agent against it via `turn_with_history`, persist new
+/// messages back to the session store. The default-session agent
+/// state is unaffected.
+async fn chat_completions_agent_session_scoped(
+    agent: Arc<Mutex<Agent>>,
+    session_store: Arc<crate::sessions::SessionStore>,
+    client_session_id: String,
+    request: ChatCompletionRequest,
+    model_name: String,
+) -> Response {
+    use super::session_id;
+
+    let user_msg = match last_user_text(&request.messages) {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "no non-empty user message found in `messages`",
+                Some("messages".into()),
+            );
+        }
+    };
+
+    if let Err(e) = session_id::ensure_session(&session_store, &client_session_id).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("could not ensure session row: {}", e),
+            None,
+        );
+    }
+
+    let history = match session_id::load_history(&session_store, &client_session_id).await {
+        Ok(h) => h,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("could not load session history: {}", e),
+                None,
+            );
+        }
+    };
+
+    let mut guard = agent.lock().await;
+    let result = match guard.turn_with_history(history, &user_msg).await {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                format!("agent returned error: {}", e),
+                None,
+            );
+        }
+    };
+    drop(guard);
+
+    if let Err(e) =
+        session_id::append_messages(&session_store, &client_session_id, &result.new_messages).await
+    {
+        // Persist failure isn't fatal — the response succeeded;
+        // we log and continue. Future session loads will miss this
+        // turn, which is the operator's problem to fix (disk full,
+        // db locked, etc.).
+        tracing::warn!(error = %e, "openai_compat: failed to persist session messages");
+    }
+
+    let body = ChatCompletionResponse {
+        id: new_completion_id(),
+        object: "chat.completion".into(),
+        created: now_unix(),
+        model: model_name,
+        choices: vec![ChatCompletionChoice {
+            index: 0,
+            message: ChatResponseMessage {
+                role: "assistant".into(),
+                content: Some(result.response),
+                tool_calls: None,
+                refusal: None,
+            },
+            finish_reason: Some("stop".into()),
+            logprobs: None,
+        }],
+        usage: None,
+        system_fingerprint: None,
+        service_tier: None,
+    };
+
+    let mut response = (StatusCode::OK, Json(body)).into_response();
+    // Echo the session id back so clients that didn't generate one
+    // (got assigned by the server) can keep using it.
+    if let Ok(value) = axum::http::HeaderValue::from_str(&client_session_id) {
+        response
+            .headers_mut()
+            .insert("x-fennec-session-id", value);
+    }
+    response
 }
 
 /// Provider passthrough variant — the original E-2-1 implementation.
@@ -382,6 +556,283 @@ fn last_user_text(messages: &[ChatRequestMessage]) -> Option<String> {
         .rev()
         .find(|m| m.role == "user")
         .and_then(|m| m.content.as_ref().map(flatten_content))
+}
+
+// -- /v1/responses -------------------------------------------------
+
+pub async fn responses(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<ResponsesRequest>,
+) -> Response {
+    if let Err(reason) = check_bearer(&headers, &state.api_key) {
+        return error_response(StatusCode::UNAUTHORIZED, "invalid_request_error", reason, None);
+    }
+
+    let agent = match &state.backend {
+        ChatBackend::Agent(a) => Arc::clone(a),
+        ChatBackend::Provider(_) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "/v1/responses requires the agent backend; this server is in passthrough mode",
+                None,
+            );
+        }
+    };
+
+    let session_store = match state.session_store.as_ref() {
+        Some(s) => Arc::clone(s),
+        None => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "/v1/responses requires a session store (configure [channels.openai_compat])",
+                None,
+            );
+        }
+    };
+    let response_store = match state.response_store.as_ref() {
+        Some(s) => Arc::clone(s),
+        None => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "/v1/responses requires a response store",
+                None,
+            );
+        }
+    };
+
+    if request.previous_response_id.is_some() && request.conversation.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "cannot supply both `previous_response_id` and `conversation`",
+            Some("conversation".into()),
+        );
+    }
+
+    // Normalize `input` to a list of {role, content} pairs.
+    let input_messages: Vec<(String, String)> = match &request.input {
+        Value::String(s) => vec![("user".into(), s.clone())],
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(("user".into(), s.clone())),
+                    Value::Object(_) => {
+                        let role = item
+                            .get("role")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("user")
+                            .to_string();
+                        let content = item
+                            .get("content")
+                            .map(flatten_content)
+                            .unwrap_or_default();
+                        out.push((role, content));
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+        Value::Null => Vec::new(),
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "`input` must be a string or array",
+                Some("input".into()),
+            );
+        }
+    };
+
+    let user_msg: String = input_messages
+        .iter()
+        .rev()
+        .find(|(role, _)| role == "user")
+        .map(|(_, c)| c.clone())
+        .unwrap_or_default();
+    if user_msg.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "`input` must contain a non-empty user message",
+            Some("input".into()),
+        );
+    }
+
+    // Build the agent's history. Precedence:
+    //   1. explicit conversation_history (client-supplied) — purely
+    //      stateless mode; ignores chain pointers.
+    //   2. previous_response_id — walk the chain.
+    //   3. conversation name — resolve to latest response_id, walk.
+    //   4. nothing — fresh conversation.
+    let mut prev_id_for_chain: Option<String> = request.previous_response_id.clone();
+    let history: Vec<ChatMessage> = if let Some(supplied) = &request.conversation_history {
+        supplied
+            .iter()
+            .map(|m| ChatMessage {
+                role: m.role.clone(),
+                content: m.content.as_ref().map(flatten_content),
+                tool_calls: None,
+                tool_call_id: None,
+            })
+            .collect()
+    } else if let Some(prev_id) = &prev_id_for_chain {
+        match response_store.chain_as_messages(prev_id).await {
+            Ok(h) => h,
+            Err(e) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    format!("could not load response chain: {}", e),
+                    None,
+                );
+            }
+        }
+    } else if let Some(conv_name) = &request.conversation {
+        let resolved = match response_store.get_conversation(conv_name).await {
+            Ok(v) => v,
+            Err(e) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    format!("could not resolve conversation: {}", e),
+                    None,
+                );
+            }
+        };
+        if let Some(rid) = resolved {
+            prev_id_for_chain = Some(rid.clone());
+            match response_store.chain_as_messages(&rid).await {
+                Ok(h) => h,
+                Err(e) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        format!("could not load response chain: {}", e),
+                        None,
+                    );
+                }
+            }
+        } else {
+            // Brand-new conversation name — empty history.
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Run the agent.
+    let model_name = (*state.model_name).clone();
+    let mut guard = agent.lock().await;
+    let result = match guard.turn_with_history(history, &user_msg).await {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                format!("agent returned error: {}", e),
+                None,
+            );
+        }
+    };
+    drop(guard);
+
+    let new_response_id = new_response_id();
+    let session_id_for_store = request
+        .conversation
+        .clone()
+        .or(prev_id_for_chain.clone())
+        .unwrap_or_else(|| format!("anon-{}", uuid::Uuid::new_v4().simple()));
+
+    // Persist user input + assistant response into the chain — but
+    // only when `store: true`. Each becomes a node; the user node
+    // links to prev_id_for_chain, the assistant node links to the
+    // user node.
+    let mut response_id_to_return = new_response_id.clone();
+    if request.store {
+        let user_node_id = new_response_id.clone() + "-in";
+        if let Err(e) = response_store
+            .put(
+                &user_node_id,
+                prev_id_for_chain.as_deref(),
+                &session_id_for_store,
+                "user",
+                &user_msg,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "openai_compat /v1/responses: persist user node failed");
+        }
+        if let Err(e) = response_store
+            .put(
+                &new_response_id,
+                Some(&user_node_id),
+                &session_id_for_store,
+                "assistant",
+                &result.response,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "openai_compat /v1/responses: persist assistant node failed");
+        }
+        if let Some(name) = request.conversation.as_ref() {
+            if let Err(e) = response_store
+                .set_conversation(name, &new_response_id)
+                .await
+            {
+                tracing::warn!(error = %e, "openai_compat /v1/responses: conversation pointer update failed");
+            }
+        }
+        response_id_to_return = new_response_id;
+    }
+
+    // Touch session_store for cross-platform visibility (so the
+    // user can search OpenAI conversations through session_search).
+    let session_for_history = format!("openai_compat:{}", session_id_for_store);
+    if let Err(e) = session_store
+        .create_session_with_id(&session_for_history, "openai_compat")
+        .await
+    {
+        tracing::debug!(error = %e, "openai_compat: session row creation failed");
+    }
+    if let Err(e) = session_store
+        .add_message(&session_for_history, "user", &user_msg)
+        .await
+    {
+        tracing::debug!(error = %e, "openai_compat: session user message persist failed");
+    }
+    if let Err(e) = session_store
+        .add_message(&session_for_history, "assistant", &result.response)
+        .await
+    {
+        tracing::debug!(error = %e, "openai_compat: session assistant message persist failed");
+    }
+
+    let body = ResponsesResponse {
+        id: response_id_to_return.clone(),
+        object: "response".into(),
+        created_at: now_unix(),
+        model: model_name,
+        status: "completed".into(),
+        output: vec![ResponsesOutputItem {
+            type_: "message".into(),
+            id: format!("msg-{}", uuid::Uuid::new_v4().simple()),
+            role: "assistant".into(),
+            content: vec![ResponsesOutputContent {
+                type_: "output_text".into(),
+                text: result.response,
+            }],
+        }],
+        previous_response_id: prev_id_for_chain,
+        usage: None,
+    };
+
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Build a non-streaming Chat Completions response from a provider

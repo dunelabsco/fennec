@@ -15,6 +15,17 @@ pub struct SearchHit {
     pub score: f64,
 }
 
+/// One message read out of `session_messages`. Returned from
+/// [`SessionStore::list_messages_for_session`].
+#[derive(Debug, Clone)]
+pub struct MessageRow {
+    pub id: i64,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
+}
+
 /// Metadata for a session.
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
@@ -115,6 +126,102 @@ impl SessionStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Look up a single session by id.
+    pub async fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, channel, started_at, ended_at, summary
+                 FROM sessions
+                 WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![session_id])?;
+            if let Some(row) = rows.next()? {
+                Ok::<_, anyhow::Error>(Some(SessionRecord {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    started_at: row.get(2)?,
+                    ended_at: row.get(3)?,
+                    summary: row.get(4)?,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?
+    }
+
+    /// List messages for a session in time order, capped by `limit`.
+    /// Used by the OpenAI-compat channel to load per-session
+    /// conversation history into the agent on each request.
+    pub async fn list_messages_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageRow>> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, role, content, timestamp
+                 FROM session_messages
+                 WHERE session_id = ?1
+                 ORDER BY id ASC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![session_id, limit as i64],
+                |row| {
+                    Ok(MessageRow {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        role: row.get(2)?,
+                        content: row.get(3)?,
+                        timestamp: row.get(4)?,
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok::<_, anyhow::Error>(out)
+        })
+        .await?
+    }
+
+    /// Create a session row with a caller-supplied id and channel.
+    /// Idempotent — uses `INSERT OR IGNORE`, so a second call with
+    /// the same id is a no-op.
+    ///
+    /// Used by the OpenAI-compat channel, which honors a client-
+    /// supplied `X-Fennec-Session-Id` header (prefixed with
+    /// `openai_compat:`). Other channels generate UUIDs via
+    /// [`Self::create_session`].
+    pub async fn create_session_with_id(
+        &self,
+        session_id: &str,
+        channel: &str,
+    ) -> Result<()> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        let channel = channel.to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now().to_rfc3339();
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT OR IGNORE INTO sessions (id, channel, started_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![session_id, channel, now],
+            )
+            .context("inserting session with supplied id")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
     }
 
     /// Create a new session for the given channel. Returns the session ID.

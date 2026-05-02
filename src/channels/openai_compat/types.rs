@@ -252,6 +252,89 @@ pub struct ToolCallFunctionDelta {
     pub arguments: Option<String>,
 }
 
+// -- /v1/responses (OpenAI Responses API) --------------------------
+
+/// Request body for `POST /v1/responses`. The Responses API is
+/// OpenAI's stateful counterpart to Chat Completions: clients chain
+/// requests via `previous_response_id` (server stores conversations)
+/// or supply explicit `conversation_history` (client stores).
+///
+/// `input` is required; everything else is optional. We accept both
+/// the string shape and the array-of-messages shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub input: Value,
+    /// Optional system prompt prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Server-side chain pointer. Server walks back from this id to
+    /// reconstruct the conversation history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    /// Named conversation alias (`conversation: "project-x"` →
+    /// resolves to the latest response_id for that name).
+    /// Mutually exclusive with `previous_response_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+    /// Whether to persist this turn into the response store.
+    /// Default true. Set false for ephemeral turns.
+    #[serde(default = "default_store")]
+    pub store: bool,
+    /// Bypasses server-side history and uses caller-supplied
+    /// history directly. Mutually exclusive with the chain
+    /// pointers. Each entry has `role` + `content` (string or
+    /// flattened text-only array).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_history: Option<Vec<ChatRequestMessage>>,
+}
+
+fn default_store() -> bool {
+    true
+}
+
+/// Response body for `POST /v1/responses`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesResponse {
+    pub id: String,
+    /// Always `"response"`.
+    pub object: String,
+    pub created_at: u64,
+    pub model: String,
+    /// `"completed"` for now (we don't expose async runs through
+    /// this endpoint).
+    pub status: String,
+    pub output: Vec<ResponsesOutputItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesOutputItem {
+    /// Always `"message"` for now.
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub id: String,
+    pub role: String,
+    pub content: Vec<ResponsesOutputContent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesOutputContent {
+    /// Always `"output_text"` for assistant text.
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub text: String,
+}
+
+/// Build a fresh response id (`resp-<uuid>`).
+pub fn new_response_id() -> String {
+    format!("resp-{}", uuid::Uuid::new_v4().simple())
+}
+
 // -- /v1/models ----------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
