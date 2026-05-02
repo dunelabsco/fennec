@@ -198,6 +198,7 @@ pub struct ChannelsConfig {
     pub slack: SlackChannelEntry,
     pub whatsapp: WhatsAppChannelEntry,
     pub email: EmailChannelEntry,
+    pub openai_compat: OpenAiCompatChannelEntry,
 }
 
 impl Default for ChannelsConfig {
@@ -208,6 +209,62 @@ impl Default for ChannelsConfig {
             slack: SlackChannelEntry::default(),
             whatsapp: WhatsAppChannelEntry::default(),
             email: EmailChannelEntry::default(),
+            openai_compat: OpenAiCompatChannelEntry::default(),
+        }
+    }
+}
+
+/// OpenAI-compatible HTTP API channel.
+///
+/// When enabled, Fennec serves an HTTP endpoint that speaks the
+/// OpenAI Chat Completions wire format on `/v1/chat/completions`
+/// plus the supporting `/v1/models`, `/v1/capabilities`, and
+/// `/health*` endpoints. Any OpenAI SDK or compatible client
+/// (Cursor's "OpenAI-compatible" mode, Open WebUI, raycast
+/// extensions, custom scripts) can use Fennec by pointing its
+/// base URL at `http://<host>:<port>/v1` and supplying the
+/// configured Bearer token as an API key.
+///
+/// E-2-1 ships a passthrough — requests are forwarded to Fennec's
+/// configured primary LLM provider with no agent-loop side effects.
+/// Tools, memory, skills are NOT exposed through this endpoint
+/// yet; that wiring lands in E-2-2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenAiCompatChannelEntry {
+    /// Master switch. Off means the HTTP server doesn't bind.
+    pub enabled: bool,
+    /// Listen address. Default `127.0.0.1` for local-only — change
+    /// to `0.0.0.0` to expose on the LAN. There is no TLS here;
+    /// put a reverse proxy (caddy / nginx / Traefik) in front for
+    /// internet-facing deployments.
+    pub host: String,
+    /// Listen port. Default 8642 matches the upstream default.
+    pub port: u16,
+    /// Bearer token clients must present in `Authorization: Bearer
+    /// <key>`. Empty disables auth (only safe on a trusted-network
+    /// `host = 127.0.0.1` deployment); a startup warning is logged.
+    pub api_key: String,
+    /// Model name advertised in `/v1/models` and accepted in the
+    /// request body. The agent always uses Fennec's configured
+    /// primary provider regardless of this string — it's a label,
+    /// not a routing key. Default `"fennec-agent"`.
+    pub model_name: String,
+    /// CORS allow-origin. `*` permits any origin (handy for local
+    /// dev with browser-based clients), or a comma-separated list
+    /// of origins. Empty disables CORS entirely.
+    pub cors_origins: String,
+}
+
+impl Default for OpenAiCompatChannelEntry {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".into(),
+            port: 8642,
+            api_key: String::new(),
+            model_name: "fennec-agent".into(),
+            cors_origins: String::new(),
         }
     }
 }
