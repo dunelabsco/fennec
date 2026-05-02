@@ -828,18 +828,23 @@ async fn run_gateway(
         tracing::info!("Email channel enabled");
     }
 
-    if let Some(ch) = fennec::channels::OpenAiCompatChannel::from_config(
+    if let Some(ch) = fennec::channels::OpenAiCompatChannel::from_config_with_agent(
         &ch_config.openai_compat,
-        Arc::clone(&provider),
+        Arc::clone(&agent),
     ) {
         channels.push(Arc::new(ch));
         tracing::info!(
             host = %ch_config.openai_compat.host,
             port = ch_config.openai_compat.port,
             model = %ch_config.openai_compat.model_name,
+            backend = "agent",
             "OpenAI-compat channel enabled"
         );
     }
+    // Drop the unused-variable warning — `provider` is now optional
+    // (the agent owns it internally). Keeping the binding so the
+    // `build_agent` return tuple still destructures cleanly.
+    let _ = provider;
 
     // 3a. Populate the channel map so tools (e.g. ask_user) can reach channels.
     {
