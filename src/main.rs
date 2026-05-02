@@ -233,6 +233,7 @@ async fn build_agent(
     Arc<Mutex<Option<CronOrigin>>>,
     fennec::bus::PendingReplies,
     fennec::bus::ChatDirectory,
+    Arc<dyn Provider>,
 )> {
     // Create SecretStore.
     let secret_store =
@@ -660,7 +661,7 @@ async fn build_agent(
         .build()
         .context("building agent")?;
 
-    Ok((agent, memory, cron_origin, pending_replies, chat_directory))
+    Ok((agent, memory, cron_origin, pending_replies, chat_directory, provider))
 }
 
 async fn run_agent(
@@ -672,7 +673,7 @@ async fn run_agent(
     // CLI mode doesn't run the gateway, so the channel-aware handles are
     // unused here. We still need to bind them to suppress unused-let
     // warnings without losing the build_agent return-shape.
-    let (mut agent, memory, _cron_origin, _pending_replies, _chat_directory) =
+    let (mut agent, memory, _cron_origin, _pending_replies, _chat_directory, _provider) =
         build_agent(&config, &home_dir, model, None).await?;
 
     if let Some(msg) = message {
@@ -753,7 +754,7 @@ async fn run_gateway(
     let channel_map = new_channel_map();
 
     // 2. Build Agent (pass channel map so ask_user tool can reach channels).
-    let (agent, _memory, cron_origin, pending_replies, chat_directory) =
+    let (agent, _memory, cron_origin, pending_replies, chat_directory, provider) =
         build_agent(&config, &home_dir, None, Some(channel_map.clone())).await?;
     let agent = Arc::new(tokio::sync::Mutex::new(agent));
 
@@ -826,6 +827,24 @@ async fn run_gateway(
         channels.push(Arc::new(ch));
         tracing::info!("Email channel enabled");
     }
+
+    if let Some(ch) = fennec::channels::OpenAiCompatChannel::from_config_with_agent(
+        &ch_config.openai_compat,
+        Arc::clone(&agent),
+    ) {
+        channels.push(Arc::new(ch));
+        tracing::info!(
+            host = %ch_config.openai_compat.host,
+            port = ch_config.openai_compat.port,
+            model = %ch_config.openai_compat.model_name,
+            backend = "agent",
+            "OpenAI-compat channel enabled"
+        );
+    }
+    // Drop the unused-variable warning — `provider` is now optional
+    // (the agent owns it internally). Keeping the binding so the
+    // `build_agent` return tuple still destructures cleanly.
+    let _ = provider;
 
     // 3a. Populate the channel map so tools (e.g. ask_user) can reach channels.
     {
