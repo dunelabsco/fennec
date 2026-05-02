@@ -16,7 +16,14 @@ use super::thinking::{self, ThinkingLevel};
 /// The core agent that orchestrates provider calls, tool execution, and memory.
 pub struct Agent {
     provider: Arc<dyn Provider>,
-    tools: Vec<Box<dyn Tool>>,
+    /// Tools the agent can dispatch to. Stored as `Arc<dyn Tool>` so a
+    /// single tool instance can be shared across multiple Agent
+    /// instances (the OpenAI-compat channel constructs a fresh agent
+    /// per HTTP request and reuses the same tool registry — see
+    /// E-2-3). The legacy `AgentBuilder::tool(Box<dyn Tool>)` API is
+    /// preserved by transparently converting `Box -> Arc` at insertion
+    /// time, so existing call sites don't change.
+    tools: Vec<Arc<dyn Tool>>,
     tool_specs: Vec<ToolSpec>,
     memory: Arc<dyn Memory>,
     prompt_builder: SystemPromptBuilder,
@@ -447,9 +454,20 @@ impl Agent {
 // ---------------------------------------------------------------------------
 
 /// Builder for constructing an [`Agent`] with validated configuration.
+///
+/// Tools are stored as `Arc<dyn Tool>` (shared) rather than
+/// `Box<dyn Tool>` (owned), so a single tool instance can be reused
+/// across many `Agent` constructions. The legacy
+/// `tool(Box<dyn Tool>)` and `tools(Vec<Box<dyn Tool>>)` setters
+/// transparently convert via `Arc::from(Box)` so existing call sites
+/// don't have to change. New callers (the OpenAI-compat session-
+/// scoped agent factory) can use `tool_arc(Arc<dyn Tool>)` and
+/// `tools_arc(Vec<Arc<dyn Tool>>)` to share a pre-built tool
+/// registry across many fresh agents without reconstructing each
+/// tool per request.
 pub struct AgentBuilder {
     provider: Option<Arc<dyn Provider>>,
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
     memory: Option<Arc<dyn Memory>>,
     identity_name: Option<String>,
     identity_persona: Option<String>,
@@ -487,12 +505,35 @@ impl AgentBuilder {
         self
     }
 
+    /// Add a single tool. Accepts the legacy `Box<dyn Tool>` shape
+    /// to preserve every existing call site (every `Box::new(SomeTool::new(...))`
+    /// across main.rs, channel constructors, tests, etc. continues
+    /// to work unchanged). Internally the box is converted to an
+    /// `Arc` so the tool can later be shared across multiple Agent
+    /// instances.
     pub fn tool(mut self, tool: Box<dyn Tool>) -> Self {
+        self.tools.push(Arc::from(tool));
+        self
+    }
+
+    /// Replace the tool list. Same compatibility shim as
+    /// [`Self::tool`] — accepts `Box<dyn Tool>` for back-compat.
+    pub fn tools(mut self, tools: Vec<Box<dyn Tool>>) -> Self {
+        self.tools = tools.into_iter().map(Arc::from).collect();
+        self
+    }
+
+    /// Add a single Arc-shared tool. Used by callers that already
+    /// hold an `Arc<dyn Tool>` (the OpenAI-compat per-request agent
+    /// factory in particular) and want to skip the `Box -> Arc`
+    /// indirection.
+    pub fn tool_arc(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
     }
 
-    pub fn tools(mut self, tools: Vec<Box<dyn Tool>>) -> Self {
+    /// Replace the tool list with pre-shared Arc'd tools.
+    pub fn tools_arc(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
         self
     }
