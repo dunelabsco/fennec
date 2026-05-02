@@ -14,20 +14,29 @@ pub struct McpToolSpec {
 
 /// A JSON-RPC 2.0 request — always carries an `id` so a response can be
 /// correlated back. See [`JsonRpcNotification`] for the no-id variant.
-#[derive(Debug, Serialize)]
+///
+/// Bidirectional: the MCP client serializes outgoing requests; the
+/// MCP server (when Fennec is acting as one) deserializes incoming
+/// requests on stdin. The id is kept as `serde_json::Value` because
+/// the spec accepts numbers, strings, and null — sticking to a
+/// stricter Rust type would silently disconnect any client that
+/// uses string ids.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
-    pub id: u64,
+    pub id: Value,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
 }
 
 impl JsonRpcRequest {
+    /// Construct a request with a numeric id (the most common case;
+    /// the existing `McpClient` uses sequential `u64` ids).
     pub fn new(id: u64, method: impl Into<String>, params: Option<Value>) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
-            id,
+            id: Value::from(id),
             method: method.into(),
             params,
         }
@@ -41,7 +50,7 @@ impl JsonRpcRequest {
 /// `send_notification` bumped `next_id` and emitted a `JsonRpcRequest`
 /// with an id — then the server's reply would arrive later and be
 /// consumed as if it were the response to a different request.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcNotification {
     pub jsonrpc: String,
     pub method: String,
@@ -60,22 +69,54 @@ impl JsonRpcNotification {
 }
 
 /// A JSON-RPC 2.0 response.
-#[derive(Debug, Deserialize)]
+///
+/// Bidirectional: the MCP client deserializes responses from servers
+/// it called; Fennec's server side serializes responses going out on
+/// stdout. The `id` mirrors the original request's id verbatim
+/// (number, string, or null) to satisfy clients that use non-numeric
+/// ids.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
-    #[allow(dead_code)]
     pub jsonrpc: String,
-    #[allow(dead_code)]
-    pub id: Option<u64>,
+    pub id: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
 }
 
+impl JsonRpcResponse {
+    /// Construct a successful response.
+    pub fn success(id: Value, result: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    /// Construct an error response.
+    pub fn error_response(id: Value, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        }
+    }
+}
+
 /// A JSON-RPC 2.0 error.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
-    #[allow(dead_code)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 

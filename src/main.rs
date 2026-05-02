@@ -97,6 +97,24 @@ enum Commands {
     Login,
     /// Run diagnostic checks — provider reachability, API key, memory DB, Plurum, config.
     Doctor,
+    /// MCP (Model Context Protocol) integration.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpAction {
+    /// Run Fennec as an MCP server on stdio. The MCP client (Claude
+    /// Desktop, Cursor, Codex) spawns this and pipes stdin/stdout.
+    /// Logs go to stderr only — never stdout, which is the protocol
+    /// transport.
+    Serve {
+        /// Enable debug-level logging on stderr.
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 /// Resolve the API key from config or provider-specific environment variable.
@@ -1126,9 +1144,64 @@ async fn main() -> Result<()> {
         Commands::Doctor => {
             run_doctor(&config, &home_dir).await?;
         }
+        Commands::Mcp { action } => match action {
+            McpAction::Serve { verbose } => {
+                run_mcp_serve(home_dir, verbose).await?;
+            }
+        },
     }
 
     Ok(())
+}
+
+/// Run Fennec as an MCP server on stdio. Logs to stderr (stdout is
+/// the protocol transport — anything written there desyncs the
+/// JSON-RPC stream). Read-only mode: the server doesn't bring up
+/// channel listeners, just exposes the session DB and a stub
+/// channel list. `messages_send` returns a clear error in that
+/// mode; users who need send must run `fennec gateway` separately
+/// and configure the MCP server to share its channel manager
+/// (future work).
+async fn run_mcp_serve(home_dir: std::path::PathBuf, verbose: bool) -> Result<()> {
+    use fennec::mcp::serve::{EventBridge, McpServerHandler, ServerState, run_stdio};
+    use fennec::sessions::SessionStore;
+
+    // Re-init logging to stderr only — silencing the default
+    // tracing-subscriber that may have been pointed at stdout.
+    let level = if verbose {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(level)
+        .try_init();
+
+    let db_path = home_dir.join("sessions.db");
+    let store = Arc::new(
+        SessionStore::new(&db_path)
+            .with_context(|| format!("opening sessions DB at {}", db_path.display()))?,
+    );
+
+    let bridge = EventBridge::new();
+    bridge
+        .seed_from_store(&store)
+        .await
+        .context("seeding event-bridge cursor from session store")?;
+    let _poller = bridge.spawn_poller(Arc::clone(&store));
+
+    let state = ServerState::new(home_dir.clone(), Arc::clone(&store));
+    // Read-only mode: no channels attached. messages_send and
+    // channels_list will report empty. The user can still consume
+    // every read tool and the events stream.
+    let handler = McpServerHandler::new(state, bridge);
+
+    tracing::info!(
+        db = %db_path.display(),
+        "Fennec MCP server starting on stdio"
+    );
+    run_stdio(handler).await
 }
 
 async fn run_doctor(config: &FennecConfig, home_dir: &std::path::Path) -> Result<()> {
