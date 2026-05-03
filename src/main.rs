@@ -827,6 +827,15 @@ async fn run_gateway(
         tracing::info!("Email channel enabled");
     }
 
+    if let Some(ch) = fennec::channels::MatrixChannel::from_config(&ch_config.matrix) {
+        channels.push(Arc::new(ch));
+        tracing::info!(
+            homeserver = %ch_config.matrix.homeserver,
+            user_id = %ch_config.matrix.user_id,
+            "Matrix channel enabled"
+        );
+    }
+
     // 3a. Populate the channel map so tools (e.g. ask_user) can reach channels.
     {
         let mut map = channel_map.write();
