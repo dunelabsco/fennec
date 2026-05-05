@@ -827,6 +827,15 @@ async fn run_gateway(
         tracing::info!("Email channel enabled");
     }
 
+    if let Some(ch) = fennec::channels::MatrixChannel::from_config(&ch_config.matrix) {
+        channels.push(Arc::new(ch));
+        tracing::info!(
+            homeserver = %ch_config.matrix.homeserver,
+            user_id = %ch_config.matrix.user_id,
+            "Matrix channel enabled"
+        );
+    }
+
     // 3a. Populate the channel map so tools (e.g. ask_user) can reach channels.
     {
         let mut map = channel_map.write();
@@ -930,6 +939,7 @@ async fn run_gateway(
                         chat_id: msg.chat_id.clone(),
                         reply_to: Some(msg.id.clone()),
                         metadata: std::collections::HashMap::new(),
+                        attachments: Vec::new(),
                     };
                     let _ = bus.publish_outbound(outbound).await;
                     continue;
@@ -1033,6 +1043,7 @@ async fn run_gateway(
                             chat_id: msg.chat_id.clone(),
                             reply_to: Some(msg.id.clone()),
                             metadata: std::collections::HashMap::new(),
+                            attachments: Vec::new(),
                         };
                         if let Err(e) = bus.publish_outbound(outbound).await {
                             tracing::error!("Failed to publish outbound: {e}");
@@ -1058,6 +1069,7 @@ async fn run_gateway(
                             chat_id: msg.chat_id.clone(),
                             reply_to: Some(msg.id.clone()),
                             metadata: std::collections::HashMap::new(),
+                            attachments: Vec::new(),
                         };
                         let _ = bus.publish_outbound(outbound).await;
                     }

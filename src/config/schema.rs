@@ -198,6 +198,7 @@ pub struct ChannelsConfig {
     pub slack: SlackChannelEntry,
     pub whatsapp: WhatsAppChannelEntry,
     pub email: EmailChannelEntry,
+    pub matrix: MatrixChannelEntry,
 }
 
 impl Default for ChannelsConfig {
@@ -208,6 +209,110 @@ impl Default for ChannelsConfig {
             slack: SlackChannelEntry::default(),
             whatsapp: WhatsAppChannelEntry::default(),
             email: EmailChannelEntry::default(),
+            matrix: MatrixChannelEntry::default(),
+        }
+    }
+}
+
+/// Matrix channel — speaks the Matrix Client-Server API directly
+/// (no SDK dependency). Auth is either a static `access_token` or
+/// `user_id`+`password` (which the channel exchanges for a token at
+/// startup). Provide `device_id` for stable session identity.
+///
+/// Room visibility:
+///   - `allowed_users`: Matrix user-id allowlist for DM senders. Empty
+///     means everyone is allowed. Format: `@user:server`.
+///   - `allowed_rooms`: room-id allowlist. Empty disables group rooms;
+///     `*` allows all; otherwise an explicit list of `!roomId:server`.
+///   - `free_response_rooms`: rooms in which the bot replies even
+///     without an explicit `@mention` (subset of `allowed_rooms`).
+///
+/// Threading:
+///   - `auto_thread` (default true): in non-free rooms, replies are
+///     wrapped in a thread anchored on the inbound mention.
+///   - `dm_auto_thread` (default false): same behavior in DMs.
+///   - `dm_mention_threads` (default false): in DMs, only thread when
+///     the inbound message contains a mention.
+///
+/// `markdown_to_html` (default true) controls whether the agent's
+/// markdown output is rendered to `formatted_body` HTML alongside the
+/// plain `body`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MatrixChannelEntry {
+    pub enabled: bool,
+    /// Homeserver base URL, e.g. `https://matrix.org`.
+    pub homeserver: String,
+    /// Long-lived access token. Preferred over password.
+    pub access_token: String,
+    /// Bot user-id, e.g. `@fennec:matrix.org`. Required.
+    pub user_id: String,
+    /// Password (only used when `access_token` is empty).
+    pub password: String,
+    /// Stable device id; recommended even without E2EE so the
+    /// homeserver doesn't churn devices on each restart.
+    pub device_id: String,
+    /// DM allowlist (matrix user-ids). Empty means everyone.
+    pub allowed_users: Vec<String>,
+    /// Room allowlist (`!roomId:server` or `*` or empty).
+    pub allowed_rooms: Vec<String>,
+    /// Rooms where the bot answers without requiring an `@mention`.
+    pub free_response_rooms: Vec<String>,
+    /// Whether to require an `@mention` in non-free rooms. Default true.
+    pub require_mention: bool,
+    /// Auto-thread replies in non-free rooms. Default true.
+    pub auto_thread: bool,
+    /// Auto-thread replies in DMs. Default false.
+    pub dm_auto_thread: bool,
+    /// In DMs, only thread when the inbound has a mention. Default false.
+    pub dm_mention_threads: bool,
+    /// Render markdown to HTML `formatted_body`. Default true.
+    pub markdown_to_html: bool,
+    /// Optional directory for caching inbound media files
+    /// (`m.image` / `m.file` / `m.audio` / `m.video`). When set,
+    /// the channel downloads the binary on receipt and surfaces the
+    /// local path in `metadata.matrix_media_path` so vision /
+    /// transcription tools can consume it directly. Empty disables
+    /// auto-download (only the `mxc://` URL is surfaced).
+    pub media_cache_dir: String,
+    /// Optional path where the channel persists its `next_batch`
+    /// sync token across restarts. When set, the channel resumes
+    /// from the last seen point rather than re-running the initial
+    /// sync. Empty disables persistence (every restart re-syncs).
+    pub state_file: String,
+    /// If non-zero, outbound text messages destined for the same
+    /// chat within this many milliseconds are coalesced into a
+    /// single send. Mirrors the upstream's batching behavior for
+    /// rapid-fire LLM output. Default 0 (no batching) — Fennec
+    /// emits one message per turn so this is mostly future-proofing
+    /// for streaming-style integrations.
+    pub text_batch_delay_ms: u64,
+    /// Default destination for `send_message` calls without a chat
+    /// id. Empty falls back to most-recent inbound.
+    pub home_chat_id: String,
+}
+
+impl Default for MatrixChannelEntry {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            homeserver: String::new(),
+            access_token: String::new(),
+            user_id: String::new(),
+            password: String::new(),
+            device_id: String::new(),
+            allowed_users: Vec::new(),
+            allowed_rooms: Vec::new(),
+            free_response_rooms: Vec::new(),
+            require_mention: true,
+            auto_thread: true,
+            dm_auto_thread: false,
+            dm_mention_threads: false,
+            markdown_to_html: true,
+            media_cache_dir: String::new(),
+            state_file: String::new(),
+            text_batch_delay_ms: 0,
+            home_chat_id: String::new(),
         }
     }
 }
