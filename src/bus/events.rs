@@ -31,7 +31,9 @@ pub struct OutboundMessage {
 /// Kind of a media attachment. Maps to channel-specific message
 /// types — Matrix `m.image`/`m.file`/`m.audio`/`m.video`,
 /// Telegram `sendPhoto`/`sendDocument`/`sendAudio`/`sendVideo`,
-/// etc.
+/// etc. `Voice` is a hint that the audio is a voice message
+/// rather than a generic audio file (Matrix renders these
+/// differently when the MSC3245 marker is present).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
@@ -39,6 +41,7 @@ pub enum MediaKind {
     File,
     Audio,
     Video,
+    Voice,
 }
 
 /// A binary attachment to an outbound message. The bytes travel

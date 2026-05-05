@@ -275,6 +275,18 @@ pub struct MatrixChannelEntry {
     /// transcription tools can consume it directly. Empty disables
     /// auto-download (only the `mxc://` URL is surfaced).
     pub media_cache_dir: String,
+    /// Optional path where the channel persists its `next_batch`
+    /// sync token across restarts. When set, the channel resumes
+    /// from the last seen point rather than re-running the initial
+    /// sync. Empty disables persistence (every restart re-syncs).
+    pub state_file: String,
+    /// If non-zero, outbound text messages destined for the same
+    /// chat within this many milliseconds are coalesced into a
+    /// single send. Mirrors the upstream's batching behavior for
+    /// rapid-fire LLM output. Default 0 (no batching) — Fennec
+    /// emits one message per turn so this is mostly future-proofing
+    /// for streaming-style integrations.
+    pub text_batch_delay_ms: u64,
     /// Default destination for `send_message` calls without a chat
     /// id. Empty falls back to most-recent inbound.
     pub home_chat_id: String,
@@ -298,6 +310,8 @@ impl Default for MatrixChannelEntry {
             dm_mention_threads: false,
             markdown_to_html: true,
             media_cache_dir: String::new(),
+            state_file: String::new(),
+            text_batch_delay_ms: 0,
             home_chat_id: String::new(),
         }
     }

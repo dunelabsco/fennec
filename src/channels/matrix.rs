@@ -91,10 +91,13 @@ const TYPING_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const STARTUP_GRACE_MS: u64 = 5_000;
 /// HTTP per-request timeout for non-sync calls.
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max attempts for an inbound media download before giving up.
+const MEDIA_DOWNLOAD_ATTEMPTS: u32 = 3;
 
 // -- Types -------------------------------------------------------
 
 /// Matrix channel handle. Cheap to clone via `Arc`s inside.
+#[derive(Clone)]
 pub struct MatrixChannel {
     config: MatrixChannelEntry,
     state: Arc<MatrixState>,
@@ -132,6 +135,18 @@ struct MatrixState {
     /// caller. Capped implicitly by HashMap key set size (one
     /// entry per active chat).
     last_sent_by_chat: Mutex<HashMap<String, String>>,
+    /// Per-chat text-message buffer for the
+    /// `text_batch_delay_ms` feature. When the delay is non-zero,
+    /// `send` pushes here instead of dispatching immediately and a
+    /// flush task drains the buffer after the delay window.
+    text_batch_buffers: Mutex<HashMap<String, Vec<BufferedText>>>,
+}
+
+#[derive(Debug, Clone)]
+struct BufferedText {
+    content: String,
+    metadata: HashMap<String, String>,
+    reply_to: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -205,6 +220,7 @@ impl MatrixChannel {
                 typing_failures: Mutex::new(HashMap::new()),
                 started_at_ms,
                 last_sent_by_chat: Mutex::new(HashMap::new()),
+                text_batch_buffers: Mutex::new(HashMap::new()),
             }),
             http,
         })
@@ -380,6 +396,11 @@ impl MatrixChannel {
         }
         if let Some(nb) = body.get("next_batch").and_then(|v| v.as_str()) {
             *self.state.next_batch.lock() = Some(nb.to_string());
+            // Best-effort persist so a restart resumes here. Logged
+            // but not failed-on if the disk write trips.
+            if let Err(e) = self.persist_state().await {
+                tracing::debug!(error = %e, "matrix state persist failed");
+            }
         }
         // Refresh DM cache from account_data.
         if let Some(account) = body.get("account_data") {
@@ -629,6 +650,19 @@ impl MatrixChannel {
             msgtype,
             "m.image" | "m.file" | "m.audio" | "m.video"
         );
+        // Suppress transport-style filenames (`IMG_*.jpg`,
+        // `signal-*.png`, etc.) from the visible body; the agent
+        // should respond to the media itself, not the auto-name.
+        // The full filename is still recoverable via the
+        // `matrix_media_filename` metadata field below.
+        let mut body = body;
+        let media_filename = if is_media_msg && looks_like_transport_filename(&body) {
+            let captured = body.clone();
+            body = String::new();
+            Some(captured)
+        } else {
+            None
+        };
         if body.is_empty() && !is_media_msg {
             return None;
         }
@@ -697,11 +731,8 @@ impl MatrixChannel {
         {
             metadata.insert("matrix_media_duration_ms".into(), d.to_string());
         }
-        if is_media && raw_body.is_empty() {
-            // Media-only events sometimes ship empty body; we
-            // still want them to surface so the agent can react.
-            // Use the filename / msgtype label as a placeholder.
-            // (This mirrors what the upstream does.)
+        if let Some(name) = media_filename {
+            metadata.insert("matrix_media_filename".into(), name);
         }
 
         Some(InboundMessage {
@@ -908,6 +939,99 @@ impl MatrixChannel {
 enum SyncError {
     Permanent(anyhow::Error),
     Transient(anyhow::Error),
+}
+
+/// State for an in-flight Matrix approval prompt: a message the
+/// bot sent, decorated with seed reactions (e.g. ✅ / ❎) that the
+/// human is expected to click on. Higher-level flows
+/// (`ask_user_tool`-style approvals) construct one of these,
+/// `send` it, then on inbound `m.reaction` events with
+/// `matrix_reaction_target` matching `prompt_event_id` resolve to
+/// the user's choice. `cleanup` redacts the bot's seed reactions
+/// once the prompt is resolved.
+///
+/// The struct is the *capability layer*; wiring it to Fennec's
+/// generic `ask_user_tool` flow is a cross-cutting concern that
+/// requires hooking reaction-as-reply into `PendingReplies`. Until
+/// that's done, this type is available for direct use by
+/// Matrix-specific tools or tests.
+#[derive(Debug, Clone)]
+pub struct MatrixApprovalPrompt {
+    pub room_id: String,
+    pub prompt_event_id: String,
+    /// Seed reactions the bot added (key → reaction event_id).
+    /// Used by `cleanup` to redact each one.
+    pub seed_reactions: Vec<(String, String)>,
+}
+
+impl MatrixApprovalPrompt {
+    /// Send a fresh prompt: posts `prompt_text` as `m.text`,
+    /// then adds each `seed_key` as an `m.reaction` so the user
+    /// can resolve the prompt with one click.
+    pub async fn send(
+        channel: &MatrixChannel,
+        room_id: &str,
+        prompt_text: &str,
+        seed_keys: &[&str],
+    ) -> Result<Self> {
+        let mut content = json!({
+            "msgtype": "m.text",
+            "body": prompt_text,
+        });
+        if channel.config.markdown_to_html && chunk_has_markdown(prompt_text) {
+            let html = markdown_to_html(prompt_text);
+            let obj = content.as_object_mut().unwrap();
+            obj.insert("format".into(), json!("org.matrix.custom.html"));
+            obj.insert("formatted_body".into(), json!(html));
+        }
+        let prompt_event_id = channel
+            .send_event(room_id, "m.room.message", content)
+            .await?;
+        let mut seed_reactions = Vec::with_capacity(seed_keys.len());
+        for key in seed_keys {
+            match channel.react(room_id, &prompt_event_id, key).await {
+                Ok(rx_id) => seed_reactions.push((key.to_string(), rx_id)),
+                Err(e) => {
+                    tracing::debug!(
+                        room = %room_id,
+                        key = %key,
+                        error = %e,
+                        "matrix approval prompt: seed reaction failed"
+                    );
+                }
+            }
+        }
+        Ok(Self {
+            room_id: room_id.to_string(),
+            prompt_event_id,
+            seed_reactions,
+        })
+    }
+
+    /// Whether an inbound `m.reaction` event resolves this prompt.
+    /// Matches by `matrix_reaction_target`.
+    pub fn matches_reaction(&self, inbound_metadata: &HashMap<String, String>) -> bool {
+        inbound_metadata
+            .get("matrix_reaction_target")
+            .map(|s| s.as_str())
+            == Some(self.prompt_event_id.as_str())
+    }
+
+    /// Redact the bot's seed reactions. Best-effort — failures
+    /// log but don't propagate, since cleanup is purely
+    /// cosmetic.
+    pub async fn cleanup(self, channel: &MatrixChannel) {
+        for (key, rx_id) in self.seed_reactions {
+            if let Err(e) = channel.redact(&self.room_id, &rx_id, None).await {
+                tracing::debug!(
+                    room = %self.room_id,
+                    key = %key,
+                    error = %e,
+                    "matrix approval prompt: seed reaction redact failed"
+                );
+            }
+        }
+    }
 }
 
 // -- Public API beyond Channel trait -----------------------------
@@ -1166,17 +1290,21 @@ impl MatrixChannel {
     }
 
     /// Build the JSON content for an `m.image`/`m.file`/`m.audio`/
-    /// `m.video` event, given the uploaded media's mxc URI.
+    /// `m.video` event, given the uploaded media's mxc URI. For
+    /// `MediaKind::Voice` we emit `m.audio` plus the MSC3245 voice
+    /// marker so clients render it as a voice note rather than a
+    /// generic audio attachment.
     fn media_event_content(
         &self,
         att: &crate::bus::MediaAttachment,
         mxc: &str,
     ) -> Value {
-        let (msgtype, default_name) = match att.kind {
-            crate::bus::MediaKind::Image => ("m.image", "image"),
-            crate::bus::MediaKind::Audio => ("m.audio", "audio"),
-            crate::bus::MediaKind::Video => ("m.video", "video"),
-            crate::bus::MediaKind::File => ("m.file", "file"),
+        let (msgtype, default_name, voice) = match att.kind {
+            crate::bus::MediaKind::Image => ("m.image", "image", false),
+            crate::bus::MediaKind::Audio => ("m.audio", "audio", false),
+            crate::bus::MediaKind::Voice => ("m.audio", "voice", true),
+            crate::bus::MediaKind::Video => ("m.video", "video", false),
+            crate::bus::MediaKind::File => ("m.file", "file", false),
         };
         let body = att
             .filename
@@ -1194,18 +1322,33 @@ impl MatrixChannel {
         if let Some(d) = att.duration_ms {
             info.insert("duration".into(), json!(d));
         }
-        json!({
-            "msgtype": msgtype,
-            "body": body,
-            "url": mxc,
-            "info": Value::Object(info),
-        })
+        let mut content = serde_json::Map::new();
+        content.insert("msgtype".into(), json!(msgtype));
+        content.insert("body".into(), json!(body));
+        content.insert("url".into(), json!(mxc));
+        content.insert("info".into(), Value::Object(info));
+        if voice {
+            content.insert(
+                "org.matrix.msc3245.voice".into(),
+                Value::Object(serde_json::Map::new()),
+            );
+            // MSC1767 audio extension — empty audio object signals
+            // a voice message to clients that don't understand the
+            // top-level voice marker.
+            content.insert(
+                "org.matrix.msc1767.audio".into(),
+                Value::Object(serde_json::Map::new()),
+            );
+        }
+        Value::Object(content)
     }
 
     /// Download an inbound media file (`mxc://server/id`) to the
     /// configured media-cache directory. Returns the local path on
     /// success. Caller should only invoke when `media_cache_dir`
     /// is set; with empty config this is a no-op returning `None`.
+    /// Transient failures retry with exponential backoff up to
+    /// `MEDIA_DOWNLOAD_ATTEMPTS` times.
     pub async fn download_media(
         &self,
         mxc: &str,
@@ -1219,21 +1362,46 @@ impl MatrixChannel {
             Some(u) => u,
             None => return Ok(None),
         };
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(self.token())
-            .timeout(Duration::from_secs(120))
-            .send()
-            .await
-            .context("matrix media download request failed")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("matrix media download returned {}", resp.status());
-        }
-        let bytes = resp
-            .bytes()
-            .await
-            .context("matrix media download body read failed")?;
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<anyhow::Error> = None;
+        let bytes = loop {
+            attempt += 1;
+            match self
+                .http
+                .get(&url)
+                .bearer_auth(self.token())
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(b) => break b,
+                    Err(e) => last_err = Some(anyhow::anyhow!(e)),
+                },
+                Ok(resp) => {
+                    let status = resp.status();
+                    last_err = Some(anyhow::anyhow!(
+                        "matrix media download returned {}",
+                        status
+                    ));
+                    // 4xx (except 429) is permanent — don't retry.
+                    if status.is_client_error()
+                        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                    {
+                        return Err(last_err.unwrap());
+                    }
+                }
+                Err(e) => last_err = Some(anyhow::anyhow!(e)),
+            }
+            if attempt >= MEDIA_DOWNLOAD_ATTEMPTS {
+                return Err(
+                    last_err.unwrap_or_else(|| anyhow::anyhow!("matrix media download failed")),
+                );
+            }
+            // Exponential backoff: 200ms, 800ms, 2000ms (cap).
+            let delay = Duration::from_millis(200u64 * (1u64 << (attempt - 1)).min(10));
+            tokio::time::sleep(delay).await;
+        };
         let dir = std::path::PathBuf::from(&self.config.media_cache_dir);
         tokio::fs::create_dir_all(&dir)
             .await
@@ -1246,17 +1414,53 @@ impl MatrixChannel {
             .with_context(|| format!("matrix media write failed: {}", path.display()))?;
         Ok(Some(path))
     }
-}
 
-// -- Channel impl ------------------------------------------------
-
-#[async_trait]
-impl Channel for MatrixChannel {
-    fn name(&self) -> &str {
-        "matrix"
+    /// Persist the channel's `next_batch` sync token to the
+    /// configured `state_file`, so the next start resumes from
+    /// the same point rather than re-running the initial sync.
+    /// No-op when `state_file` is empty.
+    async fn persist_state(&self) -> Result<()> {
+        if self.config.state_file.is_empty() {
+            return Ok(());
+        }
+        let nb = self.state.next_batch.lock().clone();
+        let body = serde_json::json!({ "next_batch": nb });
+        let path = std::path::PathBuf::from(&self.config.state_file);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        tokio::fs::write(&path, body.to_string())
+            .await
+            .with_context(|| format!("matrix state persist failed: {}", path.display()))?;
+        Ok(())
     }
 
-    async fn send(&self, message: &SendMessage) -> Result<()> {
+    /// Read the persisted `next_batch` token from `state_file` and
+    /// load it into channel state. No-op when `state_file` is
+    /// empty or the file is missing/malformed.
+    async fn load_state(&self) {
+        if self.config.state_file.is_empty() {
+            return;
+        }
+        let path = std::path::PathBuf::from(&self.config.state_file);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let parsed: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let Some(s) = parsed.get("next_batch").and_then(|v| v.as_str()) {
+            *self.state.next_batch.lock() = Some(s.to_string());
+        }
+    }
+
+    /// Core send implementation, bypassing any batching layer.
+    /// Called directly by the trait's `send` when batching is off,
+    /// and indirectly by the flush task once a batched buffer is
+    /// drained.
+    async fn send_immediate(&self, message: &SendMessage) -> Result<()> {
         let room_id = message.recipient.as_str();
         if room_id.is_empty() {
             anyhow::bail!("matrix: empty recipient (room_id) in send");
@@ -1291,17 +1495,24 @@ impl Channel for MatrixChannel {
 
         let chunks = chunk_text(&message.content, MAX_MESSAGE_LENGTH);
         for chunk in chunks {
+            // Wrap @user:server mentions in matrix.to markdown
+            // links so HTML rendering produces clickable anchors.
+            // Plain-text clients fall back to the raw form, which
+            // is still readable.
+            let body_for_send = wrap_mention_links(&chunk);
             let mut content = json!({
                 "msgtype": msgtype,
-                "body": chunk,
+                "body": body_for_send,
             });
-            if self.config.markdown_to_html && chunk_has_markdown(&chunk) {
-                let html = markdown_to_html(&chunk);
+            if self.config.markdown_to_html && chunk_has_markdown(&body_for_send) {
+                let html = markdown_to_html(&body_for_send);
                 let obj = content.as_object_mut().unwrap();
                 obj.insert("format".into(), json!("org.matrix.custom.html"));
                 obj.insert("formatted_body".into(), json!(html));
             }
-            // m.mentions for @user references in the body.
+            // m.mentions for @user references in the body. Run
+            // against the original (un-wrapped) chunk so we don't
+            // double-count when wrap_mention_links added linkifies.
             let mentions = extract_mentioned_user_ids(&chunk);
             if !mentions.is_empty() {
                 content.as_object_mut().unwrap().insert(
@@ -1315,8 +1526,97 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
+    /// Push a text-only send into the per-chat buffer and arm a
+    /// flush task. Subsequent sends to the same chat within the
+    /// `text_batch_delay_ms` window land in the same buffer and
+    /// the flush task coalesces them into a single send.
+    async fn enqueue_batched(&self, message: &SendMessage) -> Result<()> {
+        let chat_id = message.recipient.clone();
+        let mut already_armed = false;
+        {
+            let mut buffers = self.state.text_batch_buffers.lock();
+            let buf = buffers.entry(chat_id.clone()).or_default();
+            if !buf.is_empty() {
+                already_armed = true;
+            }
+            buf.push(BufferedText {
+                content: message.content.clone(),
+                metadata: message.metadata.clone(),
+                reply_to: message.reply_to.clone(),
+            });
+        }
+        if !already_armed {
+            let me = self.clone();
+            let delay = Duration::from_millis(self.config.text_batch_delay_ms);
+            let chat_for_task = chat_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                me.flush_chat_buffer(&chat_for_task).await;
+            });
+        }
+        Ok(())
+    }
+
+    /// Drain the buffer for one chat and dispatch a single
+    /// coalesced send. Joining is by `\n\n`; the first buffered
+    /// message's reply / thread metadata is reused (subsequent
+    /// messages in the same window typically share the same
+    /// reply target). Errors during the actual send are logged
+    /// and discarded since the caller has already returned.
+    async fn flush_chat_buffer(&self, chat_id: &str) {
+        let buffered = {
+            let mut buffers = self.state.text_batch_buffers.lock();
+            buffers.remove(chat_id).unwrap_or_default()
+        };
+        if buffered.is_empty() {
+            return;
+        }
+        let combined = buffered
+            .iter()
+            .map(|b| b.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let first = &buffered[0];
+        let merged = SendMessage::new(combined, chat_id)
+            .with_reply_to(first.reply_to.clone())
+            .with_metadata(first.metadata.clone());
+        if let Err(e) = self.send_immediate(&merged).await {
+            tracing::warn!(
+                chat_id = %chat_id,
+                error = %e,
+                count = buffered.len(),
+                "matrix batched send failed"
+            );
+        }
+    }
+}
+
+// -- Channel impl ------------------------------------------------
+
+#[async_trait]
+impl Channel for MatrixChannel {
+    fn name(&self) -> &str {
+        "matrix"
+    }
+
+    async fn send(&self, message: &SendMessage) -> Result<()> {
+        // Batching path: when text_batch_delay_ms is configured
+        // and the message is text-only, push into the per-chat
+        // buffer and rely on the flush task to dispatch a
+        // coalesced send. Attachments always send immediately
+        // (binary uploads are too costly to batch).
+        if self.config.text_batch_delay_ms > 0
+            && message.attachments.is_empty()
+            && !message.content.is_empty()
+        {
+            return self.enqueue_batched(message).await;
+        }
+        self.send_immediate(message).await
+    }
+
     async fn listen(&self, tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         self.ensure_authenticated().await?;
+        self.load_state().await;
         self.run_sync(tx).await
     }
 
@@ -1447,6 +1747,160 @@ fn extract_mentioned_user_ids(body: &str) -> Vec<String> {
         i = j.max(i + 1);
     }
     out
+}
+
+/// Wrap each `@user:server` mention in a body with the canonical
+/// matrix.to markdown link form so HTML rendering produces a
+/// proper anchor. Skips mentions already inside a markdown link
+/// (`[…](url)` constructs) and inside backtick code spans.
+///
+/// Example:
+///   `Hi @alice:example.org` →
+///   `Hi [@alice:example.org](https://matrix.to/#/@alice:example.org)`
+pub(crate) fn wrap_mention_links(body: &str) -> String {
+    if !body.contains('@') {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    let mut in_code = false;
+    // True between `](` and the matching `)` — i.e. inside the
+    // URL portion of an existing markdown link. Mentions there
+    // are part of the URL itself and must not be re-wrapped.
+    let mut in_link_url = false;
+    let mut link_url_depth = 0i32;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '`' {
+            in_code = !in_code;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if !in_code && !in_link_url && c == ']' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            // Entering an existing markdown link's URL portion.
+            in_link_url = true;
+            link_url_depth = 0;
+            out.push(c);
+            out.push('(');
+            i += 2;
+            continue;
+        }
+        if in_link_url {
+            if c == '(' {
+                link_url_depth += 1;
+            } else if c == ')' {
+                if link_url_depth == 0 {
+                    in_link_url = false;
+                } else {
+                    link_url_depth -= 1;
+                }
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if in_code || c != '@' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Possible mention. Skip if preceded by `[` (already in
+        // a markdown link's display text) or by an alphanumeric /
+        // `.` (looks like an email local-part such as
+        // `alice@example.org`).
+        let prev = out.chars().last();
+        let skip = match prev {
+            Some('[') => true,
+            Some(c2) if c2.is_ascii_alphanumeric() || c2 == '.' => true,
+            _ => false,
+        };
+        if skip {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Walk to token end.
+        let start = i;
+        let mut j = i + 1;
+        while j < bytes.len()
+            && !bytes[j].is_ascii_whitespace()
+            && !matches!(bytes[j], b',' | b';' | b'!' | b'?' | b'(' | b')' | b'[' | b']')
+        {
+            j += 1;
+        }
+        let mut candidate_end = j;
+        while candidate_end > start + 1 && bytes[candidate_end - 1] == b'.' {
+            candidate_end -= 1;
+        }
+        let candidate = &body[start..candidate_end];
+        if candidate.contains(':') && candidate.len() > 3 {
+            // Detect "already inside a markdown link" by checking
+            // for `](` immediately after the candidate.
+            let after = &body[candidate_end..];
+            if after.starts_with("](") {
+                out.push_str(candidate);
+                i = candidate_end;
+                continue;
+            }
+            out.push('[');
+            out.push_str(candidate);
+            out.push_str("](https://matrix.to/#/");
+            out.push_str(candidate);
+            out.push(')');
+            i = candidate_end;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Heuristic that detects "transport-style" media filenames —
+/// names a Matrix client auto-generates (`IMG_*.jpg`,
+/// `VID_*.mp4`, `Screenshot_*.png`, `signal-*.png`, ...) — that
+/// shouldn't be surfaced as the message body. The audit's note
+/// references the upstream's `_looks_like_matrix_image_filename`.
+pub(crate) fn looks_like_transport_filename(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let trimmed = lower.trim();
+    if trimmed.is_empty() || trimmed.contains(' ') {
+        return false;
+    }
+    // Common camera / OS auto-naming patterns.
+    let prefixes = [
+        "img_", "img-", "vid_", "vid-", "video_", "video-",
+        "screenshot_", "screenshot-", "screen shot ", "photo_",
+        "photo-", "signal-", "whatsapp ", "telegram ", "image_",
+        "image-", "audio_", "audio-", "voice_", "voice-",
+        "pxl_", "dsc_", "dscn",
+    ];
+    for p in prefixes {
+        if trimmed.starts_with(p) {
+            return true;
+        }
+    }
+    // Names that are JUST a UUID + extension, or a long hex string,
+    // or "matrix-<…>".
+    if trimmed.starts_with("matrix-") {
+        return true;
+    }
+    // Any plain filename with no spaces and one of the common media
+    // extensions, that's at least 8 chars before the ext, qualifies.
+    let common_exts = [
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov",
+        ".m4a", ".mp3", ".ogg", ".wav", ".webm",
+    ];
+    for ext in common_exts {
+        if let Some(stem) = trimmed.strip_suffix(ext) {
+            if stem.len() >= 8 && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Map a MIME type to a sensible file extension for the local
@@ -1872,6 +2326,8 @@ mod tests {
             dm_mention_threads: false,
             markdown_to_html: true,
             media_cache_dir: String::new(),
+            state_file: String::new(),
+            text_batch_delay_ms: 0,
             home_chat_id: String::new(),
         }
     }
@@ -2808,5 +3264,225 @@ mod tests {
     fn last_sent_event_id_initially_none() {
         let ch = channel();
         assert!(ch.last_sent_event_id("!any:example.org").is_none());
+    }
+
+    // -- wrap_mention_links -------------------------------------
+
+    #[test]
+    fn wrap_mention_links_basic() {
+        let s = wrap_mention_links("hi @alice:example.org how are you");
+        assert_eq!(
+            s,
+            "hi [@alice:example.org](https://matrix.to/#/@alice:example.org) how are you"
+        );
+    }
+
+    #[test]
+    fn wrap_mention_links_strips_trailing_dot() {
+        let s = wrap_mention_links("ping @alice:example.org.");
+        assert!(s.contains("[@alice:example.org](https://matrix.to/#/@alice:example.org)"));
+        assert!(s.ends_with("."));
+    }
+
+    #[test]
+    fn wrap_mention_links_skips_email() {
+        // "alice@example.org" — `@` preceded by alphanumeric, looks
+        // like an email local-part, not a Matrix mention.
+        let s = wrap_mention_links("contact alice@example.org for details");
+        assert_eq!(s, "contact alice@example.org for details");
+    }
+
+    #[test]
+    fn wrap_mention_links_skips_already_in_link() {
+        let s = wrap_mention_links(
+            "[@bob:server](https://matrix.to/#/@bob:server) said hi",
+        );
+        assert_eq!(
+            s,
+            "[@bob:server](https://matrix.to/#/@bob:server) said hi"
+        );
+    }
+
+    #[test]
+    fn wrap_mention_links_skips_inside_code_span() {
+        let s = wrap_mention_links("see `@notamention:server` token");
+        assert_eq!(s, "see `@notamention:server` token");
+    }
+
+    #[test]
+    fn wrap_mention_links_no_mentions_passthrough() {
+        let s = wrap_mention_links("plain text with no mentions");
+        assert_eq!(s, "plain text with no mentions");
+    }
+
+    // -- looks_like_transport_filename --------------------------
+
+    #[test]
+    fn transport_filename_recognizes_camera_patterns() {
+        assert!(looks_like_transport_filename("IMG_1234.jpg"));
+        assert!(looks_like_transport_filename("VID_20260101.mp4"));
+        assert!(looks_like_transport_filename("Screenshot_2026-05-04.png"));
+        assert!(looks_like_transport_filename("signal-2026-05-04.png"));
+        assert!(looks_like_transport_filename("PXL_20260101_123456.jpg"));
+    }
+
+    #[test]
+    fn transport_filename_rejects_real_text() {
+        assert!(!looks_like_transport_filename("Hello there"));
+        assert!(!looks_like_transport_filename("look at this image"));
+        assert!(!looks_like_transport_filename(""));
+    }
+
+    #[test]
+    fn transport_filename_recognizes_uuid_style() {
+        assert!(looks_like_transport_filename("8a3f9b21-c1d4-4e2a.jpg"));
+    }
+
+    // -- Voice MSC3245 -----------------------------------------
+
+    #[test]
+    fn media_event_content_voice_carries_msc3245_marker() {
+        let ch = channel();
+        let att = crate::bus::MediaAttachment {
+            kind: crate::bus::MediaKind::Voice,
+            bytes: vec![0; 100],
+            mime: "audio/ogg".into(),
+            filename: None,
+            width: None,
+            height: None,
+            duration_ms: Some(2500),
+        };
+        let v = ch.media_event_content(&att, "mxc://example.org/v");
+        assert_eq!(v["msgtype"], "m.audio");
+        assert!(v.get("org.matrix.msc3245.voice").is_some());
+        assert!(v.get("org.matrix.msc1767.audio").is_some());
+        assert_eq!(v["info"]["duration"], 2500);
+    }
+
+    // -- Filename heuristic in inbound media --------------------
+
+    #[test]
+    fn handle_event_image_with_transport_filename_strips_body() {
+        let mut c = cfg();
+        c.allowed_rooms = vec!["*".into()];
+        c.require_mention = false;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let ev = evt(json!({
+            "type": "m.room.message",
+            "event_id": "$tx",
+            "sender": "@alice:example.org",
+            "origin_server_ts": chrono::Utc::now().timestamp_millis(),
+            "content": {
+                "msgtype": "m.image",
+                "body": "IMG_4567.jpg",
+                "url": "mxc://example.org/abc"
+            }
+        }));
+        let inbound = ch.handle_event("!room:example.org", &ev).expect("kept");
+        assert_eq!(inbound.content, "");
+        assert_eq!(
+            inbound.metadata.get("matrix_media_filename").map(String::as_str),
+            Some("IMG_4567.jpg")
+        );
+    }
+
+    #[test]
+    fn handle_event_image_with_real_caption_keeps_body() {
+        let mut c = cfg();
+        c.allowed_rooms = vec!["*".into()];
+        c.require_mention = false;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let ev = evt(json!({
+            "type": "m.room.message",
+            "event_id": "$cap",
+            "sender": "@alice:example.org",
+            "origin_server_ts": chrono::Utc::now().timestamp_millis(),
+            "content": {
+                "msgtype": "m.image",
+                "body": "look at this fennec",
+                "url": "mxc://example.org/abc"
+            }
+        }));
+        let inbound = ch.handle_event("!room:example.org", &ev).expect("kept");
+        assert_eq!(inbound.content, "look at this fennec");
+        assert!(inbound.metadata.get("matrix_media_filename").is_none());
+    }
+
+    // -- Approval prompt ----------------------------------------
+
+    #[test]
+    fn approval_prompt_matches_reaction() {
+        let prompt = MatrixApprovalPrompt {
+            room_id: "!r:example.org".into(),
+            prompt_event_id: "$prompt".into(),
+            seed_reactions: Vec::new(),
+        };
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("matrix_reaction_target".into(), "$prompt".into());
+        assert!(prompt.matches_reaction(&meta));
+        meta.insert("matrix_reaction_target".into(), "$other".into());
+        assert!(!prompt.matches_reaction(&meta));
+    }
+
+    // -- Session restore ----------------------------------------
+
+    #[tokio::test]
+    async fn state_file_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("matrix-state.json");
+        let mut c = cfg();
+        c.state_file = state_path.to_string_lossy().into_owned();
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        // Simulate a sync that produced a next_batch token.
+        *ch.state.next_batch.lock() = Some("s12_456".into());
+        ch.persist_state().await.expect("persist");
+        // New channel, same state_file → load_state restores it.
+        let ch2 = MatrixChannel::from_config(&c).unwrap();
+        assert!(ch2.state.next_batch.lock().is_none());
+        ch2.load_state().await;
+        assert_eq!(
+            ch2.state.next_batch.lock().clone(),
+            Some("s12_456".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn state_file_empty_is_noop() {
+        let ch = channel(); // state_file = ""
+        // Both should silently no-op.
+        ch.persist_state().await.expect("persist no-op");
+        ch.load_state().await;
+        assert!(ch.state.next_batch.lock().is_none());
+    }
+
+    // -- Text batching ------------------------------------------
+
+    #[tokio::test]
+    async fn batched_send_buffers_when_delay_set() {
+        let mut c = cfg();
+        c.text_batch_delay_ms = 50;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let msg = SendMessage::new("first", "!room:example.org");
+        let _ = ch.enqueue_batched(&msg).await;
+        let msg2 = SendMessage::new("second", "!room:example.org");
+        let _ = ch.enqueue_batched(&msg2).await;
+        // Buffer should hold both before the flush task runs.
+        let buf = ch.state.text_batch_buffers.lock();
+        let chat = buf.get("!room:example.org").expect("buffer");
+        assert_eq!(chat.len(), 2);
+        assert_eq!(chat[0].content, "first");
+        assert_eq!(chat[1].content, "second");
+    }
+
+    #[tokio::test]
+    async fn batched_send_separate_chats_isolated() {
+        let mut c = cfg();
+        c.text_batch_delay_ms = 50;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let _ = ch.enqueue_batched(&SendMessage::new("a", "!r1:example.org")).await;
+        let _ = ch.enqueue_batched(&SendMessage::new("b", "!r2:example.org")).await;
+        let buf = ch.state.text_batch_buffers.lock();
+        assert_eq!(buf.get("!r1:example.org").map(|v| v.len()), Some(1));
+        assert_eq!(buf.get("!r2:example.org").map(|v| v.len()), Some(1));
     }
 }

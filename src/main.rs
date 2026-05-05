@@ -939,6 +939,7 @@ async fn run_gateway(
                         chat_id: msg.chat_id.clone(),
                         reply_to: Some(msg.id.clone()),
                         metadata: std::collections::HashMap::new(),
+                        attachments: Vec::new(),
                     };
                     let _ = bus.publish_outbound(outbound).await;
                     continue;
@@ -1042,6 +1043,7 @@ async fn run_gateway(
                             chat_id: msg.chat_id.clone(),
                             reply_to: Some(msg.id.clone()),
                             metadata: std::collections::HashMap::new(),
+                            attachments: Vec::new(),
                         };
                         if let Err(e) = bus.publish_outbound(outbound).await {
                             tracing::error!("Failed to publish outbound: {e}");
@@ -1067,6 +1069,7 @@ async fn run_gateway(
                             chat_id: msg.chat_id.clone(),
                             reply_to: Some(msg.id.clone()),
                             metadata: std::collections::HashMap::new(),
+                            attachments: Vec::new(),
                         };
                         let _ = bus.publish_outbound(outbound).await;
                     }
