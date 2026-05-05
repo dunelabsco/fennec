@@ -7,6 +7,8 @@ pub mod slack;
 pub mod whatsapp;
 pub mod email;
 pub mod matrix;
+#[cfg(feature = "matrix-e2ee")]
+pub mod matrix_e2ee;
 
 pub use traits::{Channel, ChannelMessage, SendMessage};
 pub use cli::CliChannel;
