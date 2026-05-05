@@ -93,6 +93,10 @@ const STARTUP_GRACE_MS: u64 = 5_000;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Max attempts for an inbound media download before giving up.
 const MEDIA_DOWNLOAD_ATTEMPTS: u32 = 3;
+/// Character threshold above which a buffered message is treated
+/// as "near the chunk limit" — its presence in a batching window
+/// doubles the flush delay since a continuation is likely coming.
+const BATCH_LONG_THRESHOLD: usize = 3900;
 
 // -- Types -------------------------------------------------------
 
@@ -140,6 +144,11 @@ struct MatrixState {
     /// `send` pushes here instead of dispatching immediately and a
     /// flush task drains the buffer after the delay window.
     text_batch_buffers: Mutex<HashMap<String, Vec<BufferedText>>>,
+    /// In-flight flush JoinHandles, keyed by chat. Tracked so we
+    /// can abort and re-arm with a longer delay when a near-limit
+    /// chunk shows up mid-window (the upstream's split-detection
+    /// behavior — a continuation is likely coming).
+    flush_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +230,7 @@ impl MatrixChannel {
                 started_at_ms,
                 last_sent_by_chat: Mutex::new(HashMap::new()),
                 text_batch_buffers: Mutex::new(HashMap::new()),
+                flush_handles: Mutex::new(HashMap::new()),
             }),
             http,
         })
@@ -1530,30 +1540,48 @@ impl MatrixChannel {
     /// flush task. Subsequent sends to the same chat within the
     /// `text_batch_delay_ms` window land in the same buffer and
     /// the flush task coalesces them into a single send.
+    ///
+    /// **Split detection**: when any message in the buffer is
+    /// `>=` `BATCH_LONG_THRESHOLD` characters, the flush delay
+    /// is doubled. Mirrors the upstream's heuristic — a near-
+    /// limit chunk usually means more chunks are coming, so we
+    /// wait longer before flushing.
     async fn enqueue_batched(&self, message: &SendMessage) -> Result<()> {
         let chat_id = message.recipient.clone();
-        let mut already_armed = false;
-        {
+        let long_buffered = {
             let mut buffers = self.state.text_batch_buffers.lock();
             let buf = buffers.entry(chat_id.clone()).or_default();
-            if !buf.is_empty() {
-                already_armed = true;
-            }
             buf.push(BufferedText {
                 content: message.content.clone(),
                 metadata: message.metadata.clone(),
                 reply_to: message.reply_to.clone(),
             });
+            // Evaluate against the full buffer so a long message
+            // arriving after a short one still triggers the
+            // extended delay.
+            buf.iter()
+                .any(|b| b.content.chars().count() >= BATCH_LONG_THRESHOLD)
+        };
+        // Always (re)arm the flush task. When a long message
+        // shows up mid-window we abort the in-flight flush and
+        // spawn a new one with the doubled delay — that's what
+        // extends the deadline.
+        let base_delay = self.config.text_batch_delay_ms;
+        let actual_delay = if long_buffered {
+            base_delay.saturating_mul(2)
+        } else {
+            base_delay
+        };
+        if let Some(prev) = self.state.flush_handles.lock().remove(&chat_id) {
+            prev.abort();
         }
-        if !already_armed {
-            let me = self.clone();
-            let delay = Duration::from_millis(self.config.text_batch_delay_ms);
-            let chat_for_task = chat_id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                me.flush_chat_buffer(&chat_for_task).await;
-            });
-        }
+        let me = self.clone();
+        let chat_for_task = chat_id.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(actual_delay)).await;
+            me.flush_chat_buffer(&chat_for_task).await;
+        });
+        self.state.flush_handles.lock().insert(chat_id, handle);
         Ok(())
     }
 
@@ -1568,6 +1596,9 @@ impl MatrixChannel {
             let mut buffers = self.state.text_batch_buffers.lock();
             buffers.remove(chat_id).unwrap_or_default()
         };
+        // Drop the now-completed handle so the next send starts
+        // a fresh batching window cleanly.
+        self.state.flush_handles.lock().remove(chat_id);
         if buffered.is_empty() {
             return;
         }
@@ -3484,5 +3515,82 @@ mod tests {
         let buf = ch.state.text_batch_buffers.lock();
         assert_eq!(buf.get("!r1:example.org").map(|v| v.len()), Some(1));
         assert_eq!(buf.get("!r2:example.org").map(|v| v.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn batched_send_arms_flush_handle() {
+        let mut c = cfg();
+        c.text_batch_delay_ms = 10_000; // long enough we never see the flush
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let _ = ch
+            .enqueue_batched(&SendMessage::new("hi", "!r:example.org"))
+            .await;
+        assert!(ch
+            .state
+            .flush_handles
+            .lock()
+            .contains_key("!r:example.org"));
+    }
+
+    #[tokio::test]
+    async fn batched_send_long_message_aborts_and_re_arms() {
+        // First arm with a short message — picks up the base
+        // delay. Second enqueue is a "near-limit" chunk; the
+        // implementation must abort the current flush handle and
+        // spawn a fresh one with the doubled delay. We verify by
+        // observing that the handle in state changes.
+        let mut c = cfg();
+        c.text_batch_delay_ms = 10_000;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let _ = ch
+            .enqueue_batched(&SendMessage::new("short", "!r:example.org"))
+            .await;
+        let handle1_id = {
+            let h = ch.state.flush_handles.lock();
+            // JoinHandle isn't directly comparable; use its raw
+            // task id (stable for the lifetime of the handle).
+            h.get("!r:example.org").map(|h| h.id())
+        };
+        // Now a long message — should trigger abort + re-arm.
+        let long = "x".repeat(BATCH_LONG_THRESHOLD + 10);
+        let _ = ch
+            .enqueue_batched(&SendMessage::new(long, "!r:example.org"))
+            .await;
+        let handle2_id = {
+            let h = ch.state.flush_handles.lock();
+            h.get("!r:example.org").map(|h| h.id())
+        };
+        assert!(handle1_id.is_some());
+        assert!(handle2_id.is_some());
+        assert_ne!(handle1_id, handle2_id);
+    }
+
+    #[tokio::test]
+    async fn batched_send_short_messages_dont_re_arm_with_extended_delay() {
+        // Sanity: when no message in the buffer crosses the
+        // threshold, the flush should still arm (every enqueue
+        // re-arms by design now), but the delay is the base.
+        // We can't directly observe the configured delay from
+        // outside, so we just verify the buffer accumulates and
+        // a flush handle exists.
+        let mut c = cfg();
+        c.text_batch_delay_ms = 10_000;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let _ = ch.enqueue_batched(&SendMessage::new("a", "!r:example.org")).await;
+        let _ = ch.enqueue_batched(&SendMessage::new("b", "!r:example.org")).await;
+        let _ = ch.enqueue_batched(&SendMessage::new("c", "!r:example.org")).await;
+        assert_eq!(
+            ch.state
+                .text_batch_buffers
+                .lock()
+                .get("!r:example.org")
+                .map(|v| v.len()),
+            Some(3)
+        );
+        assert!(ch
+            .state
+            .flush_handles
+            .lock()
+            .contains_key("!r:example.org"));
     }
 }
