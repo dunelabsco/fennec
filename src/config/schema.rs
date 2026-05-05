@@ -268,6 +268,13 @@ pub struct MatrixChannelEntry {
     pub dm_mention_threads: bool,
     /// Render markdown to HTML `formatted_body`. Default true.
     pub markdown_to_html: bool,
+    /// Optional directory for caching inbound media files
+    /// (`m.image` / `m.file` / `m.audio` / `m.video`). When set,
+    /// the channel downloads the binary on receipt and surfaces the
+    /// local path in `metadata.matrix_media_path` so vision /
+    /// transcription tools can consume it directly. Empty disables
+    /// auto-download (only the `mxc://` URL is surfaced).
+    pub media_cache_dir: String,
     /// Default destination for `send_message` calls without a chat
     /// id. Empty falls back to most-recent inbound.
     pub home_chat_id: String,
@@ -290,6 +297,7 @@ impl Default for MatrixChannelEntry {
             dm_auto_thread: false,
             dm_mention_threads: false,
             markdown_to_html: true,
+            media_cache_dir: String::new(),
             home_chat_id: String::new(),
         }
     }

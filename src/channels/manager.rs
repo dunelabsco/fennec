@@ -155,7 +155,8 @@ impl ChannelManager {
             if let Some(channel) = channels.get(&msg.channel) {
                 let send_msg = SendMessage::new(&msg.content, &msg.chat_id)
                     .with_reply_to(msg.reply_to.clone())
-                    .with_metadata(msg.metadata.clone());
+                    .with_metadata(msg.metadata.clone())
+                    .with_attachments(msg.attachments.clone());
                 if let Err(e) = channel.send(&send_msg).await {
                     tracing::error!(
                         "Failed to send outbound message to channel '{}': {}",

@@ -3,24 +3,26 @@ use std::collections::HashMap;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::bus::InboundMessage;
+use crate::bus::{InboundMessage, MediaAttachment};
 
 /// Backward-compatible alias: `ChannelMessage` is now [`InboundMessage`].
 pub type ChannelMessage = InboundMessage;
 
 /// A message to send through a channel.
 ///
-/// `reply_to` and `metadata` are optional addenda — channels that
-/// don't support replies/threads simply ignore them. Populated by
-/// `ChannelManager::dispatch_loop` from the originating
-/// `OutboundMessage` so reply targets and per-channel hints
-/// (e.g. Matrix `thread_id`) reach the channel implementation.
+/// `reply_to`, `metadata`, and `attachments` are optional addenda —
+/// channels that don't support replies/threads/media simply ignore
+/// them. Populated by `ChannelManager::dispatch_loop` from the
+/// originating `OutboundMessage` so reply targets, per-channel
+/// hints (e.g. Matrix `thread_id`), and binary attachments reach
+/// the channel implementation.
 #[derive(Debug, Clone, Default)]
 pub struct SendMessage {
     pub content: String,
     pub recipient: String,
     pub reply_to: Option<String>,
     pub metadata: HashMap<String, String>,
+    pub attachments: Vec<MediaAttachment>,
 }
 
 impl SendMessage {
@@ -30,6 +32,7 @@ impl SendMessage {
             recipient: recipient.into(),
             reply_to: None,
             metadata: HashMap::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -40,6 +43,11 @@ impl SendMessage {
 
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    pub fn with_attachments(mut self, attachments: Vec<MediaAttachment>) -> Self {
+        self.attachments = attachments;
         self
     }
 }

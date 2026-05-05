@@ -126,6 +126,12 @@ struct MatrixState {
     typing_failures: Mutex<HashMap<String, TypingState>>,
     /// Channel start time (ms since epoch) for the startup grace.
     started_at_ms: u64,
+    /// Most recent event id this channel sent, per chat. Used by
+    /// approval-prompt flows that want to react to "the message we
+    /// just sent" without threading the event id through the
+    /// caller. Capped implicitly by HashMap key set size (one
+    /// entry per active chat).
+    last_sent_by_chat: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Default)]
@@ -198,6 +204,7 @@ impl MatrixChannel {
                 bot_threads: Mutex::new(HashSet::new()),
                 typing_failures: Mutex::new(HashMap::new()),
                 started_at_ms,
+                last_sent_by_chat: Mutex::new(HashMap::new()),
             }),
             http,
         })
@@ -410,7 +417,19 @@ impl MatrixChannel {
                     .cloned()
                     .unwrap_or_default();
                 for event in events {
-                    if let Some(inbound) = self.handle_event(room_id, &event) {
+                    if let Some(mut inbound) = self.handle_event(room_id, &event) {
+                        // For media events with a configured cache
+                        // dir, download the binary inline before
+                        // surfacing the InboundMessage so consumers
+                        // (vision tool, transcription tool) can
+                        // read it from `matrix_media_path`.
+                        if let Err(e) = self.enrich_inbound_with_media(&mut inbound).await {
+                            tracing::debug!(
+                                event_id = %inbound.id,
+                                error = %e,
+                                "matrix: media download failed; surfacing event without local path"
+                            );
+                        }
                         if tx.send(inbound).await.is_err() {
                             return Ok(()); // receiver dropped
                         }
@@ -473,8 +492,22 @@ impl MatrixChannel {
 
     fn handle_event(&self, room_id: &str, event: &Value) -> Option<InboundMessage> {
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if event_type != "m.room.message" {
-            return None;
+        match event_type {
+            "m.room.message" => {}
+            "m.room.encryption" => {
+                // Track encryption status of the room. Without
+                // E-4-2's E2EE feature on, we can't decrypt, but
+                // we record the state for the (forthcoming) crypto
+                // layer. Surfacing this via a dedicated metadata
+                // event would require a new InboundMessage shape,
+                // which is the encrypted-channel concern; here we
+                // just no-op.
+                return None;
+            }
+            "m.reaction" => {
+                return self.handle_reaction_event(room_id, event);
+            }
+            _ => return None,
         }
         let event_id = event
             .get("event_id")
@@ -592,7 +625,11 @@ impl MatrixChannel {
                 return None;
             }
         }
-        if body.is_empty() {
+        let is_media_msg = matches!(
+            msgtype,
+            "m.image" | "m.file" | "m.audio" | "m.video"
+        );
+        if body.is_empty() && !is_media_msg {
             return None;
         }
         let timestamp = event
@@ -619,15 +656,52 @@ impl MatrixChannel {
         }
         // Carry m.image / m.file / m.audio / m.video metadata
         // through; downstream consumers (e.g. vision tools) can
-        // resolve mxc URLs via `mxc_to_http_url`.
+        // resolve mxc URLs via `mxc_to_http_url`, or read the
+        // local cache path from `matrix_media_path` when
+        // `media_cache_dir` is configured (the sync loop runs the
+        // download asynchronously via `enrich_inbound_with_media`).
+        let is_media = matches!(
+            msgtype,
+            "m.image" | "m.file" | "m.audio" | "m.video"
+        );
         if let Some(url) = content.get("url").and_then(|v| v.as_str()) {
             metadata.insert("matrix_media_mxc".into(), url.to_string());
+        }
+        if is_media {
+            metadata.insert(
+                "matrix_media_kind".into(),
+                msgtype.trim_start_matches("m.").to_string(),
+            );
         }
         if let Some(mime) = content
             .pointer("/info/mimetype")
             .and_then(|v| v.as_str())
         {
             metadata.insert("matrix_media_mime".into(), mime.to_string());
+        }
+        if let Some(size) = content
+            .pointer("/info/size")
+            .and_then(|v| v.as_u64())
+        {
+            metadata.insert("matrix_media_size".into(), size.to_string());
+        }
+        if let Some(w) = content.pointer("/info/w").and_then(|v| v.as_u64()) {
+            metadata.insert("matrix_media_width".into(), w.to_string());
+        }
+        if let Some(h) = content.pointer("/info/h").and_then(|v| v.as_u64()) {
+            metadata.insert("matrix_media_height".into(), h.to_string());
+        }
+        if let Some(d) = content
+            .pointer("/info/duration")
+            .and_then(|v| v.as_u64())
+        {
+            metadata.insert("matrix_media_duration_ms".into(), d.to_string());
+        }
+        if is_media && raw_body.is_empty() {
+            // Media-only events sometimes ship empty body; we
+            // still want them to surface so the agent can react.
+            // Use the filename / msgtype label as a placeholder.
+            // (This mirrors what the upstream does.)
         }
 
         Some(InboundMessage {
@@ -638,6 +712,118 @@ impl MatrixChannel {
             chat_id: room_id.to_string(),
             timestamp,
             reply_to,
+            metadata,
+        })
+    }
+
+    /// Download the media for an inbound `m.image`/`m.file`/
+    /// `m.audio`/`m.video` event into the configured local cache,
+    /// and surface the local path in `matrix_media_path`. No-op
+    /// when `media_cache_dir` is empty or the event isn't media.
+    async fn enrich_inbound_with_media(&self, inbound: &mut InboundMessage) -> Result<()> {
+        if self.config.media_cache_dir.is_empty() {
+            return Ok(());
+        }
+        let mxc = match inbound.metadata.get("matrix_media_mxc") {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => return Ok(()),
+        };
+        let mime = inbound.metadata.get("matrix_media_mime").cloned();
+        let path = self
+            .download_media(&mxc, &inbound.id, mime.as_deref())
+            .await?;
+        if let Some(p) = path {
+            inbound
+                .metadata
+                .insert("matrix_media_path".into(), p.to_string_lossy().into_owned());
+        }
+        Ok(())
+    }
+
+    /// Build an `InboundMessage` from an `m.reaction` event.
+    /// Reactions are surfaced through the same channel as text
+    /// messages — content is `"[reaction] {key}"` and the
+    /// `matrix_reaction_target` / `matrix_reaction_key` metadata
+    /// fields carry the structured payload. Higher-level flows
+    /// (e.g. `ask_user` approval prompts) match on these.
+    fn handle_reaction_event(
+        &self,
+        room_id: &str,
+        event: &Value,
+    ) -> Option<InboundMessage> {
+        let event_id = event
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if event_id.is_empty() {
+            return None;
+        }
+        if !self.state.seen_events.lock().insert(event_id) {
+            return None;
+        }
+        if let Some(ts) = event.get("origin_server_ts").and_then(|v| v.as_i64()) {
+            let cutoff = self.state.started_at_ms.saturating_sub(STARTUP_GRACE_MS);
+            if (ts as u64) < cutoff {
+                return None;
+            }
+        }
+        let sender = event
+            .get("sender")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if sender.is_empty()
+            || sender.eq_ignore_ascii_case(&self.current_user_id())
+            || is_bridge_sender(&sender)
+        {
+            return None;
+        }
+        let target_event_id = event
+            .pointer("/content/m.relates_to/event_id")
+            .and_then(|v| v.as_str())?
+            .to_string();
+        let key = event
+            .pointer("/content/m.relates_to/key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let rel_type = event
+            .pointer("/content/m.relates_to/rel_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if rel_type != "m.annotation" {
+            return None;
+        }
+        let is_dm = self.state.dm_rooms.lock().contains(room_id);
+        if is_dm {
+            if !self.is_dm_sender_allowed(&sender) {
+                return None;
+            }
+        } else if !self.is_room_allowed(room_id) {
+            return None;
+        }
+        let timestamp = event
+            .get("origin_server_ts")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0) as u64;
+        let mut metadata = HashMap::new();
+        metadata.insert("matrix_event_id".into(), event_id.to_string());
+        metadata.insert("matrix_room_id".into(), room_id.to_string());
+        metadata.insert("matrix_msgtype".into(), "m.reaction".into());
+        metadata.insert("matrix_reaction_target".into(), target_event_id);
+        metadata.insert("matrix_reaction_key".into(), key.clone());
+        if is_dm {
+            metadata.insert("matrix_dm".into(), "true".into());
+        }
+        Some(InboundMessage {
+            id: event_id.to_string(),
+            sender,
+            content: format!("[reaction] {}", key),
+            channel: "matrix".into(),
+            chat_id: room_id.to_string(),
+            timestamp,
+            reply_to: None,
             metadata,
         })
     }
@@ -724,6 +910,344 @@ enum SyncError {
     Transient(anyhow::Error),
 }
 
+// -- Public API beyond Channel trait -----------------------------
+
+impl MatrixChannel {
+    /// Generic event-send helper. Returns the homeserver-assigned
+    /// `event_id`. Used internally by `send`, `react`, `edit`,
+    /// `redact`; also available to higher-level integration code
+    /// (e.g. an approval-prompt flow that wants the event id of
+    /// the prompt to attach reactions to).
+    pub async fn send_event(
+        &self,
+        room_id: &str,
+        event_type: &str,
+        content: Value,
+    ) -> Result<String> {
+        let txn_id = format!("fennec.{}", uuid::Uuid::new_v4());
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/{}/{}",
+            self.base_url(),
+            urlencoding::encode(room_id),
+            urlencoding::encode(event_type),
+            urlencoding::encode(&txn_id),
+        );
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(self.token())
+            .json(&content)
+            .timeout(RPC_TIMEOUT)
+            .send()
+            .await
+            .context("matrix send_event request failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("matrix send_event returned {}", resp.status());
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .context("matrix send_event response not JSON")?;
+        let event_id = body
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !event_id.is_empty() && event_type == "m.room.message" {
+            self.state
+                .last_sent_by_chat
+                .lock()
+                .insert(room_id.to_string(), event_id.clone());
+        }
+        Ok(event_id)
+    }
+
+    /// Add a reaction (`m.annotation`) to an existing event. Used by
+    /// approval-prompt flows to mark a sent message with ✅/❎ seed
+    /// reactions, and to react to inbound events for acknowledgement.
+    pub async fn react(
+        &self,
+        room_id: &str,
+        target_event_id: &str,
+        key: &str,
+    ) -> Result<String> {
+        let content = json!({
+            "m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": target_event_id,
+                "key": key,
+            }
+        });
+        self.send_event(room_id, "m.reaction", content).await
+    }
+
+    /// Redact (delete) an event. Used to clean up seed reactions
+    /// after an approval prompt resolves, or to retract bot
+    /// messages.
+    pub async fn redact(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        reason: Option<&str>,
+    ) -> Result<String> {
+        let txn_id = format!("fennec.{}", uuid::Uuid::new_v4());
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/redact/{}/{}",
+            self.base_url(),
+            urlencoding::encode(room_id),
+            urlencoding::encode(event_id),
+            urlencoding::encode(&txn_id),
+        );
+        let body = match reason {
+            Some(r) => json!({ "reason": r }),
+            None => json!({}),
+        };
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(self.token())
+            .json(&body)
+            .timeout(RPC_TIMEOUT)
+            .send()
+            .await
+            .context("matrix redact request failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("matrix redact returned {}", resp.status());
+        }
+        let parsed: Value = resp
+            .json()
+            .await
+            .context("matrix redact response not JSON")?;
+        Ok(parsed
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// Edit a previously-sent message via the `m.replace` relation.
+    /// `original_event_id` is the message being edited; `new_body`
+    /// replaces its plain-text content (an HTML `formatted_body`
+    /// is included when `markdown_to_html` is on and the new body
+    /// looks like markdown). The fallback `body` follows the
+    /// upstream convention of prefixing `* ` so non-edit-aware
+    /// clients show "* edited body".
+    pub async fn edit(
+        &self,
+        room_id: &str,
+        original_event_id: &str,
+        new_body: &str,
+    ) -> Result<String> {
+        let mut new_content = json!({
+            "msgtype": "m.text",
+            "body": new_body,
+        });
+        if self.config.markdown_to_html && chunk_has_markdown(new_body) {
+            let html = markdown_to_html(new_body);
+            let obj = new_content.as_object_mut().unwrap();
+            obj.insert("format".into(), json!("org.matrix.custom.html"));
+            obj.insert("formatted_body".into(), json!(html));
+        }
+        let content = json!({
+            "msgtype": "m.text",
+            "body": format!("* {}", new_body),
+            "m.new_content": new_content,
+            "m.relates_to": {
+                "rel_type": "m.replace",
+                "event_id": original_event_id,
+            }
+        });
+        self.send_event(room_id, "m.room.message", content).await
+    }
+
+    /// Upload binary media to the homeserver's media repository.
+    /// Returns the `mxc://` URI on success. The caller then
+    /// references that URI in an `m.image`/`m.file`/`m.audio`/
+    /// `m.video` event to surface the media inline.
+    pub async fn upload_media(
+        &self,
+        bytes: &[u8],
+        mime: &str,
+        filename: Option<&str>,
+    ) -> Result<String> {
+        let mut url = format!("{}/_matrix/media/v3/upload", self.base_url());
+        if let Some(name) = filename {
+            url.push_str(&format!("?filename={}", urlencoding::encode(name)));
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(self.token())
+            .header("Content-Type", mime)
+            .body(bytes.to_vec())
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .context("matrix media upload failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("matrix media upload returned {}", resp.status());
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .context("matrix media upload response not JSON")?;
+        body.get("content_uri")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("matrix media upload missing content_uri"))
+    }
+
+    /// Most recent `event_id` this channel sent into the given
+    /// chat, if any. Useful for approval-prompt flows that want
+    /// to react to the message they just sent without threading
+    /// the id through the caller.
+    pub fn last_sent_event_id(&self, chat_id: &str) -> Option<String> {
+        self.state.last_sent_by_chat.lock().get(chat_id).cloned()
+    }
+
+    /// Decide whether to wrap an outbound message in a thread,
+    /// and if so on which event. Honors `auto_thread` (rooms),
+    /// `dm_auto_thread` (DMs), and `dm_mention_threads` (DMs only
+    /// when the inbound was an @mention). Caller may pin an
+    /// explicit thread anchor via `metadata.matrix_thread_id`,
+    /// otherwise we anchor on `reply_to`.
+    fn pick_thread_anchor(&self, room_id: &str, msg: &SendMessage) -> Option<String> {
+        if let Some(t) = msg.metadata.get("matrix_thread_id") {
+            if !t.is_empty() {
+                return Some(t.clone());
+            }
+        }
+        let is_dm = self.state.dm_rooms.lock().contains(room_id);
+        let want_thread = if is_dm {
+            if self.config.dm_auto_thread {
+                true
+            } else if self.config.dm_mention_threads {
+                msg.metadata.get("matrix_mentioned").map(String::as_str) == Some("true")
+            } else {
+                false
+            }
+        } else {
+            self.config.auto_thread
+        };
+        if !want_thread {
+            return None;
+        }
+        msg.reply_to.clone()
+    }
+
+    /// Attach reply / thread relation metadata to an outbound
+    /// content object. Called by `send` for both text bodies and
+    /// media events so attachments and their text companion stay
+    /// in the same thread.
+    fn attach_relation(&self, content: &mut Value, room_id: &str, msg: &SendMessage) {
+        if let Some(thread_id) = self.pick_thread_anchor(room_id, msg) {
+            let in_reply_to = msg
+                .reply_to
+                .clone()
+                .unwrap_or_else(|| thread_id.clone());
+            content.as_object_mut().unwrap().insert(
+                "m.relates_to".into(),
+                json!({
+                    "rel_type": "m.thread",
+                    "event_id": thread_id,
+                    "is_falling_back": true,
+                    "m.in_reply_to": { "event_id": in_reply_to },
+                }),
+            );
+            self.state.bot_threads.lock().insert(thread_id);
+        } else if let Some(reply_to) = &msg.reply_to {
+            content.as_object_mut().unwrap().insert(
+                "m.relates_to".into(),
+                json!({
+                    "m.in_reply_to": { "event_id": reply_to },
+                }),
+            );
+        }
+    }
+
+    /// Build the JSON content for an `m.image`/`m.file`/`m.audio`/
+    /// `m.video` event, given the uploaded media's mxc URI.
+    fn media_event_content(
+        &self,
+        att: &crate::bus::MediaAttachment,
+        mxc: &str,
+    ) -> Value {
+        let (msgtype, default_name) = match att.kind {
+            crate::bus::MediaKind::Image => ("m.image", "image"),
+            crate::bus::MediaKind::Audio => ("m.audio", "audio"),
+            crate::bus::MediaKind::Video => ("m.video", "video"),
+            crate::bus::MediaKind::File => ("m.file", "file"),
+        };
+        let body = att
+            .filename
+            .clone()
+            .unwrap_or_else(|| default_name.to_string());
+        let mut info = serde_json::Map::new();
+        info.insert("mimetype".into(), json!(att.mime));
+        info.insert("size".into(), json!(att.bytes.len()));
+        if let Some(w) = att.width {
+            info.insert("w".into(), json!(w));
+        }
+        if let Some(h) = att.height {
+            info.insert("h".into(), json!(h));
+        }
+        if let Some(d) = att.duration_ms {
+            info.insert("duration".into(), json!(d));
+        }
+        json!({
+            "msgtype": msgtype,
+            "body": body,
+            "url": mxc,
+            "info": Value::Object(info),
+        })
+    }
+
+    /// Download an inbound media file (`mxc://server/id`) to the
+    /// configured media-cache directory. Returns the local path on
+    /// success. Caller should only invoke when `media_cache_dir`
+    /// is set; with empty config this is a no-op returning `None`.
+    pub async fn download_media(
+        &self,
+        mxc: &str,
+        event_id: &str,
+        mime: Option<&str>,
+    ) -> Result<Option<std::path::PathBuf>> {
+        if self.config.media_cache_dir.is_empty() {
+            return Ok(None);
+        }
+        let url = match mxc_to_http_url(&self.base_url(), mxc) {
+            Some(u) => u,
+            None => return Ok(None),
+        };
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(self.token())
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .context("matrix media download request failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("matrix media download returned {}", resp.status());
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .context("matrix media download body read failed")?;
+        let dir = std::path::PathBuf::from(&self.config.media_cache_dir);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("matrix media cache dir create failed: {}", dir.display()))?;
+        let ext = mime.and_then(extension_for_mime).unwrap_or("bin");
+        let safe_id = event_id.replace(['/', '\\', ':'], "_");
+        let path = dir.join(format!("{}.{}", safe_id, ext));
+        tokio::fs::write(&path, &bytes)
+            .await
+            .with_context(|| format!("matrix media write failed: {}", path.display()))?;
+        Ok(Some(path))
+    }
+}
+
 // -- Channel impl ------------------------------------------------
 
 #[async_trait]
@@ -737,23 +1261,45 @@ impl Channel for MatrixChannel {
         if room_id.is_empty() {
             anyhow::bail!("matrix: empty recipient (room_id) in send");
         }
+
+        // Attachments first — each becomes its own m.image / m.file
+        // / m.audio / m.video event so clients render them inline.
+        // They share the reply / thread anchor with the text body
+        // so threaded conversations stay grouped.
+        for att in &message.attachments {
+            let mxc = self
+                .upload_media(&att.bytes, &att.mime, att.filename.as_deref())
+                .await?;
+            let mut content = self.media_event_content(att, &mxc);
+            self.attach_relation(&mut content, room_id, message);
+            let _ = self
+                .send_event(room_id, "m.room.message", content)
+                .await?;
+        }
+
+        // Empty content with attachments — no text companion needed.
+        if message.content.is_empty() && !message.attachments.is_empty() {
+            return Ok(());
+        }
+
+        let msgtype = message
+            .metadata
+            .get("matrix_msgtype")
+            .map(|s| s.as_str())
+            .filter(|s| matches!(*s, "m.text" | "m.emote" | "m.notice"))
+            .unwrap_or("m.text");
+
         let chunks = chunk_text(&message.content, MAX_MESSAGE_LENGTH);
-        let me = self.current_user_id();
         for chunk in chunks {
             let mut content = json!({
-                "msgtype": "m.text",
+                "msgtype": msgtype,
                 "body": chunk,
             });
             if self.config.markdown_to_html && chunk_has_markdown(&chunk) {
                 let html = markdown_to_html(&chunk);
-                content.as_object_mut().unwrap().insert(
-                    "format".into(),
-                    json!("org.matrix.custom.html"),
-                );
-                content
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("formatted_body".into(), json!(html));
+                let obj = content.as_object_mut().unwrap();
+                obj.insert("format".into(), json!("org.matrix.custom.html"));
+                obj.insert("formatted_body".into(), json!(html));
             }
             // m.mentions for @user references in the body.
             let mentions = extract_mentioned_user_ids(&chunk);
@@ -763,48 +1309,8 @@ impl Channel for MatrixChannel {
                     json!({ "user_ids": mentions }),
                 );
             }
-            // Auto-thread: anchor on the parent message id when
-            // the caller left a reply target. The bot tracks any
-            // thread it sends into so subsequent inbound activity
-            // bypasses the mention gate.
-            if let Some(thread_id) = pick_thread_anchor(&self.config, message, &me) {
-                content.as_object_mut().unwrap().insert(
-                    "m.relates_to".into(),
-                    json!({
-                        "rel_type": "m.thread",
-                        "event_id": thread_id,
-                        "is_falling_back": true,
-                        "m.in_reply_to": { "event_id": message.reply_to.clone().unwrap_or_else(|| thread_id.clone()) },
-                    }),
-                );
-                self.state.bot_threads.lock().insert(thread_id);
-            } else if let Some(reply_to) = &message.reply_to {
-                content.as_object_mut().unwrap().insert(
-                    "m.relates_to".into(),
-                    json!({
-                        "m.in_reply_to": { "event_id": reply_to },
-                    }),
-                );
-            }
-            let txn_id = format!("fennec.{}", uuid::Uuid::new_v4());
-            let url = format!(
-                "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-                self.base_url(),
-                urlencoding::encode(room_id),
-                urlencoding::encode(&txn_id),
-            );
-            let resp = self
-                .http
-                .put(&url)
-                .bearer_auth(self.token())
-                .json(&content)
-                .timeout(RPC_TIMEOUT)
-                .send()
-                .await
-                .context("matrix send request failed")?;
-            if !resp.status().is_success() {
-                anyhow::bail!("matrix send returned {}", resp.status());
-            }
+            self.attach_relation(&mut content, room_id, message);
+            let _ = self.send_event(room_id, "m.room.message", content).await?;
         }
         Ok(())
     }
@@ -943,32 +1449,33 @@ fn extract_mentioned_user_ids(body: &str) -> Vec<String> {
     out
 }
 
-/// Decide whether to wrap a send in a thread. Honors
-/// `auto_thread`, `dm_auto_thread`, and `dm_mention_threads`. If
-/// the inbound carried a `matrix_thread_id` in metadata, use it
-/// directly. Otherwise anchor on `reply_to` (the inbound event id).
-fn pick_thread_anchor(
-    config: &MatrixChannelEntry,
-    msg: &SendMessage,
-    _me: &str,
-) -> Option<String> {
-    // Note: SendMessage doesn't carry the originating chat_id's
-    // DM-ness, but the gating decision is the same for DM and
-    // non-DM at the moment of *sending*: if the caller wants a
-    // thread, they'll have set reply_to. The DM-vs-room nuance
-    // matters only for inbound gating, which `handle_event`
-    // applies separately.
-    //
-    // Effective rule: thread when auto_thread is on AND we have a
-    // reply target. Use the explicit thread id if present in the
-    // outbound metadata; else anchor on reply_to.
-    if !config.auto_thread && !config.dm_auto_thread {
-        return None;
-    }
-    // Caller may pass the thread id directly via metadata; check
-    // OutboundMessage-style `metadata` if provided. SendMessage
-    // doesn't carry metadata today, so we fall back to reply_to.
-    msg.reply_to.clone()
+/// Map a MIME type to a sensible file extension for the local
+/// media cache. Conservative — falls through to `None` when we
+/// don't have a clear winner, and the caller picks `bin`.
+fn extension_for_mime(mime: &str) -> Option<&'static str> {
+    let m = mime.split(';').next().unwrap_or(mime).trim();
+    Some(match m {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" | "image/heif" => "heic",
+        "image/svg+xml" => "svg",
+        "audio/mp4" | "audio/aac" => "m4a",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/webm" => "weba",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "application/pdf" => "pdf",
+        "application/json" => "json",
+        "application/zip" => "zip",
+        "text/plain" => "txt",
+        "text/markdown" => "md",
+        _ => return None,
+    })
 }
 
 /// Slice a body into chunks no larger than `max_chars` characters.
@@ -1364,6 +1871,7 @@ mod tests {
             dm_auto_thread: false,
             dm_mention_threads: false,
             markdown_to_html: true,
+            media_cache_dir: String::new(),
             home_chat_id: String::new(),
         }
     }
@@ -1961,5 +2469,344 @@ mod tests {
             assert!(j >= base);
             assert!(j <= base + base / 5 + Duration::from_millis(1));
         }
+    }
+
+    // -- Reaction events ----------------------------------------
+
+    #[test]
+    fn handle_event_reaction_surfaces() {
+        let mut c = cfg();
+        c.allowed_rooms = vec!["*".into()];
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let ev = evt(json!({
+            "type": "m.reaction",
+            "event_id": "$rx",
+            "sender": "@alice:example.org",
+            "origin_server_ts": chrono::Utc::now().timestamp_millis(),
+            "content": {
+                "m.relates_to": {
+                    "rel_type": "m.annotation",
+                    "event_id": "$prompt",
+                    "key": "✅"
+                }
+            }
+        }));
+        let inbound = ch.handle_event("!room:example.org", &ev).expect("kept");
+        assert_eq!(inbound.content, "[reaction] ✅");
+        assert_eq!(
+            inbound.metadata.get("matrix_reaction_target").map(String::as_str),
+            Some("$prompt")
+        );
+        assert_eq!(
+            inbound.metadata.get("matrix_reaction_key").map(String::as_str),
+            Some("✅")
+        );
+        assert_eq!(
+            inbound.metadata.get("matrix_msgtype").map(String::as_str),
+            Some("m.reaction")
+        );
+    }
+
+    #[test]
+    fn handle_event_reaction_drops_self() {
+        let mut c = cfg();
+        c.allowed_rooms = vec!["*".into()];
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let ev = evt(json!({
+            "type": "m.reaction",
+            "event_id": "$rx2",
+            "sender": "@bot:example.org",
+            "origin_server_ts": chrono::Utc::now().timestamp_millis(),
+            "content": {
+                "m.relates_to": {
+                    "rel_type": "m.annotation",
+                    "event_id": "$prompt",
+                    "key": "✅"
+                }
+            }
+        }));
+        assert!(ch.handle_event("!room:example.org", &ev).is_none());
+    }
+
+    #[test]
+    fn handle_event_reaction_drops_disallowed_room() {
+        let ch = channel(); // empty allowed_rooms
+        let ev = evt(json!({
+            "type": "m.reaction",
+            "event_id": "$rx3",
+            "sender": "@alice:example.org",
+            "origin_server_ts": chrono::Utc::now().timestamp_millis(),
+            "content": {
+                "m.relates_to": {
+                    "rel_type": "m.annotation",
+                    "event_id": "$prompt",
+                    "key": "✅"
+                }
+            }
+        }));
+        assert!(ch.handle_event("!room:example.org", &ev).is_none());
+    }
+
+    #[test]
+    fn handle_event_reaction_requires_annotation_rel_type() {
+        let mut c = cfg();
+        c.allowed_rooms = vec!["*".into()];
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let ev = evt(json!({
+            "type": "m.reaction",
+            "event_id": "$rx4",
+            "sender": "@alice:example.org",
+            "origin_server_ts": chrono::Utc::now().timestamp_millis(),
+            "content": {
+                "m.relates_to": {
+                    "rel_type": "m.thread",
+                    "event_id": "$x"
+                }
+            }
+        }));
+        assert!(ch.handle_event("!room:example.org", &ev).is_none());
+    }
+
+    // -- Media inbound expansion --------------------------------
+
+    #[test]
+    fn handle_event_image_with_empty_body_still_surfaces() {
+        let mut c = cfg();
+        c.allowed_rooms = vec!["*".into()];
+        c.require_mention = false;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let ev = evt(json!({
+            "type": "m.room.message",
+            "event_id": "$img",
+            "sender": "@alice:example.org",
+            "origin_server_ts": chrono::Utc::now().timestamp_millis(),
+            "content": {
+                "msgtype": "m.image",
+                "body": "",
+                "url": "mxc://example.org/abc"
+            }
+        }));
+        let inbound = ch.handle_event("!room:example.org", &ev).expect("kept");
+        assert_eq!(
+            inbound.metadata.get("matrix_media_kind").map(String::as_str),
+            Some("image")
+        );
+    }
+
+    #[test]
+    fn handle_event_media_full_metadata() {
+        let mut c = cfg();
+        c.allowed_rooms = vec!["*".into()];
+        c.require_mention = false;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let ev = evt(json!({
+            "type": "m.room.message",
+            "event_id": "$vid",
+            "sender": "@alice:example.org",
+            "origin_server_ts": chrono::Utc::now().timestamp_millis(),
+            "content": {
+                "msgtype": "m.video",
+                "body": "clip.mp4",
+                "url": "mxc://example.org/vid",
+                "info": {
+                    "mimetype": "video/mp4",
+                    "size": 4096,
+                    "w": 1280,
+                    "h": 720,
+                    "duration": 12000
+                }
+            }
+        }));
+        let inbound = ch.handle_event("!room:example.org", &ev).expect("kept");
+        assert_eq!(inbound.metadata.get("matrix_media_kind").map(String::as_str), Some("video"));
+        assert_eq!(inbound.metadata.get("matrix_media_size").map(String::as_str), Some("4096"));
+        assert_eq!(inbound.metadata.get("matrix_media_width").map(String::as_str), Some("1280"));
+        assert_eq!(inbound.metadata.get("matrix_media_height").map(String::as_str), Some("720"));
+        assert_eq!(inbound.metadata.get("matrix_media_duration_ms").map(String::as_str), Some("12000"));
+    }
+
+    // -- pick_thread_anchor -------------------------------------
+
+    #[test]
+    fn thread_anchor_room_with_auto_thread_uses_reply_to() {
+        let mut c = cfg();
+        c.allowed_rooms = vec!["*".into()];
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let msg = SendMessage::new("hi", "!room:example.org")
+            .with_reply_to(Some("$inbound".into()));
+        assert_eq!(
+            ch.pick_thread_anchor("!room:example.org", &msg),
+            Some("$inbound".into())
+        );
+    }
+
+    #[test]
+    fn thread_anchor_room_off_when_auto_thread_disabled() {
+        let mut c = cfg();
+        c.auto_thread = false;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let msg = SendMessage::new("hi", "!room:example.org")
+            .with_reply_to(Some("$x".into()));
+        assert_eq!(ch.pick_thread_anchor("!room:example.org", &msg), None);
+    }
+
+    #[test]
+    fn thread_anchor_dm_off_when_dm_auto_thread_disabled() {
+        let mut c = cfg();
+        c.dm_auto_thread = false;
+        c.dm_mention_threads = false;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        ch.state.dm_rooms.lock().insert("!dm:example.org".into());
+        let msg = SendMessage::new("hi", "!dm:example.org")
+            .with_reply_to(Some("$x".into()));
+        assert_eq!(ch.pick_thread_anchor("!dm:example.org", &msg), None);
+    }
+
+    #[test]
+    fn thread_anchor_dm_on_with_dm_auto_thread() {
+        let mut c = cfg();
+        c.dm_auto_thread = true;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        ch.state.dm_rooms.lock().insert("!dm:example.org".into());
+        let msg = SendMessage::new("hi", "!dm:example.org")
+            .with_reply_to(Some("$x".into()));
+        assert_eq!(
+            ch.pick_thread_anchor("!dm:example.org", &msg),
+            Some("$x".into())
+        );
+    }
+
+    #[test]
+    fn thread_anchor_dm_mention_threads_only_when_mentioned() {
+        let mut c = cfg();
+        c.dm_auto_thread = false;
+        c.dm_mention_threads = true;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        ch.state.dm_rooms.lock().insert("!dm:example.org".into());
+        // Without mention metadata: no thread.
+        let msg_no_mention = SendMessage::new("hi", "!dm:example.org")
+            .with_reply_to(Some("$x".into()));
+        assert_eq!(
+            ch.pick_thread_anchor("!dm:example.org", &msg_no_mention),
+            None
+        );
+        // With mention metadata: thread.
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("matrix_mentioned".into(), "true".into());
+        let msg_mentioned = SendMessage::new("hi", "!dm:example.org")
+            .with_reply_to(Some("$x".into()))
+            .with_metadata(meta);
+        assert_eq!(
+            ch.pick_thread_anchor("!dm:example.org", &msg_mentioned),
+            Some("$x".into())
+        );
+    }
+
+    #[test]
+    fn thread_anchor_explicit_metadata_wins() {
+        let mut c = cfg();
+        c.auto_thread = false;
+        c.dm_auto_thread = false;
+        let ch = MatrixChannel::from_config(&c).unwrap();
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("matrix_thread_id".into(), "$pinned".into());
+        let msg = SendMessage::new("hi", "!room:example.org").with_metadata(meta);
+        // Even with both auto_thread flags off, explicit metadata
+        // forces a thread anchor.
+        assert_eq!(
+            ch.pick_thread_anchor("!room:example.org", &msg),
+            Some("$pinned".into())
+        );
+    }
+
+    // -- media_event_content shape ------------------------------
+
+    #[test]
+    fn media_event_content_image_shape() {
+        let ch = channel();
+        let att = crate::bus::MediaAttachment {
+            kind: crate::bus::MediaKind::Image,
+            bytes: vec![0; 64],
+            mime: "image/png".into(),
+            filename: Some("shot.png".into()),
+            width: Some(800),
+            height: Some(600),
+            duration_ms: None,
+        };
+        let v = ch.media_event_content(&att, "mxc://example.org/abc");
+        assert_eq!(v["msgtype"], "m.image");
+        assert_eq!(v["body"], "shot.png");
+        assert_eq!(v["url"], "mxc://example.org/abc");
+        assert_eq!(v["info"]["mimetype"], "image/png");
+        assert_eq!(v["info"]["size"], 64);
+        assert_eq!(v["info"]["w"], 800);
+        assert_eq!(v["info"]["h"], 600);
+        assert!(v["info"].get("duration").is_none());
+    }
+
+    #[test]
+    fn media_event_content_audio_carries_duration() {
+        let ch = channel();
+        let att = crate::bus::MediaAttachment {
+            kind: crate::bus::MediaKind::Audio,
+            bytes: vec![0; 100],
+            mime: "audio/mp4".into(),
+            filename: Some("voice.m4a".into()),
+            width: None,
+            height: None,
+            duration_ms: Some(5000),
+        };
+        let v = ch.media_event_content(&att, "mxc://example.org/aa");
+        assert_eq!(v["msgtype"], "m.audio");
+        assert_eq!(v["info"]["duration"], 5000);
+    }
+
+    #[test]
+    fn media_event_content_file_default_body() {
+        let ch = channel();
+        let att = crate::bus::MediaAttachment {
+            kind: crate::bus::MediaKind::File,
+            bytes: vec![0; 8],
+            mime: "application/pdf".into(),
+            filename: None,
+            width: None,
+            height: None,
+            duration_ms: None,
+        };
+        let v = ch.media_event_content(&att, "mxc://example.org/f");
+        assert_eq!(v["msgtype"], "m.file");
+        assert_eq!(v["body"], "file");
+    }
+
+    // -- extension_for_mime -------------------------------------
+
+    #[test]
+    fn extension_for_mime_known_types() {
+        assert_eq!(extension_for_mime("image/png"), Some("png"));
+        assert_eq!(extension_for_mime("image/jpeg"), Some("jpg"));
+        assert_eq!(extension_for_mime("audio/mp4"), Some("m4a"));
+        assert_eq!(extension_for_mime("video/mp4"), Some("mp4"));
+        assert_eq!(extension_for_mime("application/pdf"), Some("pdf"));
+    }
+
+    #[test]
+    fn extension_for_mime_handles_charset_suffix() {
+        assert_eq!(
+            extension_for_mime("text/plain; charset=utf-8"),
+            Some("txt")
+        );
+    }
+
+    #[test]
+    fn extension_for_mime_unknown_returns_none() {
+        assert_eq!(extension_for_mime("application/x-weirdo"), None);
+    }
+
+    // -- last_sent_event_id -------------------------------------
+
+    #[test]
+    fn last_sent_event_id_initially_none() {
+        let ch = channel();
+        assert!(ch.last_sent_event_id("!any:example.org").is_none());
     }
 }

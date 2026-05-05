@@ -1,6 +1,6 @@
 pub mod events;
 pub mod turn_context;
-pub use events::{InboundMessage, OutboundMessage};
+pub use events::{InboundMessage, MediaAttachment, MediaKind, OutboundMessage};
 pub use turn_context::{
     new_turn_origin, ChatDirectory, DirectoryEntry, PendingReplies, TurnOrigin, TurnOriginHandle,
 };
