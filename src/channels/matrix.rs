@@ -149,6 +149,18 @@ struct MatrixState {
     /// chunk shows up mid-window (the upstream's split-detection
     /// behavior — a continuation is likely coming).
     flush_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Tracked joined members per room. Populated from
+    /// `m.room.member` state events during sync; consumed by the
+    /// E2EE layer's `share_room_key` to know which devices need
+    /// the Megolm key. Maintained even when E2EE is off so we
+    /// don't have to retrofit member tracking later.
+    room_members: Mutex<HashMap<String, HashSet<String>>>,
+    /// E2EE handle. Populated during `listen()` when the
+    /// `matrix-e2ee` feature is on AND `crypto_store_dir` is
+    /// configured. None otherwise (channel falls back to the
+    /// unencrypted path for everything).
+    #[cfg(feature = "matrix-e2ee")]
+    crypto: parking_lot::RwLock<Option<crate::channels::matrix_e2ee::MatrixCrypto>>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +243,9 @@ impl MatrixChannel {
                 last_sent_by_chat: Mutex::new(HashMap::new()),
                 text_batch_buffers: Mutex::new(HashMap::new()),
                 flush_handles: Mutex::new(HashMap::new()),
+                room_members: Mutex::new(HashMap::new()),
+                #[cfg(feature = "matrix-e2ee")]
+                crypto: parking_lot::RwLock::new(None),
             }),
             http,
         })
@@ -404,6 +419,16 @@ impl MatrixChannel {
                 )));
             }
         }
+        // Feed encryption-relevant fields (to_device, device_lists,
+        // OTK counts, fallback keys) into the OlmMachine BEFORE we
+        // persist next_batch — to-device events are ephemeral and
+        // the homeserver won't re-deliver them.
+        #[cfg(feature = "matrix-e2ee")]
+        if let Some(crypto) = self.crypto_handle() {
+            if let Err(e) = crypto.process_sync_changes(&body).await {
+                tracing::warn!(error = %e, "matrix crypto process_sync_changes failed");
+            }
+        }
         if let Some(nb) = body.get("next_batch").and_then(|v| v.as_str()) {
             *self.state.next_batch.lock() = Some(nb.to_string());
             // Best-effort persist so a restart resumes here. Logged
@@ -442,13 +467,38 @@ impl MatrixChannel {
                 }
             }
             for (room_id, room_data) in rooms {
+                // Process state events first so encrypted-room
+                // detection and member tracking are up-to-date
+                // before timeline events are dispatched.
+                if let Some(state_events) = room_data
+                    .pointer("/state/events")
+                    .and_then(|v| v.as_array())
+                {
+                    self.process_state_events(room_id, state_events);
+                }
                 let events = room_data
                     .pointer("/timeline/events")
                     .and_then(|v| v.as_array())
                     .cloned()
                     .unwrap_or_default();
                 for event in events {
-                    if let Some(mut inbound) = self.handle_event(room_id, &event) {
+                    // State events can also arrive in the timeline
+                    // (e.g. m.room.encryption when a room first
+                    // turns on encryption). Handle them too.
+                    if let Some(t) = event.get("type").and_then(|v| v.as_str()) {
+                        if t == "m.room.encryption" || t == "m.room.member" {
+                            self.process_state_events(room_id, std::slice::from_ref(&event));
+                        }
+                    }
+                    // Decrypt m.room.encrypted events to recover
+                    // the inner plaintext before passing through
+                    // the regular handler. Failures pass the
+                    // event through as-is so the agent at least
+                    // sees a placeholder InboundMessage.
+                    let event_for_handler = self.maybe_decrypt(room_id, event).await;
+                    if let Some(mut inbound) =
+                        self.handle_event(room_id, &event_for_handler)
+                    {
                         // For media events with a configured cache
                         // dir, download the binary inline before
                         // surfacing the InboundMessage so consumers
@@ -466,6 +516,15 @@ impl MatrixChannel {
                         }
                     }
                 }
+            }
+        }
+        // After all room events are processed, drain any
+        // outgoing crypto requests (key shares, etc.) the
+        // OlmMachine queued. Best-effort.
+        #[cfg(feature = "matrix-e2ee")]
+        if let Some(crypto) = self.crypto_handle() {
+            if let Err(e) = crypto.drain_outgoing_requests().await {
+                tracing::debug!(error = %e, "matrix crypto drain failed");
             }
         }
         Ok(())
@@ -1531,6 +1590,35 @@ impl MatrixChannel {
                 );
             }
             self.attach_relation(&mut content, room_id, message);
+            // Encrypted-room branch: wrap the content via the
+            // OlmMachine and emit `m.room.encrypted` instead of
+            // `m.room.message`. Falls back to plaintext send if
+            // the crypto handle isn't active or the room hasn't
+            // been seen as encrypted.
+            #[cfg(feature = "matrix-e2ee")]
+            if let Some(crypto) = self.crypto_handle() {
+                if crypto.is_encrypted(room_id) {
+                    let recipients = self.room_member_recipients(room_id);
+                    match crypto
+                        .encrypt_room_message(room_id, &content, &recipients)
+                        .await
+                    {
+                        Ok(encrypted) => {
+                            let _ = self
+                                .send_event(room_id, "m.room.encrypted", encrypted)
+                                .await?;
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                room = %room_id,
+                                error = %e,
+                                "matrix encrypt failed; falling back to plaintext send"
+                            );
+                        }
+                    }
+                }
+            }
             let _ = self.send_event(room_id, "m.room.message", content).await?;
         }
         Ok(())
@@ -1620,6 +1708,183 @@ impl MatrixChannel {
             );
         }
     }
+
+    // -- E2EE plumbing -----------------------------------------
+    //
+    // All crypto access goes through `crypto_handle()` which
+    // returns `None` when the feature is off OR when the user
+    // didn't configure a `crypto_store_dir`. Callers branch on
+    // that and fall through to the unencrypted path.
+
+    /// Initialize the crypto layer if both the feature is built
+    /// and the user configured a crypto store directory. No-op
+    /// otherwise — channel falls back to unencrypted operation.
+    #[cfg(feature = "matrix-e2ee")]
+    async fn init_crypto(&self) -> Result<()> {
+        if self.config.crypto_store_dir.is_empty() {
+            return Ok(());
+        }
+        use crate::channels::matrix_e2ee::{MatrixCrypto, MatrixCryptoConfig};
+        let state = self.state.clone();
+        let token_provider: Arc<dyn Fn() -> String + Send + Sync> =
+            Arc::new(move || state.access_token.lock().clone());
+        let cfg = MatrixCryptoConfig {
+            homeserver: self.config.homeserver.clone(),
+            user_id: self.current_user_id(),
+            device_id: if self.config.device_id.is_empty() {
+                None
+            } else {
+                Some(self.config.device_id.clone())
+            },
+            crypto_store_dir: std::path::PathBuf::from(&self.config.crypto_store_dir),
+            crypto_store_passphrase: if self.config.crypto_store_passphrase.is_empty() {
+                None
+            } else {
+                Some(self.config.crypto_store_passphrase.clone())
+            },
+            http: self.http.clone(),
+            token_provider,
+        };
+        let crypto = MatrixCrypto::new(cfg).await?;
+        // Drain whatever the OlmMachine wants to upload at
+        // startup (initial keys/upload, cross-signing bootstrap,
+        // etc). Best-effort — log on failure but proceed; the
+        // sync loop's per-tick drain will retry.
+        if let Err(e) = crypto.drain_outgoing_requests().await {
+            tracing::warn!(error = %e, "matrix crypto initial drain failed");
+        }
+        *self.state.crypto.write() = Some(crypto);
+        tracing::info!("matrix E2EE initialized");
+        Ok(())
+    }
+
+    /// Default-build stub — when the feature is off, init is a
+    /// no-op so `listen()` can call it unconditionally.
+    #[cfg(not(feature = "matrix-e2ee"))]
+    async fn init_crypto(&self) -> Result<()> {
+        if !self.config.crypto_store_dir.is_empty() {
+            tracing::warn!(
+                "matrix `crypto_store_dir` is set but the `matrix-e2ee` Cargo feature is disabled; \
+                 falling back to unencrypted operation"
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns the active crypto handle, if any. None when the
+    /// feature is off or the user didn't configure E2EE. Callers
+    /// branch on this to decide between encrypted and plaintext
+    /// paths.
+    #[cfg(feature = "matrix-e2ee")]
+    fn crypto_handle(&self) -> Option<crate::channels::matrix_e2ee::MatrixCrypto> {
+        self.state.crypto.read().clone()
+    }
+
+    /// Stub for default builds — returns a placeholder type that
+    /// can never be matched, so `if let Some(_) = crypto_handle()`
+    /// is always false and the encrypted path compiles out.
+    #[cfg(not(feature = "matrix-e2ee"))]
+    fn crypto_handle(&self) -> Option<std::convert::Infallible> {
+        None
+    }
+
+    /// Called for each room's `state.events` array from a sync
+    /// response. Tracks `m.room.encryption` (marks the room as
+    /// encrypted) and `m.room.member` (maintains the joined-
+    /// members set used by `share_room_key`).
+    fn process_state_events(&self, room_id: &str, state_events: &[Value]) {
+        for ev in state_events {
+            let event_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match event_type {
+                "m.room.encryption" => {
+                    #[cfg(feature = "matrix-e2ee")]
+                    if let Some(crypto) = self.crypto_handle() {
+                        crypto.mark_encrypted(room_id);
+                    }
+                }
+                "m.room.member" => {
+                    let user = ev
+                        .get("state_key")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let membership = ev
+                        .pointer("/content/membership")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if user.is_empty() {
+                        continue;
+                    }
+                    let mut members = self.state.room_members.lock();
+                    let entry = members.entry(room_id.to_string()).or_default();
+                    match membership {
+                        "join" | "invite" => {
+                            entry.insert(user.to_string());
+                        }
+                        "leave" | "ban" => {
+                            entry.remove(user);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// If `event` is `m.room.encrypted` and we have an active
+    /// crypto handle, decrypt and return the recovered plaintext
+    /// event JSON. Otherwise pass the event through unchanged.
+    /// Decrypt failures log and return the original event so
+    /// downstream filtering can still drop it cleanly.
+    async fn maybe_decrypt(&self, room_id: &str, event: Value) -> Value {
+        #[cfg(feature = "matrix-e2ee")]
+        {
+            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if event_type != "m.room.encrypted" {
+                return event;
+            }
+            let crypto = match self.crypto_handle() {
+                Some(c) => c,
+                None => return event,
+            };
+            match crypto.decrypt(room_id, &event).await {
+                Ok(plain) => plain,
+                Err(e) => {
+                    tracing::debug!(
+                        room = %room_id,
+                        error = %e,
+                        "matrix: decrypt failed; passing encrypted event through"
+                    );
+                    event
+                }
+            }
+        }
+        #[cfg(not(feature = "matrix-e2ee"))]
+        {
+            let _ = room_id;
+            event
+        }
+    }
+
+    /// Snapshot the joined members of a room. Used as the
+    /// recipient list for `share_room_key`. The bot's own user-id
+    /// is filtered out — sharing keys with ourselves is wasted
+    /// work and the OlmMachine handles same-user device sharing
+    /// internally.
+    fn room_member_recipients(&self, room_id: &str) -> Vec<String> {
+        let me = self.current_user_id();
+        self.state
+            .room_members
+            .lock()
+            .get(room_id)
+            .map(|s| {
+                s.iter()
+                    .filter(|u| !u.eq_ignore_ascii_case(&me))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 // -- Channel impl ------------------------------------------------
@@ -1648,6 +1913,7 @@ impl Channel for MatrixChannel {
     async fn listen(&self, tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         self.ensure_authenticated().await?;
         self.load_state().await;
+        self.init_crypto().await?;
         self.run_sync(tx).await
     }
 
@@ -2359,6 +2625,8 @@ mod tests {
             media_cache_dir: String::new(),
             state_file: String::new(),
             text_batch_delay_ms: 0,
+            crypto_store_dir: String::new(),
+            crypto_store_passphrase: String::new(),
             home_chat_id: String::new(),
         }
     }
