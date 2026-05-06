@@ -767,8 +767,25 @@ impl MatrixChannel {
             msgtype,
             "m.image" | "m.file" | "m.audio" | "m.video"
         );
+        // Plaintext media has `content.url` (an mxc URI). Encrypted
+        // media has `content.file` instead — an EncryptedFile
+        // object whose own `url` field is the (encrypted) ciphertext
+        // mxc URI plus the AES key/IV/hashes needed to decrypt
+        // after download.
         if let Some(url) = content.get("url").and_then(|v| v.as_str()) {
             metadata.insert("matrix_media_mxc".into(), url.to_string());
+        } else if let Some(file_obj) = content.get("file") {
+            if let Some(url) = file_obj.get("url").and_then(|v| v.as_str()) {
+                metadata.insert("matrix_media_mxc".into(), url.to_string());
+            }
+            metadata.insert("matrix_media_encrypted".into(), "true".into());
+            // The full EncryptedFile JSON travels through metadata
+            // so the async downloader (`enrich_inbound_with_media`)
+            // can hand it to the crypto layer's
+            // `decrypt_attachment`.
+            if let Ok(s) = serde_json::to_string(file_obj) {
+                metadata.insert("matrix_media_file_json".into(), s);
+            }
         }
         if is_media {
             metadata.insert(
@@ -829,13 +846,67 @@ impl MatrixChannel {
             _ => return Ok(()),
         };
         let mime = inbound.metadata.get("matrix_media_mime").cloned();
-        let path = self
-            .download_media(&mxc, &inbound.id, mime.as_deref())
-            .await?;
-        if let Some(p) = path {
+        let is_encrypted = inbound
+            .metadata
+            .get("matrix_media_encrypted")
+            .map(|s| s == "true")
+            .unwrap_or(false);
+
+        if !is_encrypted {
+            // Plaintext media — straight download to cache.
+            let path = self
+                .download_media(&mxc, &inbound.id, mime.as_deref())
+                .await?;
+            if let Some(p) = path {
+                inbound
+                    .metadata
+                    .insert("matrix_media_path".into(), p.to_string_lossy().into_owned());
+            }
+            return Ok(());
+        }
+
+        // Encrypted media path: fetch the ciphertext, hand it to
+        // the crypto layer to decrypt, then write the plaintext to
+        // the cache directory.
+        #[cfg(feature = "matrix-e2ee")]
+        {
+            let crypto = match self.crypto_handle() {
+                Some(c) => c,
+                None => {
+                    // Encrypted media but the crypto layer isn't
+                    // available — surface the mxc URL but skip
+                    // download (we can't decrypt anyway).
+                    tracing::debug!(
+                        event_id = %inbound.id,
+                        "matrix: encrypted media but no crypto handle; skipping decrypt"
+                    );
+                    return Ok(());
+                }
+            };
+            let file_json_str = match inbound.metadata.get("matrix_media_file_json") {
+                Some(s) if !s.is_empty() => s.clone(),
+                _ => return Ok(()),
+            };
+            let file_json: serde_json::Value = serde_json::from_str(&file_json_str)
+                .context("matrix encrypted file metadata not parseable")?;
+            let ciphertext = match self.fetch_media_bytes(&mxc).await? {
+                Some(b) => b,
+                None => return Ok(()),
+            };
+            let plaintext = crypto.decrypt_attachment(&file_json, ciphertext)?;
+            let path = self
+                .write_media_bytes(&plaintext, &inbound.id, mime.as_deref())
+                .await?;
             inbound
                 .metadata
-                .insert("matrix_media_path".into(), p.to_string_lossy().into_owned());
+                .insert("matrix_media_path".into(), path.to_string_lossy().into_owned());
+        }
+        #[cfg(not(feature = "matrix-e2ee"))]
+        {
+            tracing::debug!(
+                event_id = %inbound.id,
+                "matrix: encrypted media event but matrix-e2ee feature is disabled; skipping decrypt"
+            );
         }
         Ok(())
     }
@@ -1358,6 +1429,60 @@ impl MatrixChannel {
         }
     }
 
+    /// Build the JSON content for an *encrypted* media event.
+    /// Same shape as `media_event_content` but with `file: { v,
+    /// key, iv, hashes, url }` instead of a top-level `url`.
+    /// `file_info` is the EncryptedFile JSON returned by
+    /// `encrypt_attachment` with the uploaded ciphertext's mxc
+    /// URL added in.
+    #[cfg(feature = "matrix-e2ee")]
+    fn media_event_content_encrypted(
+        &self,
+        att: &crate::bus::MediaAttachment,
+        file_info: Value,
+    ) -> Value {
+        let (msgtype, default_name, voice) = match att.kind {
+            crate::bus::MediaKind::Image => ("m.image", "image", false),
+            crate::bus::MediaKind::Audio => ("m.audio", "audio", false),
+            crate::bus::MediaKind::Voice => ("m.audio", "voice", true),
+            crate::bus::MediaKind::Video => ("m.video", "video", false),
+            crate::bus::MediaKind::File => ("m.file", "file", false),
+        };
+        let body = att
+            .filename
+            .clone()
+            .unwrap_or_else(|| default_name.to_string());
+        let mut info = serde_json::Map::new();
+        info.insert("mimetype".into(), json!(att.mime));
+        info.insert("size".into(), json!(att.bytes.len()));
+        if let Some(w) = att.width {
+            info.insert("w".into(), json!(w));
+        }
+        if let Some(h) = att.height {
+            info.insert("h".into(), json!(h));
+        }
+        if let Some(d) = att.duration_ms {
+            info.insert("duration".into(), json!(d));
+        }
+        let mut content = serde_json::Map::new();
+        content.insert("msgtype".into(), json!(msgtype));
+        content.insert("body".into(), json!(body));
+        // Encrypted media replaces top-level `url` with `file`.
+        content.insert("file".into(), file_info);
+        content.insert("info".into(), Value::Object(info));
+        if voice {
+            content.insert(
+                "org.matrix.msc3245.voice".into(),
+                Value::Object(serde_json::Map::new()),
+            );
+            content.insert(
+                "org.matrix.msc1767.audio".into(),
+                Value::Object(serde_json::Map::new()),
+            );
+        }
+        Value::Object(content)
+    }
+
     /// Build the JSON content for an `m.image`/`m.file`/`m.audio`/
     /// `m.video` event, given the uploaded media's mxc URI. For
     /// `MediaKind::Voice` we emit `m.audio` plus the MSC3245 voice
@@ -1412,28 +1537,20 @@ impl MatrixChannel {
         Value::Object(content)
     }
 
-    /// Download an inbound media file (`mxc://server/id`) to the
-    /// configured media-cache directory. Returns the local path on
-    /// success. Caller should only invoke when `media_cache_dir`
-    /// is set; with empty config this is a no-op returning `None`.
-    /// Transient failures retry with exponential backoff up to
-    /// `MEDIA_DOWNLOAD_ATTEMPTS` times.
-    pub async fn download_media(
-        &self,
-        mxc: &str,
-        event_id: &str,
-        mime: Option<&str>,
-    ) -> Result<Option<std::path::PathBuf>> {
-        if self.config.media_cache_dir.is_empty() {
-            return Ok(None);
-        }
+    /// Fetch raw media bytes from the homeserver. Resolves the
+    /// mxc URI to the authenticated download endpoint, retries up
+    /// to `MEDIA_DOWNLOAD_ATTEMPTS` on transient failure with
+    /// exponential backoff, aborts on permanent 4xx (except 429).
+    /// Used by both the plaintext download and the encrypted
+    /// download path.
+    pub async fn fetch_media_bytes(&self, mxc: &str) -> Result<Option<Vec<u8>>> {
         let url = match mxc_to_http_url(&self.base_url(), mxc) {
             Some(u) => u,
             None => return Ok(None),
         };
         let mut attempt: u32 = 0;
         let mut last_err: Option<anyhow::Error> = None;
-        let bytes = loop {
+        loop {
             attempt += 1;
             match self
                 .http
@@ -1444,7 +1561,7 @@ impl MatrixChannel {
                 .await
             {
                 Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                    Ok(b) => break b,
+                    Ok(b) => return Ok(Some(b.to_vec())),
                     Err(e) => last_err = Some(anyhow::anyhow!(e)),
                 },
                 Ok(resp) => {
@@ -1453,7 +1570,6 @@ impl MatrixChannel {
                         "matrix media download returned {}",
                         status
                     ));
-                    // 4xx (except 429) is permanent — don't retry.
                     if status.is_client_error()
                         && status != reqwest::StatusCode::TOO_MANY_REQUESTS
                     {
@@ -1467,10 +1583,38 @@ impl MatrixChannel {
                     last_err.unwrap_or_else(|| anyhow::anyhow!("matrix media download failed")),
                 );
             }
-            // Exponential backoff: 200ms, 800ms, 2000ms (cap).
             let delay = Duration::from_millis(200u64 * (1u64 << (attempt - 1)).min(10));
             tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Download plaintext media to the configured cache directory
+    /// and return the local path. No-op when `media_cache_dir` is
+    /// empty.
+    pub async fn download_media(
+        &self,
+        mxc: &str,
+        event_id: &str,
+        mime: Option<&str>,
+    ) -> Result<Option<std::path::PathBuf>> {
+        if self.config.media_cache_dir.is_empty() {
+            return Ok(None);
+        }
+        let bytes = match self.fetch_media_bytes(mxc).await? {
+            Some(b) => b,
+            None => return Ok(None),
         };
+        self.write_media_bytes(&bytes, event_id, mime).await.map(Some)
+    }
+
+    /// Persist media bytes to the cache directory. Shared between
+    /// the plaintext and encrypted download paths.
+    async fn write_media_bytes(
+        &self,
+        bytes: &[u8],
+        event_id: &str,
+        mime: Option<&str>,
+    ) -> Result<std::path::PathBuf> {
         let dir = std::path::PathBuf::from(&self.config.media_cache_dir);
         tokio::fs::create_dir_all(&dir)
             .await
@@ -1478,10 +1622,10 @@ impl MatrixChannel {
         let ext = mime.and_then(extension_for_mime).unwrap_or("bin");
         let safe_id = event_id.replace(['/', '\\', ':'], "_");
         let path = dir.join(format!("{}.{}", safe_id, ext));
-        tokio::fs::write(&path, &bytes)
+        tokio::fs::write(&path, bytes)
             .await
             .with_context(|| format!("matrix media write failed: {}", path.display()))?;
-        Ok(Some(path))
+        Ok(path)
     }
 
     /// Persist the channel's `next_batch` sync token to the
@@ -1540,6 +1684,74 @@ impl MatrixChannel {
         // They share the reply / thread anchor with the text body
         // so threaded conversations stay grouped.
         for att in &message.attachments {
+            // Encrypted-room branch: encrypt bytes via the crypto
+            // layer's AttachmentEncryptor, upload the ciphertext,
+            // and emit `file` (EncryptedFile) instead of `url` so
+            // recipient clients know to decrypt. Falls back to
+            // plaintext upload + send when the room isn't
+            // encrypted or the crypto handle isn't active.
+            #[cfg(feature = "matrix-e2ee")]
+            {
+                let encrypted_path = match self.crypto_handle() {
+                    Some(c) if c.is_encrypted(room_id) => Some(c),
+                    _ => None,
+                };
+                if let Some(crypto) = encrypted_path {
+                    match crypto.encrypt_attachment(&att.bytes) {
+                        Ok((ciphertext, mut file_info)) => {
+                            let mxc = self
+                                .upload_media(&ciphertext, "application/octet-stream", None)
+                                .await?;
+                            // The encrypted-file JSON wants `url`
+                            // alongside the crypto fields.
+                            if let Some(obj) = file_info.as_object_mut() {
+                                obj.insert("url".into(), json!(mxc));
+                            }
+                            let mut content =
+                                self.media_event_content_encrypted(att, file_info);
+                            self.attach_relation(&mut content, room_id, message);
+                            // Wrap the whole `m.room.message`
+                            // through the same encrypt path text
+                            // takes — the *content* is encrypted,
+                            // not just the file.
+                            let recipients = self.room_member_recipients(room_id);
+                            match crypto
+                                .encrypt_room_message(room_id, &content, &recipients)
+                                .await
+                            {
+                                Ok(encrypted) => {
+                                    let _ = self
+                                        .send_event(
+                                            room_id,
+                                            "m.room.encrypted",
+                                            encrypted,
+                                        )
+                                        .await?;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        room = %room_id,
+                                        error = %e,
+                                        "matrix media: room-event encrypt failed; \
+                                         falling back to plaintext send"
+                                    );
+                                    // fall through to plaintext send below
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                room = %room_id,
+                                error = %e,
+                                "matrix media: attachment encrypt failed; \
+                                 falling back to plaintext send"
+                            );
+                            // fall through to plaintext send below
+                        }
+                    }
+                }
+            }
             let mxc = self
                 .upload_media(&att.bytes, &att.mime, att.filename.as_deref())
                 .await?;

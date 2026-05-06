@@ -51,7 +51,8 @@ use reqwest::Client;
 use serde_json::Value;
 
 use matrix_sdk_crypto::{
-    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
+    AttachmentDecryptor, AttachmentEncryptor, DecryptionSettings, EncryptionSettings,
+    EncryptionSyncChanges, MediaEncryptionInfo, OlmMachine, TrustRequirement,
 };
 use matrix_sdk_crypto::types::events::room::encrypted::EncryptedEvent;
 use matrix_sdk_crypto::types::requests::{AnyOutgoingRequest, OutgoingRequest};
@@ -285,6 +286,46 @@ impl MatrixCrypto {
         let json: Value = serde_json::from_str(encrypted.json().get())
             .context("encrypted output not valid JSON")?;
         Ok(json)
+    }
+
+    /// Decrypt an encrypted attachment. `file_json` is the
+    /// `content.file` object from an inbound `m.image` / `m.file` /
+    /// `m.audio` / `m.video` event in an encrypted room — it
+    /// carries the AES key, IV, and SHA-256 hash that
+    /// `AttachmentDecryptor` needs. `encrypted` is the raw
+    /// ciphertext as fetched from the homeserver media endpoint.
+    /// Returns the plaintext.
+    pub fn decrypt_attachment(
+        &self,
+        file_json: &Value,
+        encrypted: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let info: MediaEncryptionInfo = serde_json::from_value(file_json.clone())
+            .context("matrix: encrypted file metadata not parseable")?;
+        let mut input = std::io::Cursor::new(encrypted);
+        let mut decryptor = AttachmentDecryptor::new(&mut input, info)
+            .map_err(|e| anyhow::anyhow!("matrix attachment decrypt init failed: {e}"))?;
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut decryptor, &mut out)
+            .context("matrix attachment decrypt read failed")?;
+        Ok(out)
+    }
+
+    /// Encrypt a plaintext attachment for an encrypted room.
+    /// Returns the ciphertext (which gets uploaded to
+    /// `/_matrix/media/v3/upload`) and the `MediaEncryptionInfo`
+    /// the caller should serialize into the outbound event's
+    /// `file` field alongside the resulting `mxc://` URL.
+    pub fn encrypt_attachment(&self, plain: &[u8]) -> Result<(Vec<u8>, Value)> {
+        let mut cursor = std::io::Cursor::new(plain);
+        let mut encryptor = AttachmentEncryptor::new(&mut cursor);
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut encryptor, &mut out)
+            .context("matrix attachment encrypt read failed")?;
+        let info = encryptor.finish();
+        let info_json =
+            serde_json::to_value(&info).context("matrix encryption info serialize failed")?;
+        Ok((out, info_json))
     }
 
     /// Drain the OlmMachine's pending outgoing requests once. The
@@ -667,5 +708,120 @@ mod tests {
     fn supported_versions_includes_v1_13() {
         let sv = supported_versions();
         assert!(sv.versions.contains(&MatrixVersion::V1_13));
+    }
+
+    /// Attachment encrypt → decrypt round-trip against the same
+    /// MatrixCrypto handle. Doesn't need paired machines because
+    /// attachment crypto is symmetric / self-contained — the key
+    /// and IV travel inline with the ciphertext.
+    #[tokio::test]
+    async fn attachment_encrypt_decrypt_round_trip() {
+        let dir = tempdir().unwrap();
+        let cfg = MatrixCryptoConfig {
+            homeserver: "https://matrix.example.org".into(),
+            user_id: "@bot:example.org".into(),
+            device_id: Some("DEVICE0".into()),
+            crypto_store_dir: dir.path().to_path_buf(),
+            crypto_store_passphrase: None,
+            http: Client::new(),
+            token_provider: dummy_token(),
+        };
+        let crypto = MatrixCrypto::new(cfg).await.expect("init");
+
+        let plaintext = b"the quick brown fennec jumps over the lazy dog \
+                          (long enough to span the AES-CTR block boundary)"
+            .to_vec();
+        let (ciphertext, info_json) = crypto
+            .encrypt_attachment(&plaintext)
+            .expect("encrypt");
+        // Sanity: encrypted bytes shouldn't equal plaintext, and
+        // info JSON should carry the v / key / iv / hashes shape.
+        assert_ne!(ciphertext, plaintext);
+        assert_eq!(info_json["v"], "v2");
+        assert!(info_json.get("key").is_some());
+        assert!(info_json.get("iv").is_some());
+        assert!(info_json.get("hashes").is_some());
+
+        let recovered = crypto
+            .decrypt_attachment(&info_json, ciphertext)
+            .expect("decrypt");
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[tokio::test]
+    async fn attachment_decrypt_rejects_tampered_ciphertext() {
+        let dir = tempdir().unwrap();
+        let cfg = MatrixCryptoConfig {
+            homeserver: "https://matrix.example.org".into(),
+            user_id: "@bot:example.org".into(),
+            device_id: Some("DEVICE0".into()),
+            crypto_store_dir: dir.path().to_path_buf(),
+            crypto_store_passphrase: None,
+            http: Client::new(),
+            token_provider: dummy_token(),
+        };
+        let crypto = MatrixCrypto::new(cfg).await.expect("init");
+        let plaintext = b"sensitive payload".to_vec();
+        let (mut ciphertext, info_json) = crypto
+            .encrypt_attachment(&plaintext)
+            .expect("encrypt");
+        // Flip a bit in the middle of the ciphertext — sha256
+        // mismatch should make decrypt error rather than silently
+        // returning garbage.
+        let idx = ciphertext.len() / 2;
+        ciphertext[idx] ^= 0x01;
+        let result = crypto.decrypt_attachment(&info_json, ciphertext);
+        assert!(
+            result.is_err(),
+            "expected decrypt to reject tampered ciphertext, got {:?}",
+            result.map(|v| v.len())
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_decrypt_rejects_malformed_info() {
+        let dir = tempdir().unwrap();
+        let cfg = MatrixCryptoConfig {
+            homeserver: "https://matrix.example.org".into(),
+            user_id: "@bot:example.org".into(),
+            device_id: Some("DEVICE0".into()),
+            crypto_store_dir: dir.path().to_path_buf(),
+            crypto_store_passphrase: None,
+            http: Client::new(),
+            token_provider: dummy_token(),
+        };
+        let crypto = MatrixCrypto::new(cfg).await.expect("init");
+        // Bogus info — missing the version, key, iv, hashes
+        // entirely. Must error rather than panic.
+        let bad = serde_json::json!({"not": "valid"});
+        let result = crypto.decrypt_attachment(&bad, vec![1, 2, 3]);
+        assert!(result.is_err());
+    }
+
+    /// Verify that process_sync_changes accepts a realistic-shape
+    /// sync response without panicking. This isn't a round-trip
+    /// test (we'd need paired machines for that), but it locks in
+    /// the wire-format → API mapping our parsers do.
+    #[tokio::test]
+    async fn process_sync_changes_accepts_realistic_response() {
+        let dir = tempdir().unwrap();
+        let cfg = MatrixCryptoConfig {
+            homeserver: "https://matrix.example.org".into(),
+            user_id: "@bot:example.org".into(),
+            device_id: Some("DEVICE0".into()),
+            crypto_store_dir: dir.path().to_path_buf(),
+            crypto_store_passphrase: None,
+            http: Client::new(),
+            token_provider: dummy_token(),
+        };
+        let crypto = MatrixCrypto::new(cfg).await.expect("init");
+        let sync = serde_json::json!({
+            "next_batch": "s12_0",
+            "to_device": { "events": [] },
+            "device_lists": { "changed": [], "left": [] },
+            "device_one_time_keys_count": { "signed_curve25519": 50 },
+            "device_unused_fallback_key_types": ["signed_curve25519"]
+        });
+        crypto.process_sync_changes(&sync).await.expect("ok");
     }
 }
