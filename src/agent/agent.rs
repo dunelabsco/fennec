@@ -39,6 +39,11 @@ pub struct Agent {
     total_output_tokens: u64,
     total_cache_read_tokens: u64,
     turn_count: u64,
+    /// Lifecycle hooks for real-time frontends (TUI, dashboard).
+    /// Defaults to a no-op handle so existing callers (channels,
+    /// batch runs) pay no cost. Frontends register their own
+    /// `AgentCallbacks` impl via `AgentBuilder::callbacks`.
+    callbacks: super::callbacks::CallbacksHandle,
 }
 
 impl Agent {
@@ -47,6 +52,11 @@ impl Agent {
     /// On the first turn the system prompt is built (with memory context) and
     /// frozen for the remainder of the session. Subsequent turns reuse it.
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        // Notify any registered frontend that a turn is starting.
+        // This is the very first hook so a TUI / dashboard sees
+        // even the prompt-guard rejection path light up.
+        self.callbacks.on_turn_start(user_message);
+
         // Parse thinking directive before any other processing.
         let (thinking_override, user_message) = thinking::parse_thinking_directive(user_message);
         if let Some(level) = thinking_override {
@@ -126,6 +136,7 @@ impl Agent {
 
         // Tool call loop.
         for _iteration in 0..self.max_tool_iterations {
+            self.callbacks.on_status("calling provider");
             let response = self.call_provider().await?;
 
             // Track token usage from this API call.
@@ -141,6 +152,7 @@ impl Agent {
                 // No tool calls — final assistant response.
                 let text = response.content.unwrap_or_default();
                 self.history.push(ChatMessage::assistant(&text));
+                self.callbacks.on_turn_complete(&text);
 
                 // Log token usage for this turn.
                 let turn_input = self.total_input_tokens - tokens_before_input;
@@ -169,11 +181,27 @@ impl Agent {
             assistant_msg.tool_calls = Some(response.tool_calls.clone());
             self.history.push(assistant_msg);
 
-            // Execute each tool call and push results.
+            // Execute each tool call and push results, notifying
+            // the frontend at start + complete so live tool
+            // indicators and inline tool-call rendering update in
+            // real time.
             for tc in &response.tool_calls {
                 tracing::info!(tool = %tc.name, "Executing tool call");
+                self.callbacks.on_tool_start(super::callbacks::ToolStart {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    preview: preview_for_args(&tc.arguments),
+                });
+                let started = std::time::Instant::now();
                 let (output, success) = self.execute_tool(&tc.name, &tc.arguments).await;
                 tracing::info!(tool = %tc.name, success = %success, "Tool call complete");
+                self.callbacks.on_tool_complete(super::callbacks::ToolComplete {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    error: if success { None } else { Some(output.clone()) },
+                    summary: Some(truncate_summary(&output)),
+                });
                 self.history
                     .push(ChatMessage::tool_result(&tc.id, &output));
             }
@@ -461,6 +489,7 @@ pub struct AgentBuilder {
     prompt_guard: Option<PromptGuard>,
     collective: Option<Arc<CollectiveSearch>>,
     skills_prompt: Option<String>,
+    callbacks: Option<super::callbacks::CallbacksHandle>,
 }
 
 impl AgentBuilder {
@@ -479,6 +508,7 @@ impl AgentBuilder {
             prompt_guard: None,
             collective: None,
             skills_prompt: None,
+            callbacks: None,
         }
     }
 
@@ -555,6 +585,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Register a frontend callback handle. Used by the TUI and
+    /// (later) the dashboard to receive turn / tool / status
+    /// events as they happen. Callers that don't set this get a
+    /// no-op handle; existing code paths (channel sends, batch
+    /// runs) behave exactly as before.
+    pub fn callbacks(mut self, handle: super::callbacks::CallbacksHandle) -> Self {
+        self.callbacks = Some(handle);
+        self
+    }
+
     /// Build the [`Agent`], validating that required fields are set.
     pub fn build(self) -> Result<Agent> {
         let provider = self
@@ -593,6 +633,39 @@ impl AgentBuilder {
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
             turn_count: 0,
+            callbacks: self
+                .callbacks
+                .unwrap_or_else(super::callbacks::noop_callbacks),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Callback helpers
+// ---------------------------------------------------------------------------
+
+/// One-line preview of a tool call's args for the inline display
+/// and the TOOL LIVE panel header. We render JSON compactly and
+/// truncate aggressively — frontends show the full args in their
+/// own collapsed view.
+fn preview_for_args(args: &serde_json::Value) -> String {
+    let s = match args {
+        serde_json::Value::Object(map) if map.is_empty() => return String::from("()"),
+        serde_json::Value::Null => return String::from("()"),
+        _ => args.to_string(),
+    };
+    truncate_summary(&s)
+}
+
+/// Truncate any text to a single short line for inline display.
+fn truncate_summary(s: &str) -> String {
+    let single_line: String = s.lines().next().unwrap_or("").to_string();
+    const MAX: usize = 80;
+    if single_line.chars().count() <= MAX {
+        single_line
+    } else {
+        let mut out: String = single_line.chars().take(MAX - 1).collect();
+        out.push('…');
+        out
     }
 }

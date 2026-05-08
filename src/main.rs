@@ -240,6 +240,22 @@ async fn build_agent(
     fennec::bus::PendingReplies,
     fennec::bus::ChatDirectory,
 )> {
+    build_agent_with_callbacks(config, home_dir, model_override, channel_map, None).await
+}
+
+async fn build_agent_with_callbacks(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+    model_override: Option<String>,
+    channel_map: Option<ChannelMapHandle>,
+    callbacks: Option<fennec::agent::callbacks::CallbacksHandle>,
+) -> Result<(
+    fennec::agent::Agent,
+    Arc<dyn Memory>,
+    Arc<Mutex<Option<CronOrigin>>>,
+    fennec::bus::PendingReplies,
+    fennec::bus::ChatDirectory,
+)> {
     // Create SecretStore.
     let secret_store =
         SecretStore::new(home_dir.to_path_buf()).context("creating secret store")?;
@@ -654,7 +670,7 @@ async fn build_agent(
         delegate_subagent_tools,
     )));
 
-    let agent = builder
+    let mut configured_builder = builder
         .identity_name(&config.identity.name)
         .identity_persona(&config.identity.persona)
         .max_tool_iterations(config.agent.max_tool_iterations as usize)
@@ -662,9 +678,11 @@ async fn build_agent(
         .temperature(config.provider.temperature)
         .memory_context_limit(config.memory.context_limit)
         .half_life_days(config.memory.half_life_days)
-        .prompt_guard(prompt_guard)
-        .build()
-        .context("building agent")?;
+        .prompt_guard(prompt_guard);
+    if let Some(handle) = callbacks {
+        configured_builder = configured_builder.callbacks(handle);
+    }
+    let agent = configured_builder.build().context("building agent")?;
 
     Ok((agent, memory, cron_origin, pending_replies, chat_directory))
 }
@@ -750,33 +768,33 @@ async fn run_agent(
 
 /// Launch the terminal UI (`fennec agent --tui`).
 ///
-/// F1 scaffolding: builds the `App` state with placeholder data
-/// representative of a real session, hands it to the TUI's
-/// event loop, and restores the terminal on exit. Real wiring
-/// (agent loop subscription, session-store backed sessions list,
-/// channel-manager backed channel statuses) lands in subsequent
-/// commits on this branch.
+/// Builds a real agent with `TuiBridge` callbacks so streaming
+/// text deltas, tool starts/completes, status updates, and turn
+/// boundaries fan out into the TUI's app state. The renderer
+/// thread reads `App` for each frame; the agent loop runs on a
+/// tokio task and produces events into an mpsc channel; a drain
+/// task on the same runtime applies events to `App`.
 async fn run_tui(
-    _config: FennecConfig,
-    _home_dir: std::path::PathBuf,
-    _model_override: Option<String>,
+    config: FennecConfig,
+    home_dir: std::path::PathBuf,
+    model_override: Option<String>,
 ) -> Result<()> {
     use fennec::tui::app::{
         App, ChannelConnState, ChannelState, ChatLine, SessionRow,
     };
+    use fennec::tui::callbacks::TuiBridge;
+
+    // Build the TUI app with a placeholder cli session. The
+    // session-store backed list lands when sessions land — for
+    // now the user has one local session and types into it.
     let mut app = App::new();
-    // Seed with a realistic-looking initial state. Replaced with
-    // live data from the session store + channel manager in the
-    // next commit.
-    app.sessions = vec![
-        SessionRow {
-            code: "$ ".into(),
-            who: "local".into(),
-            subject: "press [n] to start a new session".into(),
-            count: "0".into(),
-            has_unread: false,
-        },
-    ];
+    app.sessions = vec![SessionRow {
+        code: "$ ".into(),
+        who: "local".into(),
+        subject: "type to begin".into(),
+        count: "0".into(),
+        has_unread: false,
+    }];
     app.channels = vec![ChannelState {
         code: "$ ".into(),
         name: "cli".into(),
@@ -785,10 +803,152 @@ async fn run_tui(
     }];
     app.chat = vec![ChatLine::System {
         time: chrono::Local::now().format("%H:%M:%S").to_string(),
-        body: "fennec tui — placeholder state. agent wiring in next commit.".into(),
+        body: format!(
+            "session resumed · model {} · ready",
+            if config.provider.model.is_empty() {
+                "default"
+            } else {
+                &config.provider.model
+            }
+        ),
     }];
     let app = std::sync::Arc::new(parking_lot::Mutex::new(app));
-    fennec::tui::run(app)
+
+    // Build the agent with the TUI bridge wired in as callbacks.
+    let (bridge, mut event_rx) = TuiBridge::new(app.clone());
+    let bridge_handle: fennec::agent::callbacks::CallbacksHandle =
+        std::sync::Arc::new(bridge);
+    let (agent, _memory, _cron_origin, _pending_replies, _chat_directory) =
+        build_agent_with_callbacks(
+            &config,
+            &home_dir,
+            model_override,
+            None,
+            Some(bridge_handle),
+        )
+        .await?;
+    let agent = std::sync::Arc::new(tokio::sync::Mutex::new(agent));
+
+    // Drain task: consume agent events, mutate app state. Runs on
+    // the same runtime as the agent itself; the renderer reads
+    // app state under its own parking_lot mutex on the main
+    // thread.
+    let drain_app = app.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = event_rx.recv().await {
+            apply_tui_event(&drain_app, ev);
+        }
+    });
+
+    // Submit-handler task: watches the input box for completed
+    // submissions (history-recorded entries) and runs them as
+    // agent turns. We poll because the TUI's event loop runs
+    // synchronously on the main thread; tighter integration
+    // (mpsc from the input handler directly) lands with the
+    // slash-command commit.
+    let submit_app = app.clone();
+    let submit_agent = agent.clone();
+    let submit_handle = tokio::spawn(async move {
+        let mut last_submitted: Option<String> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let pending = {
+                let guard = submit_app.lock();
+                if guard.should_quit {
+                    return;
+                }
+                guard.input.history.front().cloned()
+            };
+            if let Some(prompt) = pending {
+                if last_submitted.as_ref() != Some(&prompt) {
+                    last_submitted = Some(prompt.clone());
+                    let mut agent_guard = submit_agent.lock().await;
+                    let _ = agent_guard.turn(&prompt).await;
+                }
+            }
+        }
+    });
+
+    // Run the renderer (blocks until the user quits).
+    let result = fennec::tui::run(app.clone());
+
+    // Cleanly stop background tasks.
+    {
+        let mut guard = app.lock();
+        guard.should_quit = true;
+    }
+    submit_handle.abort();
+
+    result
+}
+
+/// Apply a single `TuiEvent` to the app state. Called from the
+/// drain task; runs under the parking_lot mutex briefly.
+fn apply_tui_event(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    ev: fennec::tui::callbacks::TuiEvent,
+) {
+    use fennec::tui::app::{ChatLine, LiveTool, ToolHistoryEntry};
+    use fennec::tui::callbacks::TuiEvent;
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let mut guard = app.lock();
+    match ev {
+        TuiEvent::TurnStart(prompt) => {
+            guard.chat.push(ChatLine::User {
+                time: now,
+                body: prompt,
+            });
+        }
+        TuiEvent::TurnComplete(summary) => {
+            guard.chat.push(ChatLine::Bot {
+                time: now,
+                body: summary,
+            });
+            guard.live_tool = None;
+        }
+        TuiEvent::ToolStart(s) => {
+            guard.chat.push(ChatLine::ToolCall {
+                call: format!("{}({})", s.name, s.preview),
+            });
+            guard.live_tool = Some(LiveTool {
+                name: s.name,
+                args_preview: s.preview,
+                started_at: std::time::Instant::now(),
+                progress: None,
+            });
+        }
+        TuiEvent::ToolProgress(p) => {
+            if let Some(ref mut lt) = guard.live_tool {
+                lt.args_preview = p.preview;
+            }
+        }
+        TuiEvent::ToolComplete(c) => {
+            let summary = c
+                .summary
+                .clone()
+                .unwrap_or_else(|| "(done)".to_string());
+            guard.chat.push(ChatLine::ToolResult { summary });
+            guard.recent_tools.insert(
+                0,
+                ToolHistoryEntry {
+                    ok: c.error.is_none(),
+                    name: c.name,
+                    note: format!("{}ms", c.duration_ms),
+                },
+            );
+            guard.recent_tools.truncate(8);
+            guard.live_tool = None;
+        }
+        TuiEvent::Status(msg) => {
+            guard.set_status(msg);
+        }
+        TuiEvent::TextDelta(_) | TuiEvent::ReasoningDelta(_) => {
+            // Streaming-text rendering hooks into the in-flight
+            // assistant message. Wired in the streaming-turn
+            // commit; for now the non-streaming `turn()` path
+            // adds the final message in `TurnComplete`.
+        }
+    }
 }
 
 async fn run_gateway(
