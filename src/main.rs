@@ -779,37 +779,78 @@ async fn run_tui(
     home_dir: std::path::PathBuf,
     model_override: Option<String>,
 ) -> Result<()> {
-    use fennec::tui::app::{
-        App, ChannelConnState, ChannelState, ChatLine, SessionRow,
-    };
+    use fennec::sessions::store::SessionStore;
+    use fennec::tui::app::{App, ChatLine, SessionRow};
     use fennec::tui::callbacks::TuiBridge;
 
-    // Build the TUI app with a placeholder cli session. The
-    // session-store backed list lands when sessions land — for
-    // now the user has one local session and types into it.
+    // Real sessions list: query the SessionStore for prior
+    // sessions. The current TUI session itself isn't recorded
+    // yet (the agent doesn't auto-record turns into the store —
+    // that's a separate cross-cutting wiring) but historical
+    // sessions show up so /resume picks have context.
+    let session_db = home_dir.join("sessions.db");
+    let session_store_handle =
+        match tokio::task::spawn_blocking(move || SessionStore::new(&session_db)).await {
+            Ok(Ok(s)) => Some(std::sync::Arc::new(s)),
+            Ok(Err(e)) => {
+                tracing::warn!("session store init failed: {e}; sessions list will be empty");
+                None
+            }
+            Err(_) => None,
+        };
+    let prior_sessions = if let Some(ref store) = session_store_handle {
+        store.list_sessions(20).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let mut app = App::new();
-    app.sessions = vec![SessionRow {
+    // Current TUI session pinned to the top.
+    app.sessions.push(SessionRow {
         code: "$ ".into(),
         who: "local".into(),
-        subject: "type to begin".into(),
+        subject: "current session".into(),
         count: "0".into(),
         has_unread: false,
-    }];
-    app.channels = vec![ChannelState {
-        code: "$ ".into(),
-        name: "cli".into(),
-        state: ChannelConnState::Attached,
-        detail: "this session".into(),
-    }];
+    });
+    // Historical sessions from the store, transformed into the
+    // sessions-panel row shape.
+    for rec in prior_sessions.iter().take(20) {
+        let (code, who) = channel_label(&rec.channel);
+        let subject = rec
+            .summary
+            .clone()
+            .unwrap_or_else(|| short_id(&rec.id));
+        app.sessions.push(SessionRow {
+            code,
+            who,
+            subject,
+            count: rec
+                .ended_at
+                .as_deref()
+                .map(|_| "—".to_string())
+                .unwrap_or_else(|| "·".to_string()),
+            has_unread: false,
+        });
+    }
+    app.selected_session = 0;
+
+    // Real channels list from config — every enabled channel is
+    // surfaced with a status reflecting whether the gateway is
+    // running it (in TUI mode the gateway isn't started, so all
+    // channels except cli show as 'not running').
+    app.channels = build_channels_panel(&config);
+
     app.chat = vec![ChatLine::System {
         time: chrono::Local::now().format("%H:%M:%S").to_string(),
         body: format!(
-            "session resumed · model {} · ready",
+            "session resumed · model {} · {} prior sessions · ready",
             if config.provider.model.is_empty() {
                 "default"
             } else {
                 &config.provider.model
-            }
+            },
+            prior_sessions.len()
         ),
     }];
     let app = std::sync::Arc::new(parking_lot::Mutex::new(app));
@@ -897,6 +938,90 @@ async fn run_tui(
     submit_handle.abort();
 
     result
+}
+
+/// Build the TUI's CHANNELS panel from the running config.
+/// The gateway isn't started in `--tui` mode so non-CLI channels
+/// show as "not running" — when fennec gateway is active in a
+/// separate process the user would still see them as "available"
+/// rather than "connected" (live channel-manager wiring is out
+/// of scope for F1-1; that's a richer integration that needs
+/// a shared bus across the gateway and TUI processes, which
+/// belongs to F2's dashboard work).
+fn build_channels_panel(config: &FennecConfig) -> Vec<fennec::tui::app::ChannelState> {
+    use fennec::tui::app::{ChannelConnState, ChannelState};
+    let mut out = vec![ChannelState {
+        code: "$ ".into(),
+        name: "cli".into(),
+        state: ChannelConnState::Attached,
+        detail: "this session".into(),
+    }];
+    let cs = &config.channels;
+    if cs.telegram.enabled {
+        out.push(ChannelState {
+            code: "TG".into(),
+            name: "telegram".into(),
+            state: ChannelConnState::Idle,
+            detail: "configured".into(),
+        });
+    }
+    if cs.discord.enabled {
+        out.push(ChannelState {
+            code: "DC".into(),
+            name: "discord".into(),
+            state: ChannelConnState::Idle,
+            detail: "configured".into(),
+        });
+    }
+    if cs.slack.enabled {
+        out.push(ChannelState {
+            code: "SL".into(),
+            name: "slack".into(),
+            state: ChannelConnState::Idle,
+            detail: "configured".into(),
+        });
+    }
+    if cs.whatsapp.enabled {
+        out.push(ChannelState {
+            code: "WA".into(),
+            name: "whatsapp".into(),
+            state: ChannelConnState::Idle,
+            detail: "configured".into(),
+        });
+    }
+    if cs.email.enabled {
+        out.push(ChannelState {
+            code: "@ ".into(),
+            name: "email".into(),
+            state: ChannelConnState::Idle,
+            detail: format!("imap.{}", first_dot_segment(&cs.email.imap_host)),
+        });
+    }
+    out
+}
+
+/// Map a channel name (as stored in `SessionRecord.channel`) to
+/// the (code, who) pair the sessions panel renders.
+fn channel_label(channel: &str) -> (String, String) {
+    match channel {
+        "cli" | "" => ("$ ".into(), "local".into()),
+        "telegram" => ("TG".into(), "telegram".into()),
+        "discord" => ("DC".into(), "discord".into()),
+        "slack" => ("SL".into(), "slack".into()),
+        "signal" => ("SG".into(), "signal".into()),
+        "matrix" => ("MX".into(), "matrix".into()),
+        "whatsapp" => ("WA".into(), "whatsapp".into()),
+        "email" => ("@ ".into(), "email".into()),
+        other => ("? ".into(), other.to_string()),
+    }
+}
+
+fn short_id(s: &str) -> String {
+    s.chars().take(8).collect()
+}
+
+fn first_dot_segment(s: &str) -> String {
+    s.split('.').next().unwrap_or(s).to_string()
 }
 
 /// Apply a `CommandOutcome` to the app state and (if needed)
