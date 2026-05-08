@@ -101,18 +101,44 @@ pub enum Focus {
     Input,
 }
 
-/// Per-input editor state — multi-line buffer with cursor.
+/// Per-input editor state — multi-line buffer with cursor,
+/// undo/redo stack, and history navigation.
+///
+/// Cursor coordinates are `(row, col)` in **char** units (not
+/// bytes). All editing operations preserve this invariant. The
+/// undo/redo stack records snapshots before each mutation; cap
+/// is 200 to keep memory bounded.
 #[derive(Debug, Default, Clone)]
 pub struct InputState {
     pub lines: Vec<String>,
     pub row: usize,
     pub col: usize,
-    /// Recently submitted messages. ↑↓ cycles through them.
+    /// Recently submitted messages. ↑↓ at the top/bottom edges
+    /// of the buffer cycle through these.
     pub history: VecDeque<String>,
-    /// Index into `history` while cycling (None = at the live
-    /// buffer, not a history snapshot).
+    /// Cursor index into `history`. `None` = editing live buffer;
+    /// `Some(i)` = previewing `history[i]`.
     pub history_cursor: Option<usize>,
+    /// Snapshot stack for Ctrl-Z. Each entry is the full
+    /// `(lines, row, col)` triple captured before a mutation.
+    undo_stack: Vec<EditSnapshot>,
+    /// Snapshots popped by Ctrl-Z and re-applicable via Ctrl-Y.
+    /// Cleared on any new mutation.
+    redo_stack: Vec<EditSnapshot>,
+    /// Saved live-buffer when the user starts cycling history;
+    /// restored when they cycle back past the most-recent entry.
+    saved_live_buffer: Option<EditSnapshot>,
 }
+
+#[derive(Debug, Clone)]
+struct EditSnapshot {
+    lines: Vec<String>,
+    row: usize,
+    col: usize,
+}
+
+const UNDO_STACK_CAP: usize = 200;
+const HISTORY_CAP: usize = 64;
 
 impl InputState {
     pub fn new() -> Self {
@@ -120,8 +146,11 @@ impl InputState {
             lines: vec![String::new()],
             row: 0,
             col: 0,
-            history: VecDeque::with_capacity(64),
+            history: VecDeque::with_capacity(HISTORY_CAP),
             history_cursor: None,
+            undo_stack: Vec::with_capacity(32),
+            redo_stack: Vec::new(),
+            saved_live_buffer: None,
         }
     }
 
@@ -131,9 +160,10 @@ impl InputState {
         self.lines.join("\n")
     }
 
-    /// Replace the buffer with `s` and reset the cursor to the
-    /// end. Used by history navigation.
+    /// Replace the buffer with `s` and place the cursor at the
+    /// end. Records an undo snapshot.
     pub fn set(&mut self, s: &str) {
+        self.snapshot_for_undo();
         self.lines = if s.is_empty() {
             vec![String::new()]
         } else {
@@ -144,10 +174,12 @@ impl InputState {
     }
 
     pub fn clear(&mut self) {
+        self.snapshot_for_undo();
         self.lines = vec![String::new()];
         self.row = 0;
         self.col = 0;
         self.history_cursor = None;
+        self.saved_live_buffer = None;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -162,10 +194,277 @@ impl InputState {
             return;
         }
         self.history.push_front(s);
-        while self.history.len() > 64 {
+        while self.history.len() > HISTORY_CAP {
             self.history.pop_back();
         }
     }
+
+    // -- Editor operations ---------------------------------------
+
+    /// Insert one char at the cursor. Records an undo snapshot.
+    pub fn insert_char(&mut self, c: char) {
+        self.snapshot_for_undo();
+        let line = &mut self.lines[self.row];
+        let byte_idx = char_index_to_byte(line, self.col);
+        line.insert(byte_idx, c);
+        self.col += 1;
+    }
+
+    /// Insert a newline (Shift+Enter on most terminals).
+    pub fn insert_newline(&mut self) {
+        self.snapshot_for_undo();
+        let line = self.lines[self.row].clone();
+        let byte_idx = char_index_to_byte(&line, self.col);
+        let (left, right) = line.split_at(byte_idx);
+        self.lines[self.row] = left.to_string();
+        self.lines.insert(self.row + 1, right.to_string());
+        self.row += 1;
+        self.col = 0;
+    }
+
+    /// Backspace — delete one char to the left of the cursor.
+    pub fn backspace(&mut self) {
+        self.snapshot_for_undo();
+        if self.col > 0 {
+            let line = &mut self.lines[self.row];
+            let prev = char_index_to_byte(line, self.col - 1);
+            let cur = char_index_to_byte(line, self.col);
+            line.replace_range(prev..cur, "");
+            self.col -= 1;
+        } else if self.row > 0 {
+            // Join with previous line.
+            let cur_line = self.lines.remove(self.row);
+            self.row -= 1;
+            self.col = self.lines[self.row].chars().count();
+            self.lines[self.row].push_str(&cur_line);
+        }
+    }
+
+    /// Delete the word backward (Ctrl-W).
+    pub fn delete_word_backward(&mut self) {
+        self.snapshot_for_undo();
+        let line = &self.lines[self.row].clone();
+        let mut new_col = self.col;
+        let chars: Vec<char> = line.chars().collect();
+        // Skip trailing whitespace before the cursor.
+        while new_col > 0 && chars[new_col - 1].is_whitespace() {
+            new_col -= 1;
+        }
+        // Skip the word.
+        while new_col > 0 && !chars[new_col - 1].is_whitespace() {
+            new_col -= 1;
+        }
+        let from = char_index_to_byte(line, new_col);
+        let to = char_index_to_byte(line, self.col);
+        self.lines[self.row].replace_range(from..to, "");
+        self.col = new_col;
+    }
+
+    /// Delete from cursor to start of line (Ctrl-U).
+    pub fn delete_to_line_start(&mut self) {
+        self.snapshot_for_undo();
+        let line = &self.lines[self.row].clone();
+        let to = char_index_to_byte(line, self.col);
+        self.lines[self.row].replace_range(..to, "");
+        self.col = 0;
+    }
+
+    /// Delete from cursor to end of line (Ctrl-K).
+    pub fn delete_to_line_end(&mut self) {
+        self.snapshot_for_undo();
+        let line = &self.lines[self.row].clone();
+        let from = char_index_to_byte(line, self.col);
+        self.lines[self.row].replace_range(from.., "");
+    }
+
+    pub fn move_left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.lines[self.row].chars().count();
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        let line_len = self.lines[self.row].chars().count();
+        if self.col < line_len {
+            self.col += 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    pub fn move_word_left(&mut self) {
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        if self.col == 0 {
+            self.move_left();
+            return;
+        }
+        let mut c = self.col;
+        while c > 0 && chars[c - 1].is_whitespace() {
+            c -= 1;
+        }
+        while c > 0 && !chars[c - 1].is_whitespace() {
+            c -= 1;
+        }
+        self.col = c;
+    }
+
+    pub fn move_word_right(&mut self) {
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        let len = chars.len();
+        if self.col >= len {
+            self.move_right();
+            return;
+        }
+        let mut c = self.col;
+        while c < len && !chars[c].is_whitespace() {
+            c += 1;
+        }
+        while c < len && chars[c].is_whitespace() {
+            c += 1;
+        }
+        self.col = c;
+    }
+
+    pub fn move_line_start(&mut self) {
+        self.col = 0;
+    }
+
+    pub fn move_line_end(&mut self) {
+        self.col = self.lines[self.row].chars().count();
+    }
+
+    pub fn move_up(&mut self) {
+        if self.row > 0 {
+            self.row -= 1;
+            let len = self.lines[self.row].chars().count();
+            self.col = self.col.min(len);
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            let len = self.lines[self.row].chars().count();
+            self.col = self.col.min(len);
+        }
+    }
+
+    /// Whether the cursor is on the topmost row — for ↑ to flip
+    /// into history navigation.
+    pub fn at_first_row(&self) -> bool {
+        self.row == 0
+    }
+
+    /// Whether the cursor is on the bottom row.
+    pub fn at_last_row(&self) -> bool {
+        self.row + 1 == self.lines.len()
+    }
+
+    // -- History navigation --------------------------------------
+
+    /// Cycle one step backward in history (older). Saves the live
+    /// buffer on first invocation so cycling forward past the
+    /// most-recent entry restores it.
+    pub fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        if self.history_cursor.is_none() {
+            // Save the live buffer before overwriting it.
+            self.saved_live_buffer = Some(self.snapshot());
+        }
+        let next = match self.history_cursor {
+            None => 0,
+            Some(i) => (i + 1).min(self.history.len() - 1),
+        };
+        self.history_cursor = Some(next);
+        let snapshot = self.history[next].clone();
+        self.lines = if snapshot.is_empty() {
+            vec![String::new()]
+        } else {
+            snapshot.split('\n').map(String::from).collect()
+        };
+        self.row = self.lines.len().saturating_sub(1);
+        self.col = self.lines[self.row].chars().count();
+    }
+
+    /// Cycle one step forward in history (newer). When already at
+    /// the most-recent entry, restores the saved live buffer.
+    pub fn history_next(&mut self) {
+        match self.history_cursor {
+            None => {}
+            Some(0) => {
+                self.history_cursor = None;
+                if let Some(saved) = self.saved_live_buffer.take() {
+                    self.restore(saved);
+                }
+            }
+            Some(i) => {
+                self.history_cursor = Some(i - 1);
+                let snapshot = self.history[i - 1].clone();
+                self.lines = if snapshot.is_empty() {
+                    vec![String::new()]
+                } else {
+                    snapshot.split('\n').map(String::from).collect()
+                };
+                self.row = self.lines.len().saturating_sub(1);
+                self.col = self.lines[self.row].chars().count();
+            }
+        }
+    }
+
+    // -- Undo / redo --------------------------------------------
+
+    pub fn undo(&mut self) {
+        if let Some(snapshot) = self.undo_stack.pop() {
+            self.redo_stack.push(self.snapshot());
+            self.restore(snapshot);
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(snapshot) = self.redo_stack.pop() {
+            self.undo_stack.push(self.snapshot());
+            self.restore(snapshot);
+        }
+    }
+
+    fn snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            lines: self.lines.clone(),
+            row: self.row,
+            col: self.col,
+        }
+    }
+
+    fn restore(&mut self, snapshot: EditSnapshot) {
+        self.lines = snapshot.lines;
+        self.row = snapshot.row;
+        self.col = snapshot.col;
+    }
+
+    fn snapshot_for_undo(&mut self) {
+        self.redo_stack.clear();
+        self.undo_stack.push(self.snapshot());
+        if self.undo_stack.len() > UNDO_STACK_CAP {
+            self.undo_stack.remove(0);
+        }
+    }
+}
+
+/// Translate a char index to a byte index within `s`. Cursor
+/// positions are stored as char indices because Unicode-aware
+/// editing is the default on modern terminals (emoji, CJK,
+/// combining marks).
+fn char_index_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
 }
 
 /// Overall TUI app state.
@@ -215,38 +514,93 @@ impl App {
     /// are global (Tab cycles focus, Ctrl-C/D exits — handled in
     /// the event loop).
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        // Global hotkeys.
+        if matches!(code, KeyCode::Tab) {
+            self.cycle_focus();
+            return;
+        }
+
+        match self.focus {
+            Focus::Sessions => self.handle_key_sessions(code),
+            Focus::Chat => self.handle_key_chat(code),
+            Focus::Input => self.handle_key_input(code, modifiers),
+        }
+    }
+
+    fn handle_key_sessions(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Tab => self.cycle_focus(),
-            KeyCode::Up if self.focus == Focus::Sessions => self.prev_session(),
-            KeyCode::Down if self.focus == Focus::Sessions => self.next_session(),
-            KeyCode::PageUp if self.focus == Focus::Chat => {
+            KeyCode::Up | KeyCode::Char('k') => self.prev_session(),
+            KeyCode::Down | KeyCode::Char('j') => self.next_session(),
+            _ => {}
+        }
+    }
+
+    fn handle_key_chat(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::PageUp => {
                 self.chat_scroll = self.chat_scroll.saturating_add(10);
             }
-            KeyCode::PageDown if self.focus == Focus::Chat => {
+            KeyCode::PageDown => {
                 self.chat_scroll = self.chat_scroll.saturating_sub(10);
             }
-            // Input handling — full editor in a follow-up commit.
-            // For now: type chars, backspace, enter clears, no
-            // multi-line yet.
-            KeyCode::Char(c) if self.focus == Focus::Input => {
-                let _ = modifiers;
-                self.input.lines[self.input.row].push(c);
-                self.input.col += 1;
+            KeyCode::Up => {
+                self.chat_scroll = self.chat_scroll.saturating_add(1);
             }
-            KeyCode::Backspace if self.focus == Focus::Input => {
-                let line = &mut self.input.lines[self.input.row];
-                if line.pop().is_some() {
-                    self.input.col = self.input.col.saturating_sub(1);
-                }
+            KeyCode::Down => {
+                self.chat_scroll = self.chat_scroll.saturating_sub(1);
             }
-            KeyCode::Enter if self.focus == Focus::Input => {
+            _ => {}
+        }
+    }
+
+    fn handle_key_input(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        let alt = modifiers.contains(KeyModifiers::ALT);
+        let shift = modifiers.contains(KeyModifiers::SHIFT);
+        match code {
+            // Submit / newline.
+            KeyCode::Enter if shift || alt => self.input.insert_newline(),
+            KeyCode::Enter => {
                 let text = self.input.text().trim().to_string();
                 if !text.is_empty() {
                     self.input.push_history(text.clone());
                     self.input.clear();
-                    self.set_status(&format!("submitted: {}", truncate(&text, 40)));
+                    self.set_status(format!("submitted: {}", truncate(&text, 40)));
                 }
             }
+
+            // Editing — undo / redo.
+            KeyCode::Char('z') if ctrl => self.input.undo(),
+            KeyCode::Char('y') if ctrl => self.input.redo(),
+
+            // Editing — bulk delete.
+            KeyCode::Char('w') if ctrl => self.input.delete_word_backward(),
+            KeyCode::Char('u') if ctrl => self.input.delete_to_line_start(),
+            KeyCode::Char('k') if ctrl => self.input.delete_to_line_end(),
+
+            // Editing — single-char delete.
+            KeyCode::Backspace => self.input.backspace(),
+
+            // Cursor movement — char.
+            KeyCode::Left if ctrl || alt => self.input.move_word_left(),
+            KeyCode::Right if ctrl || alt => self.input.move_word_right(),
+            KeyCode::Left => self.input.move_left(),
+            KeyCode::Right => self.input.move_right(),
+
+            // Cursor movement — line / vertical / history.
+            KeyCode::Home => self.input.move_line_start(),
+            KeyCode::End => self.input.move_line_end(),
+            KeyCode::Char('a') if ctrl => self.input.move_line_start(),
+            KeyCode::Char('e') if ctrl => self.input.move_line_end(),
+            KeyCode::Up if self.input.at_first_row() => self.input.history_prev(),
+            KeyCode::Up => self.input.move_up(),
+            KeyCode::Down if self.input.at_last_row() => self.input.history_next(),
+            KeyCode::Down => self.input.move_down(),
+
+            // Char input. Skipping ASCII control chars (0x00-0x1F)
+            // so Ctrl-key combos we don't bind don't spew junk.
+            KeyCode::Char(c) if !ctrl => self.input.insert_char(c),
+
             _ => {}
         }
     }
@@ -403,5 +757,125 @@ mod tests {
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.input.is_empty());
         assert_eq!(app.input.history.front().map(String::as_str), Some("hi"));
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_does_not_submit() {
+        let mut app = App::new();
+        app.focus = Focus::Input;
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::SHIFT);
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_eq!(app.input.text(), "a\nb");
+        assert_eq!(app.input.history.len(), 0);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_backward() {
+        let mut s = InputState::new();
+        for c in "hello world ".chars() {
+            s.insert_char(c);
+        }
+        s.delete_word_backward();
+        // First Ctrl-W eats trailing whitespace + "world".
+        assert_eq!(s.text(), "hello ");
+        s.delete_word_backward();
+        // Second eats "hello" + the trailing space before it.
+        assert_eq!(s.text(), "");
+    }
+
+    #[test]
+    fn ctrl_u_deletes_to_line_start() {
+        let mut s = InputState::new();
+        for c in "hello world".chars() {
+            s.insert_char(c);
+        }
+        s.move_line_start();
+        s.move_word_right();
+        s.delete_to_line_start();
+        assert_eq!(s.text(), "world");
+    }
+
+    #[test]
+    fn ctrl_k_deletes_to_line_end() {
+        let mut s = InputState::new();
+        for c in "hello world".chars() {
+            s.insert_char(c);
+        }
+        s.col = 5;
+        s.delete_to_line_end();
+        assert_eq!(s.text(), "hello");
+    }
+
+    #[test]
+    fn undo_redo_round_trip() {
+        let mut s = InputState::new();
+        for c in "abc".chars() {
+            s.insert_char(c);
+        }
+        assert_eq!(s.text(), "abc");
+        s.undo();
+        s.undo();
+        s.undo();
+        assert_eq!(s.text(), "");
+        s.redo();
+        s.redo();
+        s.redo();
+        assert_eq!(s.text(), "abc");
+    }
+
+    #[test]
+    fn history_navigation_preserves_live_buffer() {
+        let mut s = InputState::new();
+        s.push_history("first".into());
+        s.push_history("second".into());
+        // Type something the user hasn't submitted.
+        for c in "draft".chars() {
+            s.insert_char(c);
+        }
+        assert_eq!(s.text(), "draft");
+        // ↑ goes to most-recent history entry.
+        s.history_prev();
+        assert_eq!(s.text(), "second");
+        // ↑ goes further back.
+        s.history_prev();
+        assert_eq!(s.text(), "first");
+        // ↑ at the oldest pins.
+        s.history_prev();
+        assert_eq!(s.text(), "first");
+        // ↓ steps back forward.
+        s.history_next();
+        assert_eq!(s.text(), "second");
+        // ↓ past most-recent restores the saved live buffer.
+        s.history_next();
+        assert_eq!(s.text(), "draft");
+    }
+
+    #[test]
+    fn cursor_word_movement_skips_words_and_whitespace() {
+        let mut s = InputState::new();
+        for c in "the quick brown".chars() {
+            s.insert_char(c);
+        }
+        s.move_line_start();
+        s.move_word_right();
+        assert_eq!(s.col, 4); // start of "quick"
+        s.move_word_right();
+        assert_eq!(s.col, 10); // start of "brown"
+        s.move_word_left();
+        assert_eq!(s.col, 4);
+    }
+
+    #[test]
+    fn unicode_aware_editing() {
+        let mut s = InputState::new();
+        for c in "héllo".chars() {
+            s.insert_char(c);
+        }
+        assert_eq!(s.col, 5);
+        s.backspace();
+        s.backspace();
+        assert_eq!(s.text(), "hél");
+        assert_eq!(s.col, 3);
     }
 }
