@@ -77,6 +77,12 @@ enum Commands {
         /// Override the LLM model
         #[arg(long)]
         model: Option<String>,
+
+        /// Open the terminal UI (sessions / chat / channels panels)
+        /// instead of the line-by-line CLI. Existing CLI mode is
+        /// the default.
+        #[arg(long)]
+        tui: bool,
     },
     /// Show agent status
     Status,
@@ -742,6 +748,49 @@ async fn run_agent(
     Ok(())
 }
 
+/// Launch the terminal UI (`fennec agent --tui`).
+///
+/// F1 scaffolding: builds the `App` state with placeholder data
+/// representative of a real session, hands it to the TUI's
+/// event loop, and restores the terminal on exit. Real wiring
+/// (agent loop subscription, session-store backed sessions list,
+/// channel-manager backed channel statuses) lands in subsequent
+/// commits on this branch.
+async fn run_tui(
+    _config: FennecConfig,
+    _home_dir: std::path::PathBuf,
+    _model_override: Option<String>,
+) -> Result<()> {
+    use fennec::tui::app::{
+        App, ChannelConnState, ChannelState, ChatLine, SessionRow,
+    };
+    let mut app = App::new();
+    // Seed with a realistic-looking initial state. Replaced with
+    // live data from the session store + channel manager in the
+    // next commit.
+    app.sessions = vec![
+        SessionRow {
+            code: "$ ".into(),
+            who: "local".into(),
+            subject: "press [n] to start a new session".into(),
+            count: "0".into(),
+            has_unread: false,
+        },
+    ];
+    app.channels = vec![ChannelState {
+        code: "$ ".into(),
+        name: "cli".into(),
+        state: ChannelConnState::Attached,
+        detail: "this session".into(),
+    }];
+    app.chat = vec![ChatLine::System {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body: "fennec tui — placeholder state. agent wiring in next commit.".into(),
+    }];
+    let app = std::sync::Arc::new(parking_lot::Mutex::new(app));
+    fennec::tui::run(app)
+}
+
 async fn run_gateway(
     config: FennecConfig,
     home_dir: std::path::PathBuf,
@@ -1099,8 +1148,12 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Commands::Agent { message, model } => {
-            run_agent(config, home_dir, message, model).await?;
+        Commands::Agent { message, model, tui } => {
+            if tui {
+                run_tui(config, home_dir, model).await?;
+            } else {
+                run_agent(config, home_dir, message, model).await?;
+            }
         }
         Commands::Status => {
             println!("Fennec v{}", env!("CARGO_PKG_VERSION"));

@@ -1,0 +1,167 @@
+//! Lifecycle callbacks an agent run can fan out to a frontend.
+//!
+//! The TUI (F1) and the dashboard (F2 — future) both consume the
+//! same set of events: streaming text, tool start / progress /
+//! complete, reasoning deltas, and human-in-the-loop prompts
+//! (approval / clarify / secret). This trait lets a frontend
+//! subscribe to those events without modifying the agent loop's
+//! per-callsite logic.
+//!
+//! Channels (Telegram, Discord, etc.) DO NOT use this surface —
+//! they receive only the final assistant message, the same as
+//! today. Callbacks are an *additional* layer for frontends that
+//! want intra-turn visibility.
+//!
+//! Default-impl methods on the trait make every event optional:
+//! a frontend can implement only the ones it cares about. The
+//! agent loop fires every event regardless; consumers ignore what
+//! they don't need.
+
+use std::sync::Arc;
+
+/// A live tool execution in progress.
+#[derive(Debug, Clone)]
+pub struct ToolStart {
+    /// Stable identifier for matching `start` ↔ `progress` ↔ `complete`.
+    pub tool_id: String,
+    /// Tool name (e.g. `"weather"`, `"shell"`, `"memory.recall"`).
+    pub name: String,
+    /// One-line preview of the call (e.g. arg summary).
+    pub preview: String,
+}
+
+/// Tool progress update — emitted between start and complete for
+/// long-running tools that surface incremental state. Most tools
+/// don't emit this; tools that take more than a couple of seconds
+/// (shell commands, http downloads) should.
+#[derive(Debug, Clone)]
+pub struct ToolProgress {
+    pub tool_id: String,
+    /// Updated preview (e.g. "downloaded 4/12 MB").
+    pub preview: String,
+}
+
+/// Tool execution finished.
+#[derive(Debug, Clone)]
+pub struct ToolComplete {
+    pub tool_id: String,
+    pub name: String,
+    /// Wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+    /// `Some(message)` on error; `None` on success.
+    pub error: Option<String>,
+    /// Optional one-line summary of the result. Frontends use this
+    /// for the inline tool-call collapsed display.
+    pub summary: Option<String>,
+}
+
+/// A request that requires user input mid-turn. The agent suspends
+/// until the frontend resolves the request (or times out per the
+/// frontend's policy).
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    /// Human-readable command being requested (e.g. `rm -rf build/`).
+    pub command: String,
+    /// Why the agent wants to run it.
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClarifyRequest {
+    /// The question the agent wants the user to answer.
+    pub question: String,
+    /// Optional multiple-choice options. Empty means free-text.
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecretRequest {
+    /// What's being asked for (e.g. "GitHub personal access token").
+    pub label: String,
+}
+
+/// Lifecycle hooks an agent run fires for each event of interest
+/// to a real-time frontend.
+///
+/// All methods have default no-op implementations so a frontend
+/// only overrides the ones it consumes. The agent loop calls them
+/// directly; they're synchronous and should not block — frontends
+/// that need to do real work (write to a UI, etc.) should send a
+/// message to their own event loop and return immediately.
+///
+/// The blocking-prompt methods (`on_approval_request`,
+/// `on_clarify_request`, `on_secret_request`) are the exception:
+/// they DO block the agent until the user responds. Frontends
+/// implement them by suspending their event loop, presenting a
+/// modal, and returning the response. A return of `None` means
+/// "user cancelled / declined" and the agent should treat that
+/// as a deny.
+pub trait AgentCallbacks: Send + Sync {
+    /// Streaming text delta from the assistant. Called many times
+    /// per turn; concatenating all deltas in order yields the
+    /// final assistant message.
+    fn on_text_delta(&self, _delta: &str) {}
+
+    /// Streaming reasoning delta (extended thinking, e.g.
+    /// Claude 4.x thinking blocks). Same shape as text deltas.
+    fn on_reasoning_delta(&self, _delta: &str) {}
+
+    /// Tool started executing.
+    fn on_tool_start(&self, _start: ToolStart) {}
+
+    /// Tool progress update.
+    fn on_tool_progress(&self, _progress: ToolProgress) {}
+
+    /// Tool finished.
+    fn on_tool_complete(&self, _complete: ToolComplete) {}
+
+    /// Status update for the active turn (e.g. "calling provider",
+    /// "compressing context"). Transient — frontend usually shows
+    /// it in a status bar that auto-clears after a few seconds.
+    fn on_status(&self, _message: &str) {}
+
+    /// Turn started. `prompt` is the user message that initiated
+    /// the turn.
+    fn on_turn_start(&self, _prompt: &str) {}
+
+    /// Turn ended. `summary` is the final assistant message.
+    fn on_turn_complete(&self, _summary: &str) {}
+
+    /// Blocking: ask the user to approve a privileged action.
+    /// Default impl auto-approves so callbacks-less code paths
+    /// behave exactly as they did before this trait existed.
+    fn on_approval_request(&self, _request: ApprovalRequest) -> bool {
+        true
+    }
+
+    /// Blocking: ask the user a clarifying question. Default
+    /// returns `None` so callers fall back to whatever they did
+    /// before.
+    fn on_clarify_request(&self, _request: ClarifyRequest) -> Option<String> {
+        None
+    }
+
+    /// Blocking: ask the user for a secret (e.g. an API token).
+    fn on_secret_request(&self, _request: SecretRequest) -> Option<String> {
+        None
+    }
+}
+
+/// No-op implementation. Used in code paths that don't have a
+/// frontend (existing channel sends, batch runs, etc.) so the
+/// agent can call callback methods unconditionally.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoCallbacks;
+
+impl AgentCallbacks for NoCallbacks {}
+
+/// Owned, type-erased handle so an `Agent` can hold a callbacks
+/// implementation without leaking the concrete type into its
+/// signature.
+pub type CallbacksHandle = Arc<dyn AgentCallbacks>;
+
+/// Convenience: the default no-op handle, useful in tests and in
+/// code paths that explicitly want "no frontend".
+pub fn noop_callbacks() -> CallbacksHandle {
+    Arc::new(NoCallbacks)
+}
