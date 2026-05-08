@@ -489,6 +489,16 @@ pub struct App {
     pub transient_status: Option<(String, Instant)>,
     /// Set to true when the event loop should exit.
     pub should_quit: bool,
+    /// `/compact` toggle — hides metadata + blank lines in the
+    /// chat panel for tighter rendering.
+    pub compact_mode: bool,
+    /// `/details` toggle — hides thinking blocks + tool detail
+    /// expansions when off.
+    pub details_visible: bool,
+    /// `/mouse` toggle — drives crossterm's mouse-tracking
+    /// enable/disable on the next frame. Off by default to avoid
+    /// stealing the user's terminal-native scroll wheel.
+    pub mouse_enabled: bool,
 }
 
 impl App {
@@ -507,6 +517,9 @@ impl App {
             cursor_visible: true,
             transient_status: None,
             should_quit: false,
+            compact_mode: false,
+            details_visible: true,
+            mouse_enabled: false,
         }
     }
 

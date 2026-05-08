@@ -7,12 +7,37 @@
 //! Commands live in this module rather than in the existing CLI
 //! channel because they're TUI-specific (some open modal
 //! overlays, some change the renderer's state, some are pure
-//! agent operations). Implementations land in subsequent commits;
-//! this file establishes the registry shape so callers compile.
+//! agent operations).
+
+pub mod builtin;
 
 use std::collections::HashMap;
 
 use anyhow::Result;
+
+use super::app::App;
+
+/// Action a command wants performed on the agent itself. Surfaced
+/// because slash commands run on the main thread under the
+/// app's parking_lot mutex; agent calls are async + need their
+/// own tokio mutex. The submit loop performs these actions
+/// *after* the command handler returns and the app lock is
+/// released.
+#[derive(Debug, Clone)]
+pub enum AgentAction {
+    /// Clear the agent's history (start a fresh conversation
+    /// without restarting the process).
+    Clear,
+    /// Replay the last user message as a fresh turn.
+    Retry,
+    /// Pop the last user-assistant exchange.
+    Undo,
+    /// Inject `message` as a steering note into the next turn.
+    Steer(String),
+    /// Send `prompt` as a regular turn (used by /background and
+    /// similar commands that wrap a normal turn).
+    Run(String),
+}
 
 /// Outcome of running a slash command. Drives the TUI's response
 /// to the command — display text, status flash, modal, exit, etc.
@@ -30,36 +55,63 @@ pub enum CommandOutcome {
     /// Command was a no-op for now (placeholder while
     /// implementations land).
     NotImplemented(String),
+    /// Side-effecting agent operation queued for the submit loop.
+    Agent(AgentAction),
 }
 
-/// Trait every slash command implements.
+/// Trait every slash command implements. Handlers take a mutable
+/// `App` reference so they can mutate UI state directly (toggle
+/// flags, push system messages, etc.). For agent operations they
+/// return an `AgentAction` outcome variant; the submit loop
+/// applies it after releasing the app lock.
 pub trait CommandHandler: Send + Sync {
     /// Command name without the leading slash (e.g. `"clear"`).
     fn name(&self) -> &'static str;
     /// One-line summary for `/help`.
     fn help(&self) -> &'static str;
+    /// Aliases (e.g. `"new"` is also `"clear"`). Default: none.
+    fn aliases(&self) -> &[&'static str] {
+        &[]
+    }
     /// Run the command.
-    fn execute(&self, args: &str) -> Result<CommandOutcome>;
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome>;
 }
 
 /// Registry of installed commands.
 pub struct CommandRegistry {
     handlers: HashMap<&'static str, Box<dyn CommandHandler>>,
+    /// Aliases pointing at the primary command name.
+    aliases: HashMap<&'static str, &'static str>,
 }
 
 impl CommandRegistry {
     pub fn new() -> Self {
         Self {
             handlers: HashMap::new(),
+            aliases: HashMap::new(),
         }
     }
 
     pub fn register(&mut self, handler: Box<dyn CommandHandler>) {
-        self.handlers.insert(handler.name(), handler);
+        let aliases: Vec<&'static str> = handler.aliases().to_vec();
+        let primary = handler.name();
+        self.handlers.insert(primary, handler);
+        // Aliases share the same primary handler via a re-lookup
+        // in `get`. We don't double-store boxes; the alias map
+        // just remembers which primary to forward to.
+        for a in aliases {
+            self.aliases.insert(a, primary);
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn CommandHandler> {
-        self.handlers.get(name).map(|b| b.as_ref())
+        if let Some(h) = self.handlers.get(name) {
+            return Some(h.as_ref());
+        }
+        if let Some(primary) = self.aliases.get(name) {
+            return self.handlers.get(primary).map(|b| b.as_ref());
+        }
+        None
     }
 
     pub fn names(&self) -> Vec<&'static str> {
@@ -70,11 +122,24 @@ impl CommandRegistry {
 
     /// Look up `name` and run with `args`. Returns
     /// `CommandOutcome::Unknown(name)` if no handler exists.
-    pub fn dispatch(&self, name: &str, args: &str) -> Result<CommandOutcome> {
+    pub fn dispatch(
+        &self,
+        name: &str,
+        args: &str,
+        app: &mut App,
+    ) -> Result<CommandOutcome> {
         match self.get(name) {
-            Some(h) => h.execute(args),
+            Some(h) => h.execute(args, app),
             None => Ok(CommandOutcome::Unknown(name.to_string())),
         }
+    }
+
+    /// Build a registry pre-loaded with the F1-1 built-in
+    /// command set. Called by the TUI on startup.
+    pub fn with_builtins() -> Self {
+        let mut r = Self::new();
+        builtin::register_all(&mut r);
+        r
     }
 }
 
@@ -129,7 +194,7 @@ mod tests {
         fn help(&self) -> &'static str {
             "echo args back"
         }
-        fn execute(&self, args: &str) -> Result<CommandOutcome> {
+        fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
             Ok(CommandOutcome::Text(args.to_string()))
         }
     }
@@ -138,7 +203,8 @@ mod tests {
     fn registry_dispatches_known_command() {
         let mut r = CommandRegistry::new();
         r.register(Box::new(EchoCommand));
-        let outcome = r.dispatch("echo", "hello").unwrap();
+        let mut app = App::new();
+        let outcome = r.dispatch("echo", "hello", &mut app).unwrap();
         match outcome {
             CommandOutcome::Text(s) => assert_eq!(s, "hello"),
             other => panic!("unexpected outcome: {:?}", other),
@@ -148,7 +214,8 @@ mod tests {
     #[test]
     fn registry_returns_unknown_for_missing_command() {
         let r = CommandRegistry::new();
-        match r.dispatch("missing", "").unwrap() {
+        let mut app = App::new();
+        match r.dispatch("missing", "", &mut app).unwrap() {
             CommandOutcome::Unknown(name) => assert_eq!(name, "missing"),
             other => panic!("unexpected outcome: {:?}", other),
         }

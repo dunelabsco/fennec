@@ -840,12 +840,13 @@ async fn run_tui(
         }
     });
 
-    // Submit-handler task: watches the input box for completed
-    // submissions (history-recorded entries) and runs them as
-    // agent turns. We poll because the TUI's event loop runs
-    // synchronously on the main thread; tighter integration
-    // (mpsc from the input handler directly) lands with the
-    // slash-command commit.
+    // Submit-handler task: watches the input editor for new
+    // history entries (each Enter records one) and routes them
+    // either to the slash-command registry or to a fresh agent
+    // turn. Polling is intentional — the TUI's render loop runs
+    // synchronously on the main thread so we can't share a
+    // tokio mpsc with it without extra plumbing.
+    let registry = std::sync::Arc::new(fennec::tui::commands::CommandRegistry::with_builtins());
     let submit_app = app.clone();
     let submit_agent = agent.clone();
     let submit_handle = tokio::spawn(async move {
@@ -859,13 +860,29 @@ async fn run_tui(
                 }
                 guard.input.history.front().cloned()
             };
-            if let Some(prompt) = pending {
-                if last_submitted.as_ref() != Some(&prompt) {
-                    last_submitted = Some(prompt.clone());
-                    let mut agent_guard = submit_agent.lock().await;
-                    let _ = agent_guard.turn(&prompt).await;
-                }
+            let prompt = match pending {
+                Some(p) if last_submitted.as_ref() != Some(&p) => p,
+                _ => continue,
+            };
+            last_submitted = Some(prompt.clone());
+
+            // Slash command? Run it through the registry under
+            // the app lock briefly, then handle any AgentAction
+            // outcome with the agent lock released.
+            if let Some((name, args)) = fennec::tui::commands::parse(&prompt) {
+                let outcome = {
+                    let mut guard = submit_app.lock();
+                    registry.dispatch(name, args, &mut guard).unwrap_or_else(|e| {
+                        fennec::tui::commands::CommandOutcome::Status(format!("error: {e}"))
+                    })
+                };
+                handle_command_outcome(outcome, &submit_app, &submit_agent).await;
+                continue;
             }
+
+            // Plain text — run as an agent turn.
+            let mut agent_guard = submit_agent.lock().await;
+            let _ = agent_guard.turn(&prompt).await;
         }
     });
 
@@ -880,6 +897,61 @@ async fn run_tui(
     submit_handle.abort();
 
     result
+}
+
+/// Apply a `CommandOutcome` to the app state and (if needed)
+/// dispatch the queued `AgentAction` against the agent. Lives
+/// here rather than inside the registry because executing
+/// agent operations needs both the parking_lot app mutex and
+/// the tokio agent mutex; the registry is sync.
+async fn handle_command_outcome(
+    outcome: fennec::tui::commands::CommandOutcome,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+) {
+    use fennec::tui::commands::{AgentAction, CommandOutcome};
+    match outcome {
+        CommandOutcome::Quit => {
+            app.lock().should_quit = true;
+        }
+        CommandOutcome::Text(body) => {
+            let mut guard = app.lock();
+            guard.chat.push(fennec::tui::app::ChatLine::System {
+                time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                body,
+            });
+        }
+        CommandOutcome::Status(msg) => {
+            app.lock().set_status(msg);
+        }
+        CommandOutcome::Unknown(name) => {
+            app.lock().set_status(format!("unknown command: /{name}"));
+        }
+        CommandOutcome::NotImplemented(name) => {
+            app.lock()
+                .set_status(format!("/{name}: not yet implemented"));
+        }
+        CommandOutcome::Agent(action) => match action {
+            AgentAction::Clear => {
+                let mut guard = agent.lock().await;
+                guard.clear_history();
+            }
+            AgentAction::Retry | AgentAction::Undo | AgentAction::Steer(_) => {
+                // The agent doesn't yet expose retry/undo/steer
+                // primitives; their wiring lands alongside the
+                // streaming-turn commit. The chat-side state
+                // change has already been applied by the command
+                // handler, so the user sees an immediate visual
+                // effect; the agent-side replay arrives next.
+                let mut guard = app.lock();
+                guard.set_status("queued — agent-side wiring in F1-1 final");
+            }
+            AgentAction::Run(prompt) => {
+                let mut guard = agent.lock().await;
+                let _ = guard.turn(&prompt).await;
+            }
+        },
+    }
 }
 
 /// Apply a single `TuiEvent` to the app state. Called from the
