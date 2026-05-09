@@ -746,6 +746,34 @@ impl Agent {
         }
     }
 
+    /// Pop messages from the tail of `history` until (and
+    /// including) the most recent user-role message is removed.
+    /// Returns `(count_popped, user_text)` on success, `None`
+    /// when no user message exists (history is left untouched
+    /// in that case).
+    ///
+    /// Used by `/undo` (to drop the last exchange) and `/retry`
+    /// (to drop + re-submit the user message). Mirrors Hermes'
+    /// `session.undo` (`tui_gateway/server.py:2424-2449`) which
+    /// pops in reverse until a user-role row is found.
+    pub fn pop_last_turn(&mut self) -> Option<(usize, String)> {
+        // First locate the index of the most recent user
+        // message — only then do we mutate. Avoids corrupting
+        // history if the tail somehow has no user row (a
+        // pathological state, but we shouldn't panic on it).
+        let user_idx = self
+            .history
+            .iter()
+            .rposition(|m| m.role == "user")?;
+        let user_text = self.history[user_idx]
+            .content
+            .clone()
+            .unwrap_or_default();
+        let popped = self.history.len() - user_idx;
+        self.history.truncate(user_idx);
+        Some((popped, user_text))
+    }
+
     /// Snapshot of cumulative session token usage + cost. Returned
     /// by [`Self::token_usage`] for the `/usage` command.
     ///

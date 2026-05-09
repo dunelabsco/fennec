@@ -1232,14 +1232,18 @@ async fn handle_command_outcome(
                 let mut guard = agent.lock().await;
                 guard.clear_history();
             }
-            AgentAction::Retry | AgentAction::Undo | AgentAction::Steer(_) => {
-                // The agent doesn't yet expose retry/undo/steer
-                // primitives. The chat-side state change has
-                // already been applied by the command handler so
-                // the user sees an immediate visual effect; the
-                // agent-side replay lands in F1-2.
+            AgentAction::Undo => {
+                handle_undo(app, agent).await;
+            }
+            AgentAction::Retry => {
+                handle_retry(app, agent).await;
+            }
+            AgentAction::Steer(_note) => {
+                // /steer's pending-injection queue lands in the
+                // next commit (F1-1: /steer with pending_steer
+                // + tool-loop hook).
                 let mut guard = app.lock();
-                guard.set_status("queued — agent-side replay arrives in F1-2");
+                guard.set_status("steer queued — injection wiring lands next");
             }
             AgentAction::Run(prompt) => {
                 let mut guard = agent.lock().await;
@@ -1649,6 +1653,104 @@ fn handle_reload_env(
         time: chrono::Local::now().format("%H:%M:%S").to_string(),
         body,
     });
+}
+
+/// `/undo` worker — drop the last user / assistant exchange
+/// from the agent's history. Mid-turn rejection via try_lock
+/// matches Hermes' "session busy" guard at server.py:2424-2449.
+/// The chat-side cleanup (popping ChatLines) was done by the
+/// command handler before we got here.
+async fn handle_undo(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let body = {
+        let mut agent_lock = match agent.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                let mut g = app.lock();
+                g.chat.push(fennec::tui::app::ChatLine::System {
+                    time: now,
+                    body: "session busy — finish the current turn before /undo".into(),
+                });
+                return;
+            }
+        };
+        match agent_lock.pop_last_turn() {
+            Some((n, _user_text)) => {
+                let plural = if n == 1 { "message" } else { "messages" };
+                format!("undid {n} {plural}")
+            }
+            None => "nothing to undo".to_string(),
+        }
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: now,
+        body,
+    });
+}
+
+/// `/retry` worker — pop the last user / assistant exchange,
+/// then re-submit the user message as a fresh streaming turn.
+/// Mid-turn rejection via try_lock. If there's no prior user
+/// message to retry, surfaces "nothing to retry" rather than
+/// silently no-op (matches Hermes' core.ts:587-610).
+async fn handle_retry(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let push = |body: String, app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>| {
+        let mut g = app.lock();
+        g.chat.push(fennec::tui::app::ChatLine::System {
+            time: now.clone(),
+            body,
+        });
+    };
+
+    // Pop + capture the user text under the agent lock, then
+    // drop the lock so turn_streaming can take it back for the
+    // re-run.
+    let user_text = {
+        let mut agent_lock = match agent.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                push(
+                    "session busy — finish the current turn before /retry".into(),
+                    app,
+                );
+                return;
+            }
+        };
+        match agent_lock.pop_last_turn() {
+            Some((_n, text)) => text,
+            None => {
+                drop(agent_lock);
+                push("nothing to retry".into(), app);
+                return;
+            }
+        }
+    };
+
+    push(format!("retrying: {}", truncate_for_status(&user_text)), app);
+    // Re-submit. We hold the agent lock for the full streaming
+    // turn so concurrent commands wait — same as the regular
+    // submit path.
+    let mut agent_lock = agent.lock().await;
+    let _ = agent_lock.turn_streaming(&user_text).await;
+}
+
+fn truncate_for_status(s: &str) -> String {
+    const MAX: usize = 60;
+    let mut iter = s.chars();
+    let head: String = iter.by_ref().take(MAX).collect();
+    if iter.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
 }
 
 /// `/paste` worker — read an image from the OS clipboard, save
