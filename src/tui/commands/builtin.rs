@@ -421,20 +421,14 @@ impl CommandHandler for Model {
     fn help(&self) -> &'static str {
         "show or switch the active LLM"
     }
-    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
         let arg = args.trim();
-        if arg.is_empty() {
-            push_system(
-                app,
-                "model: shown in the bottom status bar. /model <name> to switch (live-swap lands in F1-2; for now the change applies to new sessions).".into(),
-            );
+        let payload = if arg.is_empty() {
+            None
         } else {
-            push_system(
-                app,
-                format!("/model {arg} — recorded; live-swap lands in F1-2."),
-            );
-        }
-        Ok(CommandOutcome::Status("noted".into()))
+            Some(arg.to_string())
+        };
+        Ok(CommandOutcome::Agent(AgentAction::SwitchModel(payload)))
     }
 }
 

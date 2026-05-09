@@ -48,6 +48,11 @@ pub enum AgentAction {
     /// Resume a saved session by id-or-title (Hermes' fallback
     /// matches by exact title when no id matches).
     SessionResume(String),
+    /// Show the active model and a known-models list, or swap
+    /// to a different model live (mid-turn requests are
+    /// rejected, mirroring Hermes' `_apply_model_switch`).
+    /// `None` payload means "show". `Some(name)` means "switch".
+    SwitchModel(Option<String>),
 }
 
 /// Outcome of running a slash command. Drives the TUI's response

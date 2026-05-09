@@ -129,6 +129,35 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         .with_context(|| format!("API key not found: set provider.api_key in config or {} env var", env_var))
 }
 
+/// Resolve a provider Arc for the given config + new model name,
+/// honouring both the OAuth path (Anthropic with a stored OAuth
+/// token) and the API-key path. Used at startup by
+/// `build_agent_with_callbacks` and at runtime by `/model` to
+/// rebuild the live provider without restarting the process.
+fn resolve_provider_with_model(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+    model: &str,
+) -> Result<Arc<dyn Provider>> {
+    let secret_store =
+        SecretStore::new(home_dir.to_path_buf()).context("creating secret store")?;
+    let provider: Box<dyn Provider> = if config.provider.name == "anthropic" {
+        if let Ok(Some(oauth_token)) = auth::load_oauth_token(home_dir) {
+            Box::new(AnthropicProvider::new_with_oauth(
+                oauth_token,
+                Some(model.to_string()),
+            ))
+        } else {
+            let api_key = resolve_api_key(config, &secret_store)?;
+            build_provider(config, api_key, Some(model.to_string()))
+        }
+    } else {
+        let api_key = resolve_api_key(config, &secret_store)?;
+        build_provider(config, api_key, Some(model.to_string()))
+    };
+    Ok(Arc::from(provider))
+}
+
 /// Build the LLM provider based on config.
 fn build_provider(
     config: &FennecConfig,
@@ -907,6 +936,8 @@ async fn run_tui(
     let submit_app = app.clone();
     let submit_agent = agent.clone();
     let submit_store = session_store_handle.clone();
+    let submit_config = config.clone();
+    let submit_home = home_dir.clone();
     let submit_handle = tokio::spawn(async move {
         let mut last_submitted: Option<String> = None;
         loop {
@@ -939,6 +970,8 @@ async fn run_tui(
                     &submit_app,
                     &submit_agent,
                     submit_store.as_ref(),
+                    &submit_config,
+                    &submit_home,
                 )
                 .await;
                 continue;
@@ -1162,6 +1195,8 @@ async fn handle_command_outcome(
     app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
     agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
     session_store: Option<&std::sync::Arc<fennec::sessions::SessionStore>>,
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
 ) {
     use fennec::tui::commands::{AgentAction, CommandOutcome};
     match outcome {
@@ -1220,6 +1255,9 @@ async fn handle_command_outcome(
             }
             AgentAction::SessionResume(target) => {
                 handle_session_resume(target, app, agent, session_store).await;
+            }
+            AgentAction::SwitchModel(payload) => {
+                handle_switch_model(payload, app, agent, config, home_dir).await;
             }
         },
     }
@@ -1358,6 +1396,99 @@ async fn handle_session_resume(
         time: chrono::Local::now().format("%H:%M:%S").to_string(),
         body: format!("resumed: {title_label} ({count} messages)"),
     });
+}
+
+/// `/model` worker — read or write the active provider's
+/// model. `payload = None` renders an inline panel showing
+/// the current model + the snapshot of known models so the
+/// user can pick one. `Some(name)` rebuilds the provider with
+/// the new model, swaps it on the live agent, and confirms.
+///
+/// Mid-turn swap is rejected (matching Hermes'
+/// `_apply_model_switch` at server.py:1067-1145, which raises
+/// "session busy"). Detection here is a `try_lock` on the
+/// agent's tokio mutex — if it's held, a turn is in flight.
+async fn handle_switch_model(
+    payload: Option<String>,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) {
+    use fennec::agent::pricing;
+
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let push = |body: String, app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>| {
+        let mut g = app.lock();
+        g.chat.push(fennec::tui::app::ChatLine::System {
+            time: now.clone(),
+            body,
+        });
+    };
+
+    match payload {
+        None => {
+            // Read path: snapshot the active model and render the
+            // known-models list inline. No agent mutation.
+            let current = {
+                let guard = agent.lock().await;
+                guard.provider().model().to_string()
+            };
+            let current_label = if current.is_empty() {
+                "(unknown)".to_string()
+            } else {
+                current
+            };
+            let known: Vec<&'static str> = pricing::known_models();
+            let mut body = format!("Active model: {current_label}\nKnown models:\n");
+            for m in &known {
+                body.push_str(&format!("  · {m}\n"));
+            }
+            body.push_str("\nUse /model <name> to switch live (rejected mid-turn).");
+            push(body.trim_end().to_string(), app);
+        }
+        Some(new_model) => {
+            // Write path: reject if the agent is mid-turn, then
+            // rebuild + swap the provider. The new provider Arc
+            // also surfaces the new model in /usage's pricing
+            // lookup automatically since `provider().model()` is
+            // the source of truth.
+            let mut agent_lock = match agent.try_lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    push(
+                        "session busy — finish the current turn before /model".to_string(),
+                        app,
+                    );
+                    return;
+                }
+            };
+            let provider = match resolve_provider_with_model(config, home_dir, &new_model) {
+                Ok(p) => p,
+                Err(e) => {
+                    drop(agent_lock);
+                    push(format!("model swap failed: {e}"), app);
+                    return;
+                }
+            };
+            agent_lock.set_provider(provider);
+            drop(agent_lock);
+            // Persist the new model to disk so the change survives
+            // a restart, mirroring Hermes' `_persist_model_switch`.
+            // A failure here is non-fatal — the live agent already
+            // has the swap applied; we just warn the user.
+            let mut persisted = config.clone();
+            persisted.provider.model = new_model.clone();
+            let config_path = home_dir.join("config.toml");
+            let persist_msg = match persisted.save(&config_path) {
+                Ok(()) => format!("model → {new_model}"),
+                Err(e) => format!(
+                    "model → {new_model} (in-memory only; config.toml save failed: {e})"
+                ),
+            };
+            push(persist_msg, app);
+        }
+    }
 }
 
 /// Apply a single `TuiEvent` to the app state. Called from the

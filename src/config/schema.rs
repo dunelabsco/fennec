@@ -54,6 +54,19 @@ impl FennecConfig {
         let config: FennecConfig = toml::from_str(&contents)?;
         Ok(config)
     }
+
+    /// Persist configuration to `path` as TOML. Used by `/model`,
+    /// `/tools`, and other slash commands that mutate runtime
+    /// config and need the change to survive a restart. Creates
+    /// the parent directory if missing.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = toml::to_string_pretty(self)?;
+        std::fs::write(path, body)?;
+        Ok(())
+    }
 }
 
 /// Identity configuration.

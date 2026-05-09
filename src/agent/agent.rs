@@ -746,6 +746,17 @@ impl Agent {
         &self.provider
     }
 
+    /// Swap the live provider — used by `/model` to switch
+    /// models without restarting the process. Resets the cached
+    /// system prompt because the new provider may want
+    /// different prompt-injection conventions on its first
+    /// turn (and to keep parity with `clear_history`'s prompt
+    /// reset). Existing `history` is preserved.
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+        self.system_prompt = None;
+    }
+
     /// Get a reference to the shared memory.
     pub fn memory(&self) -> &Arc<dyn Memory> {
         &self.memory

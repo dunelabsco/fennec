@@ -219,6 +219,19 @@ pub fn lookup(model: &str) -> Option<&'static PricingEntry> {
         .find(|entry| m.starts_with(entry.model_prefix))
 }
 
+/// List of model-name prefixes the snapshot covers. Used by
+/// `/model` (with no arg) to render a "known models" list so
+/// the user has somewhere to look while picking a target. The
+/// list isn't authoritative — anything else can still be
+/// switched to via `/model <name>`; pricing for unrecognised
+/// models lands as "(unknown)" in `/usage`.
+pub fn known_models() -> Vec<&'static str> {
+    PRICING_TABLE
+        .iter()
+        .map(|e| e.model_prefix)
+        .collect()
+}
+
 /// Estimate session cost in USD for a model + accumulated usage
 /// counters. Returns `None` when the model isn't in the snapshot
 /// table.
@@ -291,6 +304,26 @@ mod tests {
         // contributes 0 even with non-zero cache_write_tokens.
         let with_writes = estimate_cost("gpt-4o", 0, 0, 0, 1_000_000).unwrap();
         assert_eq!(with_writes, 0.0);
+    }
+
+    #[test]
+    fn known_models_includes_each_provider_family() {
+        let names = known_models();
+        // At minimum: an Anthropic, an OpenAI, and a Kimi entry.
+        assert!(
+            names.iter().any(|n| n.starts_with("claude-")),
+            "missing Anthropic family: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("gpt-")),
+            "missing OpenAI family: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("kimi-")),
+            "missing Kimi family: {names:?}"
+        );
+        // No empty entries.
+        assert!(names.iter().all(|n| !n.is_empty()));
     }
 
     fn _coverage_check(usage: &UsageInfo) {
