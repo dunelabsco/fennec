@@ -30,6 +30,7 @@
 
 pub mod app;
 pub mod callbacks;
+pub mod clipboard;
 pub mod commands;
 pub mod layout;
 pub mod theme;

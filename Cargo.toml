@@ -40,6 +40,8 @@ dirs = "6.0"
 hex = "0.4"
 toml = "0.8"
 dotenvy = "0.15"
+arboard = "3.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 glob = "0.3"
 dialoguer = "0.12"
 console = "0.15"

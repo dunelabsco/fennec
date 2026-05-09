@@ -1278,6 +1278,12 @@ async fn handle_command_outcome(
             AgentAction::AttachImage(path) => {
                 handle_attach_image(path, app, agent).await;
             }
+            AgentAction::PasteClipboardImage => {
+                handle_paste_clipboard(app, agent, home_dir).await;
+            }
+            AgentAction::CopyAssistantMessage(n) => {
+                handle_copy_assistant(n, app);
+            }
         },
     }
 }
@@ -1641,6 +1647,134 @@ fn handle_reload_env(
     let mut g = app.lock();
     g.chat.push(fennec::tui::app::ChatLine::System {
         time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body,
+    });
+}
+
+/// `/paste` worker — read an image from the OS clipboard, save
+/// as PNG under `~/.fennec/clipboard/clip-YYYYMMDD-HHMMSS.png`,
+/// and queue it on the agent the same way `/image` does. Pure
+/// text paste isn't handled here because the user's terminal
+/// already gets that for free via Cmd-V / Ctrl-Shift-V into
+/// the input box.
+async fn handle_paste_clipboard(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    home_dir: &std::path::Path,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let push = |body: String, app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>| {
+        let mut g = app.lock();
+        g.chat.push(fennec::tui::app::ChatLine::System {
+            time: now.clone(),
+            body,
+        });
+    };
+
+    // arboard's Clipboard::new is sync + can block briefly on
+    // Linux X11. Run on a blocking pool so the submit task's
+    // tokio runtime stays responsive.
+    let read_result =
+        tokio::task::spawn_blocking(fennec::tui::clipboard::read_image_rgba).await;
+    let img = match read_result {
+        Ok(Ok(img)) => img,
+        Ok(Err(e)) => {
+            push(format!("paste failed: {e}"), app);
+            return;
+        }
+        Err(e) => {
+            push(format!("paste failed (join error): {e}"), app);
+            return;
+        }
+    };
+
+    let target_dir = home_dir.join("clipboard");
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let target = target_dir.join(format!("clip-{stamp}.png"));
+    if let Err(e) = img.write_png(&target) {
+        push(format!("paste failed: {e}"), app);
+        return;
+    }
+
+    // Reuse the /image attach path so dimensions, token estimate,
+    // and message echoing all match the keyboard /image command.
+    let body = {
+        let mut guard = agent.lock().await;
+        match guard.attach_image(&target) {
+            Ok(att) => {
+                let queued = guard.pending_attachment_count();
+                let dims = match (att.width, att.height) {
+                    (Some(w), Some(h)) => format!("{w}×{h}"),
+                    _ => "?".to_string(),
+                };
+                let tokens = att
+                    .token_estimate
+                    .map(|t| format!("{t} tokens"))
+                    .unwrap_or_else(|| "size unknown".to_string());
+                format!(
+                    "📎 pasted: {name} · {dims} · ~{tokens} · {queued} pending",
+                    name = att.display_name,
+                )
+            }
+            Err(e) => format!("paste attach failed: {e}"),
+        }
+    };
+    push(body, app);
+}
+
+/// `/copy` worker — copy the Nth assistant message (1-indexed,
+/// or the last when `None`) to the OS clipboard via arboard.
+/// Falls back to OSC52 escape on failure (SSH sessions and
+/// sandboxed terminals). Empty chat → "nothing to copy".
+fn handle_copy_assistant(
+    n: Option<usize>,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let body = {
+        let bots: Vec<String> = {
+            let guard = app.lock();
+            guard
+                .chat
+                .iter()
+                .filter_map(|l| match l {
+                    fennec::tui::app::ChatLine::Bot { body, .. } => Some(body.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        if bots.is_empty() {
+            "nothing to copy — no assistant messages yet".to_string()
+        } else {
+            let idx = match n {
+                None => bots.len() - 1,
+                Some(v) => v.saturating_sub(1).min(bots.len() - 1),
+            };
+            let target = bots[idx].clone();
+            match fennec::tui::clipboard::write_with_fallback(&target) {
+                fennec::tui::clipboard::CopyResult::Native => {
+                    format!(
+                        "copied message {}/{} to clipboard",
+                        idx + 1,
+                        bots.len()
+                    )
+                }
+                fennec::tui::clipboard::CopyResult::Osc52 => {
+                    format!(
+                        "sent OSC52 copy sequence (terminal must honor it) — message {}/{}",
+                        idx + 1,
+                        bots.len()
+                    )
+                }
+                fennec::tui::clipboard::CopyResult::Failed => {
+                    "copy failed: native clipboard + OSC52 both unavailable".to_string()
+                }
+            }
+        }
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: now,
         body,
     });
 }

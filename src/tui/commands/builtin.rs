@@ -650,17 +650,13 @@ impl CommandHandler for Paste {
         "paste"
     }
     fn help(&self) -> &'static str {
-        "paste clipboard text into the input"
+        "attach a clipboard image to the next message"
     }
-    fn execute(&self, _args: &str, app: &mut App) -> Result<CommandOutcome> {
-        // Clipboard access via a cross-platform crate is a real
-        // dep we'd need to add — defer to F1-2 alongside the
-        // image variant. For now, emit a hint.
-        push_system(
-            app,
-            "clipboard paste lands in F1-2. Most terminals already paste with Cmd-V / Ctrl-Shift-V into the input.".into(),
-        );
-        Ok(CommandOutcome::Status("noted".into()))
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        if !args.trim().is_empty() {
+            return Ok(CommandOutcome::Status("usage: /paste".into()));
+        }
+        Ok(CommandOutcome::Agent(AgentAction::PasteClipboardImage))
     }
 }
 
@@ -670,37 +666,23 @@ impl CommandHandler for Copy {
         "copy"
     }
     fn help(&self) -> &'static str {
-        "copy a past assistant message"
+        "copy an assistant message to the OS clipboard"
     }
-    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
-        // Find last bot message, or the n-th from the end.
-        let n: usize = args.trim().parse().unwrap_or(0);
-        let bot_messages: Vec<&str> = app
-            .chat
-            .iter()
-            .filter_map(|l| match l {
-                ChatLine::Bot { body, .. } => Some(body.as_str()),
-                _ => None,
-            })
-            .collect();
-        if bot_messages.is_empty() {
-            push_system(app, "no assistant messages to copy yet.".into());
-            return Ok(CommandOutcome::Status("nothing to copy".into()));
-        }
-        let idx = bot_messages.len().saturating_sub(1 + n);
-        let target = bot_messages[idx];
-        // Real clipboard write lands in F1-2 (needs a platform
-        // crate). For now, surface the text so the user can
-        // select it manually.
-        push_system(
-            app,
-            format!(
-                "(clipboard write lands in F1-2) message {} of {}:\n{target}",
-                idx + 1,
-                bot_messages.len()
-            ),
-        );
-        Ok(CommandOutcome::Status("ok".into()))
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        let trimmed = args.trim();
+        let n = if trimmed.is_empty() {
+            None
+        } else {
+            match trimmed.parse::<usize>() {
+                Ok(v) if v >= 1 => Some(v),
+                _ => {
+                    return Ok(CommandOutcome::Status(
+                        "usage: /copy [n] — n is 1-indexed".into(),
+                    ));
+                }
+            }
+        };
+        Ok(CommandOutcome::Agent(AgentAction::CopyAssistantMessage(n)))
     }
 }
 
@@ -828,10 +810,32 @@ mod tests {
     }
 
     #[test]
-    fn copy_with_no_bot_messages_status_is_nothing() {
+    fn copy_with_no_arg_emits_copy_action_for_last_message() {
+        // The handler delegates to the submit loop via
+        // AgentAction::CopyAssistantMessage. Empty-chat handling
+        // (the "nothing to copy" path) lives in main.rs's
+        // handle_copy_assistant, not the command handler.
         let (outcome, _app) = dispatch("copy", "");
         match outcome {
-            CommandOutcome::Status(s) => assert!(s.contains("nothing")),
+            CommandOutcome::Agent(AgentAction::CopyAssistantMessage(None)) => {}
+            other => panic!("expected CopyAssistantMessage(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_with_numeric_arg_passes_index_through() {
+        let (outcome, _app) = dispatch("copy", "3");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::CopyAssistantMessage(Some(3))) => {}
+            other => panic!("expected CopyAssistantMessage(Some(3)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn copy_with_non_numeric_arg_returns_status_usage() {
+        let (outcome, _app) = dispatch("copy", "garbage");
+        match outcome {
+            CommandOutcome::Status(s) => assert!(s.contains("usage"), "got: {s}"),
             other => panic!("expected Status, got {:?}", other),
         }
     }

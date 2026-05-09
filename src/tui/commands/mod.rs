@@ -75,6 +75,15 @@ pub enum AgentAction {
     /// `/image` can return dimensions + token estimate;
     /// providers serialise it inline on the next turn.
     AttachImage(std::path::PathBuf),
+    /// Attach the image currently on the OS clipboard. The
+    /// submit loop reads via arboard, persists a PNG under
+    /// ~/.fennec/clipboard/, and queues it on the agent.
+    PasteClipboardImage,
+    /// Copy a chat-history bot message to the OS clipboard.
+    /// `None` selects the most recent assistant turn; `Some(n)`
+    /// selects the Nth (1-indexed). Falls back to OSC52 escape
+    /// when the native clipboard isn't available.
+    CopyAssistantMessage(Option<usize>),
 }
 
 /// Outcome of running a slash command. Drives the TUI's response
