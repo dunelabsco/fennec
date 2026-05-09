@@ -499,6 +499,11 @@ pub struct App {
     /// enable/disable on the next frame. Off by default to avoid
     /// stealing the user's terminal-native scroll wheel.
     pub mouse_enabled: bool,
+    /// Index into `chat` of the assistant message currently being
+    /// streamed. `None` between turns; `Some(i)` while text deltas
+    /// are arriving so they accumulate into one growing message
+    /// instead of pushing a new line per delta.
+    pub in_flight_bot_idx: Option<usize>,
 }
 
 impl App {
@@ -520,7 +525,36 @@ impl App {
             compact_mode: false,
             details_visible: true,
             mouse_enabled: false,
+            in_flight_bot_idx: None,
         }
+    }
+
+    /// Append a streaming text delta to the in-flight assistant
+    /// message. Pushes a new `Bot` line if there isn't one yet
+    /// for this turn (or if a tool call broke the streaming
+    /// continuity by setting `in_flight_bot_idx` back to `None`).
+    pub fn append_bot_delta(&mut self, delta: &str) {
+        if let Some(idx) = self.in_flight_bot_idx {
+            if let Some(ChatLine::Bot { body, .. }) = self.chat.get_mut(idx) {
+                body.push_str(delta);
+                return;
+            }
+            // Fall through to "fresh push" if the index points
+            // at a non-Bot line (shouldn't happen, but be safe).
+            self.in_flight_bot_idx = None;
+        }
+        self.chat.push(ChatLine::Bot {
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+            body: delta.to_string(),
+        });
+        self.in_flight_bot_idx = Some(self.chat.len() - 1);
+    }
+
+    /// Mark the in-flight assistant message complete (a tool call
+    /// is starting, or the turn is ending). Subsequent
+    /// `append_bot_delta` will start a fresh message.
+    pub fn finalize_bot_message(&mut self) {
+        self.in_flight_bot_idx = None;
     }
 
     /// Handle a key press. Routes to the focused pane; some keys
@@ -877,6 +911,29 @@ mod tests {
         assert_eq!(s.col, 10); // start of "brown"
         s.move_word_left();
         assert_eq!(s.col, 4);
+    }
+
+    #[test]
+    fn append_bot_delta_creates_then_extends_in_flight_message() {
+        let mut app = App::new();
+        app.append_bot_delta("hello");
+        app.append_bot_delta(", world");
+        assert_eq!(app.chat.len(), 1);
+        match &app.chat[0] {
+            ChatLine::Bot { body, .. } => assert_eq!(body, "hello, world"),
+            other => panic!("expected Bot line, got {:?}", other),
+        }
+        assert_eq!(app.in_flight_bot_idx, Some(0));
+    }
+
+    #[test]
+    fn finalize_then_append_starts_fresh_message() {
+        let mut app = App::new();
+        app.append_bot_delta("first reply");
+        app.finalize_bot_message();
+        app.append_bot_delta("second reply");
+        assert_eq!(app.chat.len(), 2);
+        assert_eq!(app.in_flight_bot_idx, Some(1));
     }
 
     #[test]

@@ -314,6 +314,171 @@ impl Agent {
         Ok(rx)
     }
 
+    /// Streaming version of [`Self::turn`] that fans text deltas
+    /// through the registered callbacks as they arrive. Same
+    /// final-result contract as `turn()` (returns the assistant
+    /// text on success, errors on max-iterations exceeded /
+    /// guard rejection / provider failure), with the addition
+    /// that frontends see live updates throughout.
+    ///
+    /// The default no-op `AgentCallbacks` impl makes this safe
+    /// for callers that don't care about streaming — the deltas
+    /// fire into nothing. Channels (Telegram / etc.) keep using
+    /// `turn()` since they only consume final messages and don't
+    /// need the streaming overhead.
+    pub async fn turn_streaming(&mut self, user_message: &str) -> Result<String> {
+        use crate::providers::traits::{ChatRequest, StreamEvent, ToolCall};
+
+        self.callbacks.on_turn_start(user_message);
+
+        // Same setup as turn(): /think parsing, prompt guard,
+        // collective search, system prompt, history push.
+        let (thinking_override, user_message) = thinking::parse_thinking_directive(user_message);
+        if let Some(level) = thinking_override {
+            self.thinking_level = level;
+        }
+        let user_message: &str = &user_message;
+
+        if let Some(ref guard) = self.prompt_guard {
+            match guard.scan(user_message) {
+                ScanResult::Blocked(reason) => bail!("{reason}"),
+                ScanResult::Suspicious(_, _) | ScanResult::Safe => {}
+            }
+        }
+
+        let collective_context = if let Some(ref collective) = self.collective {
+            match collective.search(user_message, 3).await {
+                Ok(result) => match result.confidence {
+                    SearchConfidence::High => {
+                        Some(self.format_collective_results(&result.experiences, true))
+                    }
+                    SearchConfidence::Partial => {
+                        Some(self.format_collective_results(&result.experiences, false))
+                    }
+                    SearchConfidence::None => None,
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        if self.system_prompt.is_none() {
+            let memory_context = self.load_memory_context(user_message).await?;
+            let tool_names: Vec<String> = self.tools.iter().map(|t| t.name().to_string()).collect();
+            let prompt = self.prompt_builder.build(
+                &memory_context,
+                &tool_names,
+                &self.skills_prompt,
+            );
+            self.system_prompt = Some(prompt);
+        }
+
+        let effective_message = if let Some(ref ctx) = collective_context {
+            format!("[Collective matches]\n{ctx}\n[User message]\n{user_message}")
+        } else {
+            user_message.to_string()
+        };
+        self.history.push(ChatMessage::user(&effective_message));
+        self.turn_count += 1;
+
+        // Tool-iteration loop, streaming each LLM call.
+        for _iteration in 0..self.max_tool_iterations {
+            self.callbacks.on_status("calling provider");
+
+            let request = ChatRequest {
+                system: self.system_prompt.as_deref(),
+                messages: &self.history,
+                tools: if self.tool_specs.is_empty() {
+                    None
+                } else {
+                    Some(self.tool_specs.as_slice())
+                },
+                max_tokens: self.max_tokens,
+                temperature: self.temperature,
+                thinking_level: self.thinking_level,
+            };
+            let mut rx = self.provider.chat_stream(request).await?;
+
+            let mut accumulated_text = String::new();
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            // (id, name, args_buffer) for the in-flight tool call.
+            let mut current_tool: Option<(String, String, String)> = None;
+
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    StreamEvent::Delta(text) => {
+                        accumulated_text.push_str(&text);
+                        self.callbacks.on_text_delta(&text);
+                    }
+                    StreamEvent::ToolCallStart { id, name } => {
+                        current_tool = Some((id, name, String::new()));
+                    }
+                    StreamEvent::ToolCallDelta {
+                        id: _,
+                        arguments_delta,
+                    } => {
+                        if let Some((_, _, ref mut buf)) = current_tool {
+                            buf.push_str(&arguments_delta);
+                        }
+                    }
+                    StreamEvent::ToolCallEnd { id: _ } => {
+                        if let Some((id, name, args)) = current_tool.take() {
+                            let arguments: serde_json::Value =
+                                serde_json::from_str(&args).unwrap_or_else(|_| {
+                                    serde_json::Value::Object(serde_json::Map::new())
+                                });
+                            tool_calls.push(ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            });
+                        }
+                    }
+                    StreamEvent::Done => break,
+                    StreamEvent::Error(e) => bail!("provider stream error: {e}"),
+                }
+            }
+
+            if tool_calls.is_empty() {
+                // Final assistant response.
+                self.history.push(ChatMessage::assistant(&accumulated_text));
+                self.callbacks.on_turn_complete(&accumulated_text);
+                return Ok(accumulated_text);
+            }
+
+            // Has tool calls — push the assistant message + tool
+            // results, then loop for the next provider call.
+            let mut assistant_msg = ChatMessage::assistant(&accumulated_text);
+            assistant_msg.tool_calls = Some(tool_calls.clone());
+            self.history.push(assistant_msg);
+
+            for tc in &tool_calls {
+                self.callbacks.on_tool_start(super::callbacks::ToolStart {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    preview: preview_for_args(&tc.arguments),
+                });
+                let started = std::time::Instant::now();
+                let (output, success) = self.execute_tool(&tc.name, &tc.arguments).await;
+                self.callbacks.on_tool_complete(super::callbacks::ToolComplete {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    error: if success { None } else { Some(output.clone()) },
+                    summary: Some(truncate_summary(&output)),
+                });
+                self.history
+                    .push(ChatMessage::tool_result(&tc.id, &output));
+            }
+        }
+
+        bail!(
+            "max tool iterations ({}) exceeded",
+            self.max_tool_iterations
+        )
+    }
+
     /// Record the final assistant text after a [`Self::turn_streamed`]
     /// receiver has drained, so the next turn sees it in history. Callers
     /// that drive `turn_streamed` must invoke this once the stream's

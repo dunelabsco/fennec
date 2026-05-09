@@ -921,9 +921,10 @@ async fn run_tui(
                 continue;
             }
 
-            // Plain text — run as an agent turn.
+            // Plain text — run as an agent turn (streaming, so
+            // text deltas + tool events surface live in the TUI).
             let mut agent_guard = submit_agent.lock().await;
-            let _ = agent_guard.turn(&prompt).await;
+            let _ = agent_guard.turn_streaming(&prompt).await;
         }
     });
 
@@ -1095,15 +1096,41 @@ fn apply_tui_event(
                 time: now,
                 body: prompt,
             });
+            guard.finalize_bot_message();
         }
         TuiEvent::TurnComplete(summary) => {
-            guard.chat.push(ChatLine::Bot {
-                time: now,
-                body: summary,
-            });
+            // If streaming was active, the in-flight bot message
+            // already contains the full text — just close it. If
+            // streaming wasn't used (e.g. the non-streaming
+            // `turn()` path), the bot reply hasn't been pushed
+            // yet, so push it now.
+            match guard.in_flight_bot_idx {
+                Some(_) => {
+                    guard.finalize_bot_message();
+                }
+                None if !summary.is_empty() => {
+                    guard.chat.push(ChatLine::Bot {
+                        time: now,
+                        body: summary,
+                    });
+                }
+                _ => {}
+            }
             guard.live_tool = None;
         }
+        TuiEvent::TextDelta(delta) => {
+            guard.append_bot_delta(&delta);
+        }
+        TuiEvent::ReasoningDelta(_delta) => {
+            // Reasoning rendering — F1-1 ships text streaming,
+            // reasoning-block rendering (the dim "thinking…" panel
+            // upstream shows above the reply) lands in F1-2.
+        }
         TuiEvent::ToolStart(s) => {
+            // A tool call breaks the streaming continuity — close
+            // the in-flight bot message so the next text delta
+            // (after the tool result) starts a fresh message.
+            guard.finalize_bot_message();
             guard.chat.push(ChatLine::ToolCall {
                 call: format!("{}({})", s.name, s.preview),
             });
@@ -1138,12 +1165,6 @@ fn apply_tui_event(
         }
         TuiEvent::Status(msg) => {
             guard.set_status(msg);
-        }
-        TuiEvent::TextDelta(_) | TuiEvent::ReasoningDelta(_) => {
-            // Streaming-text rendering hooks into the in-flight
-            // assistant message. Wired in the streaming-turn
-            // commit; for now the non-streaming `turn()` path
-            // adds the final message in `TurnComplete`.
         }
     }
 }
