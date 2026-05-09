@@ -32,11 +32,20 @@ pub struct SessionRecord {
 /// One persisted message inside a session — replayed into
 /// [`Agent::replace_history`] when `/resume` loads a prior
 /// conversation.
+///
+/// `tool_calls` is the JSON-encoded `Vec<ToolCall>` for
+/// assistant messages that requested tool invocations;
+/// `tool_call_id` is set on tool-result rows so they can be
+/// linked back to the originating call. Both are `None` for
+/// plain user/assistant text messages, which keeps the table
+/// small for non-tool turns.
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
     pub role: String,
     pub content: String,
     pub timestamp: String,
+    pub tool_calls: Option<String>,
+    pub tool_call_id: Option<String>,
 }
 
 /// SQLite-backed session store with FTS5 search.
@@ -90,7 +99,9 @@ impl SessionStore {
                 session_id TEXT NOT NULL REFERENCES sessions(id),
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
-                timestamp TEXT NOT NULL
+                timestamp TEXT NOT NULL,
+                tool_calls TEXT,
+                tool_call_id TEXT
             );
 
             -- Indexes for per-channel session lookup and for the
@@ -153,6 +164,44 @@ impl SessionStore {
                 .context("adding title column to sessions")?;
         }
 
+        // Migration: tool_calls + tool_call_id columns on
+        // session_messages. Existing dbs predate F1-1's
+        // tool-call replay support; this ALTER lets prior
+        // sessions co-exist with new ones (their tool messages
+        // just have NULL in both columns and replay as text-only,
+        // matching the F1-1 amendment's first-cut behavior).
+        let mut has_tool_calls_col = false;
+        let mut has_tool_call_id_col = false;
+        {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(session_messages)")
+                .context("preparing pragma table_info(session_messages)")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .context("querying table_info(session_messages)")?;
+            for r in rows {
+                match r?.as_str() {
+                    "tool_calls" => has_tool_calls_col = true,
+                    "tool_call_id" => has_tool_call_id_col = true,
+                    _ => {}
+                }
+            }
+        }
+        if !has_tool_calls_col {
+            conn.execute(
+                "ALTER TABLE session_messages ADD COLUMN tool_calls TEXT",
+                [],
+            )
+            .context("adding tool_calls column to session_messages")?;
+        }
+        if !has_tool_call_id_col {
+            conn.execute(
+                "ALTER TABLE session_messages ADD COLUMN tool_call_id TEXT",
+                [],
+            )
+            .context("adding tool_call_id column to session_messages")?;
+        }
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -176,19 +225,48 @@ impl SessionStore {
         .await?
     }
 
-    /// Add a message to an existing session.
+    /// Add a plain text message (no tool-call structure) to an
+    /// existing session. Convenience wrapper over
+    /// [`Self::add_message_full`] for callers that don't need
+    /// to persist tool_calls / tool_call_id.
     pub async fn add_message(&self, session_id: &str, role: &str, content: &str) -> Result<()> {
+        self.add_message_full(session_id, role, content, None, None).await
+    }
+
+    /// Add a message including optional tool-call structure.
+    /// Used by the TUI's per-turn persistence loop so resumed
+    /// sessions replay tool turns faithfully — assistant
+    /// messages keep their `tool_calls` array, tool-result
+    /// rows keep their `tool_call_id`.
+    pub async fn add_message_full(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tool_calls: Option<&str>,
+        tool_call_id: Option<&str>,
+    ) -> Result<()> {
         let conn = Arc::clone(&self.conn);
         let session_id = session_id.to_string();
         let role = role.to_string();
         let content = content.to_string();
+        let tool_calls = tool_calls.map(|s| s.to_string());
+        let tool_call_id = tool_call_id.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
             let now = chrono::Utc::now().to_rfc3339();
             let conn = conn.lock();
             conn.execute(
-                "INSERT INTO session_messages (session_id, role, content, timestamp)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![session_id, role, content, now],
+                "INSERT INTO session_messages
+                    (session_id, role, content, timestamp, tool_calls, tool_call_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    session_id,
+                    role,
+                    content,
+                    now,
+                    tool_calls,
+                    tool_call_id
+                ],
             )
             .context("inserting session message")?;
             Ok::<_, anyhow::Error>(())
@@ -372,7 +450,7 @@ impl SessionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT role, content, timestamp
+                "SELECT role, content, timestamp, tool_calls, tool_call_id
                  FROM session_messages
                  WHERE session_id = ?1
                  ORDER BY id ASC",
@@ -382,6 +460,8 @@ impl SessionStore {
                     role: row.get(0)?,
                     content: row.get(1)?,
                     timestamp: row.get(2)?,
+                    tool_calls: row.get(3)?,
+                    tool_call_id: row.get(4)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -503,6 +583,51 @@ mod tests {
         // Lookup by exact title string.
         let rec = store.get_session("alpha").await.unwrap().unwrap();
         assert_eq!(rec.id, sid);
+    }
+
+    #[tokio::test]
+    async fn add_message_full_round_trips_tool_call_structure() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        store.add_message(&sid, "user", "what's the weather?").await.unwrap();
+        // Assistant turn with a tool_calls array.
+        let tcs_json =
+            r#"[{"id":"call_1","name":"weather","arguments":{"city":"SF"}}]"#;
+        store
+            .add_message_full(&sid, "assistant", "", Some(tcs_json), None)
+            .await
+            .unwrap();
+        // Tool-result row referring to that id.
+        store
+            .add_message_full(
+                &sid,
+                "tool",
+                "{\"temp\": 64}",
+                None,
+                Some("call_1"),
+            )
+            .await
+            .unwrap();
+        store
+            .add_message(&sid, "assistant", "It's 64°F in SF.")
+            .await
+            .unwrap();
+
+        let msgs = store.get_session_messages(&sid).await.unwrap();
+        assert_eq!(msgs.len(), 4);
+        // The assistant tool-call message must come back with
+        // its tool_calls JSON intact.
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].tool_calls.as_deref(), Some(tcs_json));
+        // The tool result row must preserve tool_call_id.
+        assert_eq!(msgs[2].role, "tool");
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(msgs[2].content, "{\"temp\": 64}");
+        // Plain rows have None on both new fields.
+        assert!(msgs[0].tool_calls.is_none());
+        assert!(msgs[0].tool_call_id.is_none());
+        assert!(msgs[3].tool_calls.is_none());
+        assert!(msgs[3].tool_call_id.is_none());
     }
 
     #[tokio::test]

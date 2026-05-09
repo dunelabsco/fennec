@@ -1010,10 +1010,37 @@ async fn run_tui(
                 for msg in &appended {
                     let role = msg.role.as_str();
                     let content = msg.content.clone().unwrap_or_default();
-                    if content.is_empty() {
+                    let tool_calls_json = msg.tool_calls.as_ref().and_then(|tcs| {
+                        // Persist as JSON so resume can reconstruct
+                        // the structured ToolCall list. Skip on
+                        // empty array — no point recording "this
+                        // assistant turn requested zero tools."
+                        if tcs.is_empty() {
+                            None
+                        } else {
+                            serde_json::to_string(tcs).ok()
+                        }
+                    });
+                    // Empty content is fine for assistant messages
+                    // that ONLY contain tool_calls (no preamble
+                    // text), and for tool-result rows that
+                    // genuinely return empty output. Skip only
+                    // when there's literally nothing to record:
+                    // no content AND no tool structure.
+                    if content.is_empty() && tool_calls_json.is_none() && msg.tool_call_id.is_none()
+                    {
                         continue;
                     }
-                    if let Err(e) = store.add_message(&sid, role, &content).await {
+                    if let Err(e) = store
+                        .add_message_full(
+                            &sid,
+                            role,
+                            &content,
+                            tool_calls_json.as_deref(),
+                            msg.tool_call_id.as_deref(),
+                        )
+                        .await
+                    {
                         tracing::warn!("session store add_message failed: {e}");
                     }
                 }
@@ -1398,18 +1425,43 @@ async fn handle_session_resume(
         }
     };
 
-    // Translate stored messages back into ChatMessage form. Tool
-    // calls aren't persisted in the messages table today (only
-    // role + text content) so we faithfully replay text-only
-    // turns; tool-call replay would require a richer schema.
-    use fennec::providers::traits::ChatMessage;
+    // Translate stored messages back into full ChatMessage
+    // form, including the tool-call structure. Assistant rows
+    // with persisted tool_calls JSON re-attach the parsed
+    // Vec<ToolCall>; tool-result rows preserve their
+    // tool_call_id so the provider can match them back to the
+    // originating call. Rows that fail to deserialise (corrupt
+    // JSON from a hand-edited db) fall back to text-only
+    // replay rather than dropping the message entirely.
+    use fennec::providers::traits::{ChatMessage, ToolCall};
     let chat_messages: Vec<ChatMessage> = messages
         .iter()
         .filter_map(|m| match m.role.as_str() {
             "user" => Some(ChatMessage::user(&m.content)),
-            "assistant" => Some(ChatMessage::assistant(&m.content)),
+            "assistant" => {
+                let mut msg = ChatMessage::assistant(&m.content);
+                if let Some(json) = m.tool_calls.as_deref() {
+                    match serde_json::from_str::<Vec<ToolCall>>(json) {
+                        Ok(tcs) if !tcs.is_empty() => msg.tool_calls = Some(tcs),
+                        Ok(_) => {} // empty array — leave as text-only
+                        Err(e) => tracing::warn!(
+                            "could not parse persisted tool_calls JSON for resumed assistant message: {e}"
+                        ),
+                    }
+                }
+                Some(msg)
+            }
+            "tool" => {
+                // Tool result rows. Preserve the tool_call_id so
+                // the provider serializer can match the result
+                // back to the assistant's tool_calls entry — a
+                // mismatched id makes the next turn's request
+                // bail on the API side.
+                let id = m.tool_call_id.as_deref().unwrap_or("");
+                Some(ChatMessage::tool_result(id, &m.content))
+            }
             "system" => Some(ChatMessage::system(&m.content)),
-            _ => None, // skip tool / tool_result roles for now
+            _ => None,
         })
         .collect();
     let count = chat_messages.len();
