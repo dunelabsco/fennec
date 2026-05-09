@@ -858,9 +858,12 @@ async fn run_tui(
     let mut app = App::new();
     app.current_session_id = current_session_id.clone();
     app.skills_dir = Some(home_dir.join("skills"));
-    // Hydrate persisted TUI display toggles. /details enum
-    // wiring comes in the next commit; /compact applies now.
+    // Hydrate persisted TUI display toggles so user choices
+    // survive across runs.
     app.compact_mode = config.tui.compact;
+    if let Some(mode) = fennec::tui::app::DetailsMode::parse(&config.tui.details) {
+        app.details_mode = mode;
+    }
     // Current TUI session pinned to the top.
     app.sessions.push(SessionRow {
         code: "$ ".into(),
@@ -1670,11 +1673,7 @@ fn handle_persist_tui_settings(
 ) {
     let (compact, details) = {
         let g = app.lock();
-        // `/details` lands its own enum next; for the /compact
-        // commit we just round-trip whatever value is already
-        // in config (preserving prior runs' setting) so the
-        // /details persistence pipe is in place.
-        (g.compact_mode, config.tui.details.clone())
+        (g.compact_mode, g.details_mode.as_str().to_string())
     };
     let mut persisted = config.clone();
     persisted.tui.compact = compact;

@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::app::{App, ChannelConnState, ChatLine, Focus, SessionRow};
+use super::app::{App, ChannelConnState, ChatLine, DetailsMode, Focus, SessionRow};
 use super::theme::*;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -285,36 +285,87 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                     Span::styled(body.clone(), Style::default().fg(TEXT_CREAM)),
                 ]));
             }
-            ChatLine::ToolCall { call } => {
-                lines.push(Line::from(vec![
-                    Span::styled("    ▸ ", Style::default().fg(TOOL_PINK)),
-                    Span::styled(
-                        "tool",
-                        Style::default().fg(TOOL_PINK).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(" · ", Style::default().fg(SUBDUED)),
-                    Span::styled(call.clone(), Style::default().fg(TOOL_PINK)),
-                ]));
-            }
-            ChatLine::ToolResult { summary } => {
-                lines.push(Line::from(vec![
-                    Span::styled("    ↳ ", Style::default().fg(SUBDUED)),
-                    Span::styled(summary.clone(), Style::default().fg(SUBDUED)),
-                ]));
-            }
-            ChatLine::ToolRunning { label, started_at } => {
-                let elapsed = started_at.elapsed().as_millis();
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("    {} ", app.spinner_glyph()),
-                        Style::default().fg(TOOL_PINK),
-                    ),
-                    Span::styled(
-                        format!("{label} ({elapsed}ms)"),
-                        Style::default().fg(TOOL_PINK).add_modifier(Modifier::DIM),
-                    ),
-                ]));
-            }
+            ChatLine::ToolCall { call } => match app.details_mode {
+                DetailsMode::Hidden => {
+                    // Skip entirely.
+                }
+                DetailsMode::Collapsed => {
+                    // Header only — drop the args portion (the
+                    // text after "name(...)") so a long path or
+                    // SQL string doesn't wrap. We split at the
+                    // first '(' to extract the bare tool name.
+                    let bare = call
+                        .split_once('(')
+                        .map(|(name, _rest)| name)
+                        .unwrap_or(call.as_str());
+                    lines.push(Line::from(vec![
+                        Span::styled("    ▸ ", Style::default().fg(TOOL_PINK)),
+                        Span::styled(
+                            "tool",
+                            Style::default()
+                                .fg(TOOL_PINK)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" · ", Style::default().fg(SUBDUED)),
+                        Span::styled(
+                            bare.to_string(),
+                            Style::default().fg(TOOL_PINK),
+                        ),
+                    ]));
+                }
+                DetailsMode::Expanded => {
+                    lines.push(Line::from(vec![
+                        Span::styled("    ▸ ", Style::default().fg(TOOL_PINK)),
+                        Span::styled(
+                            "tool",
+                            Style::default()
+                                .fg(TOOL_PINK)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" · ", Style::default().fg(SUBDUED)),
+                        Span::styled(call.clone(), Style::default().fg(TOOL_PINK)),
+                    ]));
+                }
+            },
+            ChatLine::ToolResult { summary } => match app.details_mode {
+                DetailsMode::Hidden | DetailsMode::Collapsed => {
+                    // Hidden: skip. Collapsed: skip too (the
+                    // header in the matching ToolCall row is
+                    // enough; the result body is the "detail"
+                    // we're collapsing).
+                }
+                DetailsMode::Expanded => {
+                    lines.push(Line::from(vec![
+                        Span::styled("    ↳ ", Style::default().fg(SUBDUED)),
+                        Span::styled(
+                            summary.clone(),
+                            Style::default().fg(SUBDUED),
+                        ),
+                    ]));
+                }
+            },
+            ChatLine::ToolRunning { label, started_at } => match app.details_mode {
+                DetailsMode::Hidden => {
+                    // Skip the live spinner too; the right
+                    // panel still shows it for situational
+                    // awareness.
+                }
+                _ => {
+                    let elapsed = started_at.elapsed().as_millis();
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("    {} ", app.spinner_glyph()),
+                            Style::default().fg(TOOL_PINK),
+                        ),
+                        Span::styled(
+                            format!("{label} ({elapsed}ms)"),
+                            Style::default()
+                                .fg(TOOL_PINK)
+                                .add_modifier(Modifier::DIM),
+                        ),
+                    ]));
+                }
+            },
         }
         // Spacer between entries — only in non-compact mode.
         // Compact view drops the blank rows so more turns fit

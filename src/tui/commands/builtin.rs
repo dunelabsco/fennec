@@ -274,15 +274,32 @@ impl CommandHandler for Details {
         "details"
     }
     fn help(&self) -> &'static str {
-        "toggle thinking / tool detail visibility"
+        "set tool / reasoning detail visibility (hidden|collapsed|expanded)"
     }
     fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
-        let want = parse_toggle(args, app.details_visible);
-        app.details_visible = want;
-        Ok(CommandOutcome::Status(format!(
-            "details: {}",
-            if want { "shown" } else { "hidden" }
-        )))
+        use crate::tui::app::DetailsMode;
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            // Cycle through the three modes — gives users a
+            // single-keystroke toggle without remembering the
+            // mode names.
+            app.details_mode = match app.details_mode {
+                DetailsMode::Expanded => DetailsMode::Collapsed,
+                DetailsMode::Collapsed => DetailsMode::Hidden,
+                DetailsMode::Hidden => DetailsMode::Expanded,
+            };
+        } else {
+            match DetailsMode::parse(trimmed) {
+                Some(m) => app.details_mode = m,
+                None => {
+                    return Ok(CommandOutcome::Status(format!(
+                        "details: unknown mode '{trimmed}' (expected hidden/collapsed/expanded)"
+                    )));
+                }
+            }
+        }
+        push_system(app, format!("details: {}", app.details_mode.as_str()));
+        Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
     }
 }
 
@@ -924,6 +941,59 @@ mod tests {
         assert!(app.compact_mode);
         r.dispatch("compact", "off", &mut app).unwrap();
         assert!(!app.compact_mode);
+    }
+
+    #[test]
+    fn details_no_arg_cycles_through_modes() {
+        use crate::tui::app::DetailsMode;
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        // Default is Expanded.
+        assert_eq!(app.details_mode, DetailsMode::Expanded);
+        r.dispatch("details", "", &mut app).unwrap();
+        assert_eq!(app.details_mode, DetailsMode::Collapsed);
+        r.dispatch("details", "", &mut app).unwrap();
+        assert_eq!(app.details_mode, DetailsMode::Hidden);
+        r.dispatch("details", "", &mut app).unwrap();
+        assert_eq!(app.details_mode, DetailsMode::Expanded);
+    }
+
+    #[test]
+    fn details_with_arg_sets_explicit_mode() {
+        use crate::tui::app::DetailsMode;
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("details", "hidden", &mut app).unwrap();
+        assert_eq!(app.details_mode, DetailsMode::Hidden);
+        r.dispatch("details", "expanded", &mut app).unwrap();
+        assert_eq!(app.details_mode, DetailsMode::Expanded);
+    }
+
+    #[test]
+    fn details_with_unknown_arg_returns_status_and_does_not_change_state() {
+        use crate::tui::app::DetailsMode;
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        let initial = app.details_mode;
+        let outcome = r.dispatch("details", "loud", &mut app).unwrap();
+        match outcome {
+            CommandOutcome::Status(s) => {
+                assert!(s.contains("unknown mode"), "got: {s}")
+            }
+            other => panic!("expected Status, got {:?}", other),
+        }
+        // Untouched on parse failure.
+        assert_eq!(app.details_mode, initial);
+        assert_eq!(initial, DetailsMode::Expanded);
+    }
+
+    #[test]
+    fn details_emits_persist_action_on_change() {
+        let (outcome, _app) = dispatch("details", "collapsed");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::PersistTuiSettings) => {}
+            other => panic!("expected PersistTuiSettings, got {:?}", other),
+        }
     }
 
     #[test]

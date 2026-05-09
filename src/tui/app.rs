@@ -101,6 +101,46 @@ pub enum Focus {
     Input,
 }
 
+/// Visibility mode for inline tool blocks (and, once F1-2 lands
+/// reasoning rendering, thinking blocks). Settable via
+/// `/details hidden|collapsed|expanded`. Default is `Expanded`,
+/// matching the F1-1 renderer's existing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DetailsMode {
+    /// Skip tool/reasoning blocks entirely.
+    Hidden,
+    /// Show only the header (`▸ tool · name`) without args /
+    /// result body / spinner.
+    Collapsed,
+    /// Show everything (current F1-1 behavior).
+    #[default]
+    Expanded,
+}
+
+impl DetailsMode {
+    /// Parse a string the user typed at the command line.
+    /// Returns `None` for unknown values so callers can surface
+    /// "unknown mode" error rather than silently defaulting.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "hidden" | "off" | "h" => Some(DetailsMode::Hidden),
+            "collapsed" | "c" => Some(DetailsMode::Collapsed),
+            "expanded" | "on" | "full" | "e" => Some(DetailsMode::Expanded),
+            _ => None,
+        }
+    }
+
+    /// Inverse of `parse` — used for config.toml persistence
+    /// and `/details` (no arg) read-back.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DetailsMode::Hidden => "hidden",
+            DetailsMode::Collapsed => "collapsed",
+            DetailsMode::Expanded => "expanded",
+        }
+    }
+}
+
 /// Per-input editor state — multi-line buffer with cursor,
 /// undo/redo stack, and history navigation.
 ///
@@ -492,9 +532,15 @@ pub struct App {
     /// `/compact` toggle — hides metadata + blank lines in the
     /// chat panel for tighter rendering.
     pub compact_mode: bool,
-    /// `/details` toggle — hides thinking blocks + tool detail
-    /// expansions when off.
-    pub details_visible: bool,
+    /// `/details` mode — controls visibility of inline tool
+    /// details (call args, running spinner, result summary) and
+    /// reasoning blocks when those land in F1-2. Three settings
+    /// matching Hermes (`ui-tui/src/app/slash/commands/ops.ts`):
+    ///   - Hidden: skip tool blocks entirely
+    ///   - Collapsed: render only `▸ tool · name` (no args / no
+    ///     result body)
+    ///   - Expanded: full detail (current F1-1 behavior)
+    pub details_mode: DetailsMode,
     /// `/mouse` toggle — drives crossterm's mouse-tracking
     /// enable/disable on the next frame. Off by default to avoid
     /// stealing the user's terminal-native scroll wheel.
@@ -542,7 +588,7 @@ impl App {
             transient_status: None,
             should_quit: false,
             compact_mode: false,
-            details_visible: true,
+            details_mode: DetailsMode::Expanded,
             mouse_enabled: false,
             in_flight_bot_idx: None,
             voice: super::voice::VoiceController::new(),
@@ -751,6 +797,42 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn details_mode_parses_known_aliases() {
+        assert_eq!(DetailsMode::parse("hidden"), Some(DetailsMode::Hidden));
+        assert_eq!(DetailsMode::parse("h"), Some(DetailsMode::Hidden));
+        assert_eq!(DetailsMode::parse("off"), Some(DetailsMode::Hidden));
+        assert_eq!(
+            DetailsMode::parse("collapsed"),
+            Some(DetailsMode::Collapsed)
+        );
+        assert_eq!(DetailsMode::parse("c"), Some(DetailsMode::Collapsed));
+        assert_eq!(
+            DetailsMode::parse("expanded"),
+            Some(DetailsMode::Expanded)
+        );
+        assert_eq!(DetailsMode::parse("on"), Some(DetailsMode::Expanded));
+        assert_eq!(DetailsMode::parse("FULL"), Some(DetailsMode::Expanded));
+    }
+
+    #[test]
+    fn details_mode_parse_returns_none_for_unknown() {
+        assert!(DetailsMode::parse("foobar").is_none());
+        assert!(DetailsMode::parse("").is_none());
+    }
+
+    #[test]
+    fn details_mode_round_trips_via_as_str() {
+        for m in [DetailsMode::Hidden, DetailsMode::Collapsed, DetailsMode::Expanded] {
+            let serialized = m.as_str();
+            assert_eq!(
+                DetailsMode::parse(serialized),
+                Some(m),
+                "{serialized} did not round-trip"
+            );
+        }
+    }
 
     #[test]
     fn input_state_starts_empty() {
