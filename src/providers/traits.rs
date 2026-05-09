@@ -39,6 +39,26 @@ pub struct ChatMessage {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub tool_call_id: Option<String>,
+    /// Image attachments that should be sent inline with this
+    /// message. Populated by `/image` and `/paste` for the next
+    /// user turn; provider impls translate them into
+    /// provider-specific image content blocks. `None` keeps the
+    /// message as text-only (the common case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<ImageAttachmentRef>>,
+}
+
+/// Provider-agnostic image payload carried on a `ChatMessage`.
+/// `base64_data` is pre-encoded; `mime_type` is the MIME the
+/// provider-side serialiser should declare.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageAttachmentRef {
+    pub mime_type: String,
+    pub base64_data: String,
+    /// Optional source-path display name for the chat (`/image`
+    /// confirmation message uses this).
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 impl ChatMessage {
@@ -49,6 +69,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
         }
     }
 
@@ -59,6 +80,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
         }
     }
 
@@ -69,6 +91,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
         }
     }
 
@@ -79,6 +102,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            attachments: None,
         }
     }
 }

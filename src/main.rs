@@ -1275,6 +1275,9 @@ async fn handle_command_outcome(
             AgentAction::ReloadMcp => {
                 handle_reload_mcp(app);
             }
+            AgentAction::AttachImage(path) => {
+                handle_attach_image(path, app, agent).await;
+            }
         },
     }
 }
@@ -1638,6 +1641,44 @@ fn handle_reload_env(
     let mut g = app.lock();
     g.chat.push(fennec::tui::app::ChatLine::System {
         time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body,
+    });
+}
+
+/// `/image` worker — load + base64-encode the file, queue it
+/// on the agent for the next user turn, and echo metadata back
+/// to the chat (filename, dimensions, token estimate). Mirrors
+/// Hermes' image.attach RPC (`tui_gateway/server.py:3361-3401`).
+async fn handle_attach_image(
+    path: std::path::PathBuf,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let body = {
+        let mut guard = agent.lock().await;
+        match guard.attach_image(&path) {
+            Ok(att) => {
+                let queued = guard.pending_attachment_count();
+                let dims = match (att.width, att.height) {
+                    (Some(w), Some(h)) => format!("{w}×{h}"),
+                    _ => "?".to_string(),
+                };
+                let tokens = att
+                    .token_estimate
+                    .map(|t| format!("{t} tokens"))
+                    .unwrap_or_else(|| "size unknown".to_string());
+                format!(
+                    "📎 attached: {name} · {dims} · ~{tokens} · {queued} pending",
+                    name = att.display_name,
+                )
+            }
+            Err(e) => format!("attach failed: {e}"),
+        }
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: now,
         body,
     });
 }

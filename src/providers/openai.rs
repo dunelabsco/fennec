@@ -95,11 +95,37 @@ impl OpenAIProvider {
                     }));
                 }
                 _ => {
-                    // "system", "user", etc.
-                    api_messages.push(json!({
-                        "role": msg.role,
-                        "content": msg.content.as_deref().unwrap_or("")
-                    }));
+                    // "system", "user", etc. If image attachments
+                    // are queued for this turn, serialise as the
+                    // multi-part content form: array of
+                    // {type: text, text} + {type: image_url,
+                    // image_url: {url: data:<mime>;base64,<data>}}.
+                    let text = msg.content.as_deref().unwrap_or("");
+                    if let Some(ref atts) = msg.attachments {
+                        let mut parts = Vec::with_capacity(atts.len() + 1);
+                        if !text.is_empty() {
+                            parts.push(json!({"type": "text", "text": text}));
+                        }
+                        for a in atts {
+                            let url = format!(
+                                "data:{};base64,{}",
+                                a.mime_type, a.base64_data
+                            );
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": {"url": url},
+                            }));
+                        }
+                        api_messages.push(json!({
+                            "role": msg.role,
+                            "content": parts,
+                        }));
+                    } else {
+                        api_messages.push(json!({
+                            "role": msg.role,
+                            "content": text,
+                        }));
+                    }
                 }
             }
         }

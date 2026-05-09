@@ -64,6 +64,12 @@ pub struct Agent {
     /// but are filtered out of `tool_specs` shown to the model
     /// and rejected at dispatch time.
     disabled_tools: HashSet<String>,
+    /// Image attachments queued by `/image` and `/paste` for
+    /// the next user turn. Drained at the top of `turn` /
+    /// `turn_streaming` and attached to the outbound user
+    /// `ChatMessage`. Mirrors Hermes'
+    /// `session["attached_images"]` (`tui_gateway/server.py:3361-3401`).
+    pending_attachments: Vec<super::attachment::ImageAttachment>,
     memory: Arc<dyn Memory>,
     prompt_builder: SystemPromptBuilder,
     max_tool_iterations: usize,
@@ -178,8 +184,12 @@ impl Agent {
             user_message.to_string()
         };
 
-        // Push user message to history.
-        self.history.push(ChatMessage::user(&effective_message));
+        // Push user message to history, attaching any images
+        // queued via /image or /paste so the provider can send
+        // them inline with this turn's prompt.
+        let mut user_msg = ChatMessage::user(&effective_message);
+        user_msg.attachments = self.take_pending_attachments_for_turn();
+        self.history.push(user_msg);
 
         self.turn_count += 1;
         let turn_start = std::time::Instant::now();
@@ -349,8 +359,12 @@ impl Agent {
             user_message.to_string()
         };
 
-        // Push user message to history.
-        self.history.push(ChatMessage::user(&effective_message));
+        // Push user message to history, attaching any images
+        // queued via /image or /paste so the provider can send
+        // them inline with this turn's prompt.
+        let mut user_msg = ChatMessage::user(&effective_message);
+        user_msg.attachments = self.take_pending_attachments_for_turn();
+        self.history.push(user_msg);
 
         // Get streaming receiver from provider.
         let system = self.system_prompt.as_deref();
@@ -832,6 +846,54 @@ impl Agent {
         v
     }
 
+    /// Queue an image for the next user turn. The bytes are
+    /// loaded + base64-encoded eagerly so the next provider
+    /// call doesn't pay disk I/O. Returns the attachment so
+    /// `/image` can echo dimensions + token estimate to the
+    /// user.
+    pub fn attach_image(
+        &mut self,
+        path: &std::path::Path,
+    ) -> anyhow::Result<super::attachment::ImageAttachment> {
+        let attached = super::attachment::ImageAttachment::from_path(path)?;
+        self.pending_attachments.push(attached.clone());
+        Ok(attached)
+    }
+
+    /// Number of attachments queued for the next turn. Powers
+    /// `/usage`-style "X images attached" hints in the UI.
+    pub fn pending_attachment_count(&self) -> usize {
+        self.pending_attachments.len()
+    }
+
+    /// Drop all queued attachments without consuming them. Used
+    /// by `/clear` and similar commands that reset turn state.
+    pub fn clear_pending_attachments(&mut self) {
+        self.pending_attachments.clear();
+    }
+
+    /// Internal: drain queued attachments into the
+    /// provider-facing form, used at the top of `turn` /
+    /// `turn_streaming` to attach them to the outbound user
+    /// message.
+    fn take_pending_attachments_for_turn(
+        &mut self,
+    ) -> Option<Vec<crate::providers::traits::ImageAttachmentRef>> {
+        if self.pending_attachments.is_empty() {
+            return None;
+        }
+        let drained = std::mem::take(&mut self.pending_attachments);
+        let refs: Vec<_> = drained
+            .into_iter()
+            .map(|a| crate::providers::traits::ImageAttachmentRef {
+                mime_type: a.mime_type,
+                base64_data: a.base64_data,
+                display_name: Some(a.display_name),
+            })
+            .collect();
+        Some(refs)
+    }
+
     /// Subset of `tool_specs` actually advertised to the model
     /// — disabled entries are filtered out so the LLM doesn't
     /// see them as available.
@@ -1006,6 +1068,7 @@ impl AgentBuilder {
             tools: self.tools,
             tool_specs,
             disabled_tools: HashSet::new(),
+            pending_attachments: Vec::new(),
             memory,
             prompt_builder,
             max_tool_iterations: self.max_tool_iterations.unwrap_or(15),

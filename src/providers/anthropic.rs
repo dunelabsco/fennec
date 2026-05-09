@@ -134,11 +134,38 @@ impl AnthropicProvider {
                     }));
                 }
                 _ => {
-                    // "user" and anything else.
-                    api_messages.push(json!({
-                        "role": msg.role,
-                        "content": msg.content.as_deref().unwrap_or("")
-                    }));
+                    // "user" and anything else. If there are
+                    // image attachments queued for this turn,
+                    // serialise them as image blocks alongside
+                    // the text. Anthropic expects each image as
+                    // {type: image, source: {type: base64,
+                    // media_type, data}}.
+                    let text = msg.content.as_deref().unwrap_or("");
+                    if let Some(ref atts) = msg.attachments {
+                        let mut blocks = Vec::with_capacity(atts.len() + 1);
+                        if !text.is_empty() {
+                            blocks.push(json!({"type": "text", "text": text}));
+                        }
+                        for a in atts {
+                            blocks.push(json!({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": a.mime_type,
+                                    "data": a.base64_data,
+                                }
+                            }));
+                        }
+                        api_messages.push(json!({
+                            "role": msg.role,
+                            "content": blocks,
+                        }));
+                    } else {
+                        api_messages.push(json!({
+                            "role": msg.role,
+                            "content": text,
+                        }));
+                    }
                 }
             }
         }

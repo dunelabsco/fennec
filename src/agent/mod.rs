@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod attachment;
 pub mod callbacks;
 pub mod compressor;
 pub mod context;

@@ -624,20 +624,23 @@ impl CommandHandler for Image {
     fn help(&self) -> &'static str {
         "attach an image to the next message"
     }
-    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
         let path = args.trim();
         if path.is_empty() {
-            push_system(app, "image needs a file path. usage: /image <path>".into());
-            return Ok(CommandOutcome::Status("missing arg".into()));
+            return Ok(CommandOutcome::Status(
+                "usage: /image <path>".into(),
+            ));
         }
-        push_system(
-            app,
-            format!(
-                "image attach for {} — wiring to the vision tool's attachments path lands in F1-2.",
-                path
-            ),
-        );
-        Ok(CommandOutcome::Status("noted".into()))
+        // Expand a leading `~` so users typing `/image ~/Pictures/foo.png`
+        // hit the right file. Anything else is passed through verbatim.
+        let expanded = if let Some(rest) = path.strip_prefix("~/") {
+            dirs::home_dir()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| std::path::PathBuf::from(path))
+        } else {
+            std::path::PathBuf::from(path)
+        };
+        Ok(CommandOutcome::Agent(AgentAction::AttachImage(expanded)))
     }
 }
 

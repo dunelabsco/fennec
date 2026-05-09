@@ -70,6 +70,11 @@ pub enum AgentAction {
     /// surfaces an honest "not yet wired" status instead of a
     /// silent no-op.
     ReloadMcp,
+    /// Attach an image at the given path to the next user
+    /// turn. The file is read + base64-encoded immediately so
+    /// `/image` can return dimensions + token estimate;
+    /// providers serialise it inline on the next turn.
+    AttachImage(std::path::PathBuf),
 }
 
 /// Outcome of running a slash command. Drives the TUI's response
