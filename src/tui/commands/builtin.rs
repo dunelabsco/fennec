@@ -529,15 +529,148 @@ impl CommandHandler for Skills {
         "skills"
     }
     fn help(&self) -> &'static str {
-        "browse / inspect skills"
+        "list / search / inspect installed skills"
     }
-    fn execute(&self, _args: &str, app: &mut App) -> Result<CommandOutcome> {
-        push_system(
-            app,
-            "skills browser overlay lands in F1-2. Skills are loaded at startup; check the agent's system prompt for the active set.".into(),
-        );
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let trimmed = args.trim();
+        let skills_dir = match app.skills_dir.clone() {
+            Some(d) => d,
+            None => {
+                return Ok(CommandOutcome::Status(
+                    "skills directory not configured (no home dir)".into(),
+                ));
+            }
+        };
+
+        let skills = match crate::skills::SkillsLoader::load_from_directory(&skills_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                push_system(app, format!("skills load failed: {e}"));
+                return Ok(CommandOutcome::Status("error".into()));
+            }
+        };
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let verb = parts.next().unwrap_or("").to_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match verb.as_str() {
+            "" | "list" => {
+                if skills.is_empty() {
+                    push_system(
+                        app,
+                        format!(
+                            "no skills installed at {}. Drop a Markdown file with YAML frontmatter (name, description) to add one.",
+                            skills_dir.display()
+                        ),
+                    );
+                } else {
+                    let mut body = format!("Skills ({} installed)\n", skills.len());
+                    for s in &skills {
+                        body.push_str(&format!(
+                            "  · {}{}\n      {}\n",
+                            s.name,
+                            if s.always { " (always)" } else { "" },
+                            truncate_inline(&s.description, 100),
+                        ));
+                    }
+                    body.push_str("\nUse /skills inspect <name> for full details, /skills search <q> to filter.");
+                    push_system(app, body.trim_end().to_string());
+                }
+            }
+            "search" => {
+                if rest.is_empty() {
+                    return Ok(CommandOutcome::Status(
+                        "usage: /skills search <query>".into(),
+                    ));
+                }
+                let q = rest.to_lowercase();
+                let hits: Vec<&crate::skills::Skill> = skills
+                    .iter()
+                    .filter(|s| {
+                        s.name.to_lowercase().contains(&q)
+                            || s.description.to_lowercase().contains(&q)
+                    })
+                    .collect();
+                if hits.is_empty() {
+                    push_system(app, format!("no skills match: {rest}"));
+                } else {
+                    let mut body =
+                        format!("Skills matching '{rest}' ({} hit(s))\n", hits.len());
+                    for s in &hits {
+                        body.push_str(&format!(
+                            "  · {}\n      {}\n",
+                            s.name,
+                            truncate_inline(&s.description, 100),
+                        ));
+                    }
+                    push_system(app, body.trim_end().to_string());
+                }
+            }
+            "inspect" => {
+                if rest.is_empty() {
+                    return Ok(CommandOutcome::Status(
+                        "usage: /skills inspect <name>".into(),
+                    ));
+                }
+                let needle = rest.to_lowercase();
+                match skills.iter().find(|s| s.name.to_lowercase() == needle) {
+                    Some(s) => {
+                        let mut body = format!("Skill: {}\n", s.name);
+                        body.push_str(&format!("Always-on: {}\n", s.always));
+                        if !s.requirements.is_empty() {
+                            body.push_str(&format!(
+                                "Requirements: {}\n",
+                                s.requirements.join(", ")
+                            ));
+                        }
+                        body.push_str(&format!("\n{}\n\n", s.description));
+                        // Snippet of body content so the user sees what's
+                        // actually injected without needing to open the
+                        // file.
+                        let snippet = truncate_inline(&s.content, 800);
+                        body.push_str("---\n");
+                        body.push_str(&snippet);
+                        push_system(app, body.trim_end().to_string());
+                    }
+                    None => {
+                        push_system(app, format!("unknown skill: {rest}"));
+                    }
+                }
+            }
+            "install" | "browse" => {
+                push_system(
+                    app,
+                    format!(
+                        "/skills {verb}: routes through the skills hub (multi-source registry — \
+                         GitHub / well-known / URL / community). The hub adapter set lands in \
+                         a separate skills-hub PR; until then drop a Markdown file in {} to \
+                         install manually.",
+                        skills_dir.display()
+                    ),
+                );
+            }
+            other => {
+                return Ok(CommandOutcome::Status(format!(
+                    "/skills: unknown verb '{other}' (expected list/search/inspect/install/browse)"
+                )));
+            }
+        }
         Ok(CommandOutcome::Status("ok".into()))
     }
+}
+
+/// Truncate to `max` chars with an ellipsis. Used by /skills
+/// rendering — descriptions / content are often multi-line so
+/// we collapse newlines first.
+fn truncate_inline(s: &str, max: usize) -> String {
+    let single: String = s.replace('\n', " ").chars().collect();
+    if single.chars().count() <= max {
+        return single;
+    }
+    let mut out: String = single.chars().take(max - 1).collect();
+    out.push('…');
+    out
 }
 
 struct Tools;
@@ -807,6 +940,115 @@ mod tests {
             }
             other => panic!("expected Steer action, got {:?}", other),
         }
+    }
+
+    fn dispatch_with_skills_dir(
+        name: &str,
+        args: &str,
+        skills_dir: &std::path::Path,
+    ) -> (CommandOutcome, App) {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        app.skills_dir = Some(skills_dir.to_path_buf());
+        let outcome = r.dispatch(name, args, &mut app).unwrap();
+        (outcome, app)
+    }
+
+    fn write_skill(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::write(dir.join(format!("{name}.md")), body).unwrap();
+    }
+
+    fn skill_md(name: &str, description: &str) -> String {
+        format!(
+            "---\nname: {name}\ndescription: {description}\nalways: false\n---\n# {name}\n\nbody for {name}\n"
+        )
+    }
+
+    #[test]
+    fn skills_list_with_no_dir_returns_status() {
+        let (outcome, _app) = dispatch("skills", "");
+        match outcome {
+            CommandOutcome::Status(s) => assert!(s.contains("not configured"), "got: {s}"),
+            other => panic!("expected Status, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn skills_list_renders_loaded_skills() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_skill(dir.path(), "alpha", &skill_md("alpha", "alpha description"));
+        write_skill(dir.path(), "beta", &skill_md("beta", "beta description"));
+        let (_o, app) = dispatch_with_skills_dir("skills", "", dir.path());
+        let body = app
+            .chat
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                ChatLine::System { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .expect("expected a system line");
+        assert!(body.contains("alpha"), "{body}");
+        assert!(body.contains("beta"), "{body}");
+        assert!(body.contains("alpha description"), "{body}");
+    }
+
+    #[test]
+    fn skills_search_filters_by_substring() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_skill(dir.path(), "git-commit", &skill_md("git-commit", "Commit hygiene helpers"));
+        write_skill(dir.path(), "weather", &skill_md("weather", "Forecast lookup"));
+        let (_o, app) = dispatch_with_skills_dir("skills", "search hygiene", dir.path());
+        let body = app
+            .chat
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                ChatLine::System { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(body.contains("git-commit"), "{body}");
+        assert!(!body.contains("weather"), "{body}");
+    }
+
+    #[test]
+    fn skills_inspect_shows_full_details() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_skill(
+            dir.path(),
+            "deploy",
+            &skill_md("deploy", "Deployment runbook"),
+        );
+        let (_o, app) = dispatch_with_skills_dir("skills", "inspect deploy", dir.path());
+        let body = app
+            .chat
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                ChatLine::System { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(body.starts_with("Skill: deploy"), "{body}");
+        assert!(body.contains("Deployment runbook"), "{body}");
+        assert!(body.contains("body for deploy"), "{body}");
+    }
+
+    #[test]
+    fn skills_install_points_at_skills_hub_pr() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_o, app) = dispatch_with_skills_dir("skills", "install foo", dir.path());
+        let body = app
+            .chat
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                ChatLine::System { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(body.contains("skills hub"), "{body}");
     }
 
     #[test]

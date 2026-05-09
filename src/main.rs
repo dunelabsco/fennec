@@ -857,6 +857,7 @@ async fn run_tui(
 
     let mut app = App::new();
     app.current_session_id = current_session_id.clone();
+    app.skills_dir = Some(home_dir.join("skills"));
     // Current TUI session pinned to the top.
     app.sessions.push(SessionRow {
         code: "$ ".into(),

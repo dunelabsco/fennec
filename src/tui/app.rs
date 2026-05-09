@@ -519,6 +519,10 @@ pub struct App {
     /// `App` so the chat header can show it without re-querying
     /// the store every frame.
     pub current_session_title: Option<String>,
+    /// Filesystem location of `~/.fennec/skills/` (or override).
+    /// `/skills` reads this lazily via SkillsLoader so the user
+    /// sees a fresh list every time without a config reload.
+    pub skills_dir: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -544,6 +548,7 @@ impl App {
             voice: super::voice::VoiceController::new(),
             current_session_id: None,
             current_session_title: None,
+            skills_dir: None,
         }
     }
 
