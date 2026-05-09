@@ -60,6 +60,16 @@ pub enum AgentAction {
     /// alongside the toggle in the submit loop, matching Hermes'
     /// tools.configure (server.py:6213-6280).
     ToolsToggle(Option<(bool, Vec<String>)>),
+    /// Re-read `~/.fennec/.env` into the running process so
+    /// changed env-only credentials (API keys, base URLs) take
+    /// effect on the next provider call. Mirrors Hermes' reload.env.
+    ReloadEnv,
+    /// Rescan MCP servers configured for the running session.
+    /// Hermes' reload.mcp shuts down + rediscovers; Fennec's
+    /// agent doesn't currently boot any MCP clients, so this
+    /// surfaces an honest "not yet wired" status instead of a
+    /// silent no-op.
+    ReloadMcp,
 }
 
 /// Outcome of running a slash command. Drives the TUI's response

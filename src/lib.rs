@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod auth_env;
 pub mod config;
 pub mod memory;
 pub mod providers;

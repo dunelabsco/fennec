@@ -591,11 +591,10 @@ impl CommandHandler for Reload {
         "reload"
     }
     fn help(&self) -> &'static str {
-        "reload .env into the running agent"
+        "re-read ~/.fennec/.env into the running process"
     }
-    fn execute(&self, _args: &str, app: &mut App) -> Result<CommandOutcome> {
-        push_system(app, ".env reload lands in F1-2.".into());
-        Ok(CommandOutcome::Status("noted".into()))
+    fn execute(&self, _args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        Ok(CommandOutcome::Agent(AgentAction::ReloadEnv))
     }
 }
 
@@ -605,14 +604,13 @@ impl CommandHandler for ReloadMcp {
         "reload-mcp"
     }
     fn help(&self) -> &'static str {
-        "rescan MCP servers"
+        "rescan MCP servers in the live session"
     }
     fn aliases(&self) -> &[&'static str] {
         &["reload_mcp"]
     }
-    fn execute(&self, _args: &str, app: &mut App) -> Result<CommandOutcome> {
-        push_system(app, "MCP rescan lands in F1-2.".into());
-        Ok(CommandOutcome::Status("noted".into()))
+    fn execute(&self, _args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        Ok(CommandOutcome::Agent(AgentAction::ReloadMcp))
     }
 }
 

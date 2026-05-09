@@ -1269,6 +1269,12 @@ async fn handle_command_outcome(
             AgentAction::ToolsToggle(payload) => {
                 handle_tools_toggle(payload, app, agent, config, home_dir).await;
             }
+            AgentAction::ReloadEnv => {
+                handle_reload_env(app, home_dir);
+            }
+            AgentAction::ReloadMcp => {
+                handle_reload_mcp(app);
+            }
         },
     }
 }
@@ -1607,6 +1613,53 @@ async fn handle_tools_toggle(
             push(body, app);
         }
     }
+}
+
+/// `/reload` worker — re-read `~/.fennec/.env` into the
+/// running process. Newly-set keys take effect on the next
+/// provider call without a restart. Already-built provider
+/// Arcs keep their cached credentials, same as Hermes (which
+/// docstrings this same caveat at server.py:4147-4165).
+fn handle_reload_env(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    home_dir: &std::path::Path,
+) {
+    let env_path = home_dir.join(".env");
+    let body = match fennec::auth_env::reload_env_file(&env_path) {
+        Ok(0) if !env_path.exists() => {
+            format!("no .env file at {}", env_path.display())
+        }
+        Ok(n) => {
+            let noun = if n == 1 { "var" } else { "vars" };
+            format!("reloaded .env ({n} {noun} updated)")
+        }
+        Err(e) => format!("reload failed: {e}"),
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body,
+    });
+}
+
+/// `/reload_mcp` worker — Hermes calls
+/// `shutdown_mcp_servers` + `discover_mcp_tools` against the
+/// active session's MCP clients. Fennec's agent doesn't
+/// currently boot MCP clients (the `mcp` module exists but
+/// isn't wired into `build_agent_with_callbacks`), so the
+/// honest behavior is to surface that state rather than fake
+/// a reload. When MCP wiring lands, swap this body for a real
+/// rescan.
+fn handle_reload_mcp(app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>) {
+    let body = "no MCP servers loaded in this build — MCP client wiring \
+                attaches in the upcoming MCP-integration PR; /reload_mcp \
+                will rescan once that's in place"
+        .to_string();
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body,
+    });
 }
 
 /// Apply a single `TuiEvent` to the app state. Called from the
