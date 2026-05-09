@@ -41,6 +41,13 @@ pub enum AgentAction {
     /// agent, calls `Agent::token_usage`, and pushes a formatted
     /// system message into the chat scrollback.
     ShowUsage,
+    /// Set or read the title of the currently active session.
+    /// `None` means "show the current title". Empty string means
+    /// "clear the title". A non-empty string sets the title.
+    SessionTitle(Option<String>),
+    /// Resume a saved session by id-or-title (Hermes' fallback
+    /// matches by exact title when no id matches).
+    SessionResume(String),
 }
 
 /// Outcome of running a slash command. Drives the TUI's response

@@ -508,6 +508,17 @@ pub struct App {
     /// state; the tick handler polls it for transcriptions /
     /// errors and updates the UI accordingly.
     pub voice: super::voice::VoiceController,
+    /// Identifier of the SessionStore row backing the current
+    /// chat. Set when `run_tui` provisions or resumes a session;
+    /// `None` if the store init failed (the TUI still works,
+    /// just without persistence). `/title` and `/resume` mutate
+    /// this through the submit-loop's `AgentAction` plumbing.
+    pub current_session_id: Option<String>,
+    /// User-visible label of the current session. Mirrors the
+    /// `title` column of `current_session_id`'s row, kept on
+    /// `App` so the chat header can show it without re-querying
+    /// the store every frame.
+    pub current_session_title: Option<String>,
 }
 
 impl App {
@@ -531,6 +542,8 @@ impl App {
             mouse_enabled: false,
             in_flight_bot_idx: None,
             voice: super::voice::VoiceController::new(),
+            current_session_id: None,
+            current_session_title: None,
         }
     }
 

@@ -681,6 +681,37 @@ impl Agent {
         self.system_prompt = None;
     }
 
+    /// Replace the agent's working history with a prior session's
+    /// messages. Used by `/resume` to repopulate `history` from
+    /// the persisted [`crate::sessions::SessionStore`] so the
+    /// next turn sees the full conversation.
+    ///
+    /// Resets the cached system prompt so it's rebuilt with
+    /// memory context relevant to whatever the user types after
+    /// resuming, mirroring `clear_history`'s semantics.
+    pub fn replace_history(&mut self, messages: Vec<ChatMessage>) {
+        self.history = messages;
+        self.system_prompt = None;
+    }
+
+    /// Number of messages currently in `history`. Used by the
+    /// per-turn persistence hook in the TUI: snapshot the length
+    /// before a turn, persist the slice from that point after
+    /// the turn completes.
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Read-only view of `history[start..]`. Returns an empty
+    /// slice if `start` is out of bounds.
+    pub fn history_slice(&self, start: usize) -> &[ChatMessage] {
+        if start >= self.history.len() {
+            &[]
+        } else {
+            &self.history[start..]
+        }
+    }
+
     /// Snapshot of cumulative session token usage + cost. Returned
     /// by [`Self::token_usage`] for the `/usage` command.
     ///

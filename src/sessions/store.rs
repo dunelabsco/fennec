@@ -23,6 +23,20 @@ pub struct SessionRecord {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub summary: Option<String>,
+    /// Human label set by `/title <name>`. Distinct from
+    /// `summary` (which is the system-generated end-of-session
+    /// description). `None` until the user names the session.
+    pub title: Option<String>,
+}
+
+/// One persisted message inside a session — replayed into
+/// [`Agent::replace_history`] when `/resume` loads a prior
+/// conversation.
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
 }
 
 /// SQLite-backed session store with FTS5 search.
@@ -67,7 +81,8 @@ impl SessionStore {
                 channel TEXT NOT NULL,
                 started_at TEXT NOT NULL,
                 ended_at TEXT,
-                summary TEXT
+                summary TEXT,
+                title TEXT
             );
 
             CREATE TABLE IF NOT EXISTS session_messages (
@@ -111,6 +126,32 @@ impl SessionStore {
             END;",
         )
         .context("creating sessions schema")?;
+
+        // Migration for older dbs that pre-date the `title` column.
+        // SQLite has no `IF NOT EXISTS` for ADD COLUMN, so check the
+        // table's pragma list and only run the ALTER when needed.
+        // Failure here is non-fatal — if the column already exists
+        // the duplicate-column error is the expected case.
+        let has_title_col: bool = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(sessions)")
+                .context("preparing pragma table_info(sessions)")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .context("querying table_info(sessions)")?;
+            let mut found = false;
+            for r in rows {
+                if r? == "title" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_title_col {
+            conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT", [])
+                .context("adding title column to sessions")?;
+        }
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -218,7 +259,7 @@ impl SessionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT id, channel, started_at, ended_at, summary
+                "SELECT id, channel, started_at, ended_at, summary, title
                  FROM sessions
                  ORDER BY started_at DESC
                  LIMIT ?1",
@@ -231,6 +272,7 @@ impl SessionStore {
                     started_at: row.get(2)?,
                     ended_at: row.get(3)?,
                     summary: row.get(4)?,
+                    title: row.get(5)?,
                 })
             })?;
 
@@ -239,6 +281,114 @@ impl SessionStore {
                 results.push(row?);
             }
             Ok::<_, anyhow::Error>(results)
+        })
+        .await?
+    }
+
+    /// Look up a single session by exact id, then by exact title
+    /// as a fallback. Mirrors Hermes' `db.get_session_by_title()`
+    /// fallback (`tui_gateway/server.py:2180-2221`) so users who
+    /// type `/resume my-experiment` instead of the UUID can still
+    /// land on the right session. Returns `None` when neither
+    /// match.
+    pub async fn get_session(&self, id_or_title: &str) -> Result<Option<SessionRecord>> {
+        let conn = Arc::clone(&self.conn);
+        let key = id_or_title.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            // Try id first.
+            let mut stmt = conn.prepare(
+                "SELECT id, channel, started_at, ended_at, summary, title
+                 FROM sessions WHERE id = ?1 LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(rusqlite::params![key], |row| {
+                Ok(SessionRecord {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    started_at: row.get(2)?,
+                    ended_at: row.get(3)?,
+                    summary: row.get(4)?,
+                    title: row.get(5)?,
+                })
+            })?;
+            if let Some(row) = rows.next() {
+                return Ok::<_, anyhow::Error>(Some(row?));
+            }
+            // Title fallback.
+            let mut stmt = conn.prepare(
+                "SELECT id, channel, started_at, ended_at, summary, title
+                 FROM sessions WHERE title = ?1 ORDER BY started_at DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(rusqlite::params![key], |row| {
+                Ok(SessionRecord {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    started_at: row.get(2)?,
+                    ended_at: row.get(3)?,
+                    summary: row.get(4)?,
+                    title: row.get(5)?,
+                })
+            })?;
+            if let Some(row) = rows.next() {
+                return Ok(Some(row?));
+            }
+            Ok(None)
+        })
+        .await?
+    }
+
+    /// Set (or clear) the user-facing title for a session. Empty
+    /// title clears the field. Returns the number of rows
+    /// affected — `0` means the session id wasn't found.
+    pub async fn set_session_title(&self, id: &str, title: &str) -> Result<usize> {
+        let conn = Arc::clone(&self.conn);
+        let id = id.to_string();
+        let title = if title.trim().is_empty() {
+            None
+        } else {
+            Some(title.trim().to_string())
+        };
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let n = conn
+                .execute(
+                    "UPDATE sessions SET title = ?1 WHERE id = ?2",
+                    rusqlite::params![title, id],
+                )
+                .context("updating session title")?;
+            Ok::<_, anyhow::Error>(n)
+        })
+        .await?
+    }
+
+    /// Fetch every persisted message for `session_id` in
+    /// chronological order. Used by `/resume` to repopulate
+    /// `Agent::history` so the next turn sees the full prior
+    /// context, matching Hermes' `db.get_messages_as_conversation`
+    /// (`tui_gateway/server.py:2180-2221`).
+    pub async fn get_session_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
+        let conn = Arc::clone(&self.conn);
+        let sid = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT role, content, timestamp
+                 FROM session_messages
+                 WHERE session_id = ?1
+                 ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![sid], |row| {
+                Ok(StoredMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                    timestamp: row.get(2)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok::<_, anyhow::Error>(out)
         })
         .await?
     }
@@ -321,6 +471,52 @@ mod tests {
         // Either finds the message or returns empty — the critical
         // invariant is that the call does not error.
         let _ = hits;
+    }
+
+    #[tokio::test]
+    async fn set_and_get_session_title_round_trip() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        // Initially title is None.
+        let rec = store.get_session(&sid).await.unwrap().unwrap();
+        assert!(rec.title.is_none());
+        // Set title.
+        let n = store
+            .set_session_title(&sid, "experiment-1")
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let rec = store.get_session(&sid).await.unwrap().unwrap();
+        assert_eq!(rec.title.as_deref(), Some("experiment-1"));
+        // Empty title clears.
+        let n = store.set_session_title(&sid, "  ").await.unwrap();
+        assert_eq!(n, 1);
+        let rec = store.get_session(&sid).await.unwrap().unwrap();
+        assert!(rec.title.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_session_falls_back_to_title_when_id_missing() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        store.set_session_title(&sid, "alpha").await.unwrap();
+        // Lookup by exact title string.
+        let rec = store.get_session("alpha").await.unwrap().unwrap();
+        assert_eq!(rec.id, sid);
+    }
+
+    #[tokio::test]
+    async fn get_session_messages_returns_in_chronological_order() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        store.add_message(&sid, "user", "first").await.unwrap();
+        store.add_message(&sid, "assistant", "second").await.unwrap();
+        store.add_message(&sid, "user", "third").await.unwrap();
+        let msgs = store.get_session_messages(&sid).await.unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "first");
+        assert_eq!(msgs[2].content, "third");
     }
 
     /// Regression: the store's FK declaration (session_messages

@@ -783,28 +783,44 @@ async fn run_tui(
     use fennec::tui::app::{App, ChatLine, SessionRow};
     use fennec::tui::callbacks::TuiBridge;
 
-    // Real sessions list: query the SessionStore for prior
-    // sessions. The current TUI session itself isn't recorded
-    // yet (the agent doesn't auto-record turns into the store —
-    // that's a separate cross-cutting wiring) but historical
-    // sessions show up so /resume picks have context.
+    // Open (or create) the session store. Failure is non-fatal:
+    // the TUI keeps running, /resume just reports "no store".
     let session_db = home_dir.join("sessions.db");
-    let session_store_handle =
-        match tokio::task::spawn_blocking(move || SessionStore::new(&session_db)).await {
+    let session_store_handle = {
+        let path = session_db.clone();
+        match tokio::task::spawn_blocking(move || SessionStore::new(&path)).await {
             Ok(Ok(s)) => Some(std::sync::Arc::new(s)),
             Ok(Err(e)) => {
                 tracing::warn!("session store init failed: {e}; sessions list will be empty");
                 None
             }
             Err(_) => None,
-        };
+        }
+    };
     let prior_sessions = if let Some(ref store) = session_store_handle {
         store.list_sessions(20).await.unwrap_or_default()
     } else {
         Vec::new()
     };
 
+    // Provision a row for the current TUI session so /title and
+    // per-turn message persistence have somewhere to write. If
+    // the store isn't available we leave `current_session_id`
+    // unset and the persistence hook becomes a no-op.
+    let current_session_id = if let Some(ref store) = session_store_handle {
+        match store.create_session("cli").await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!("create session failed: {e}; persistence disabled this run");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut app = App::new();
+    app.current_session_id = current_session_id.clone();
     // Current TUI session pinned to the top.
     app.sessions.push(SessionRow {
         code: "$ ".into(),
@@ -890,6 +906,7 @@ async fn run_tui(
     let registry = std::sync::Arc::new(fennec::tui::commands::CommandRegistry::with_builtins());
     let submit_app = app.clone();
     let submit_agent = agent.clone();
+    let submit_store = session_store_handle.clone();
     let submit_handle = tokio::spawn(async move {
         let mut last_submitted: Option<String> = None;
         loop {
@@ -917,14 +934,43 @@ async fn run_tui(
                         fennec::tui::commands::CommandOutcome::Status(format!("error: {e}"))
                     })
                 };
-                handle_command_outcome(outcome, &submit_app, &submit_agent).await;
+                handle_command_outcome(
+                    outcome,
+                    &submit_app,
+                    &submit_agent,
+                    submit_store.as_ref(),
+                )
+                .await;
                 continue;
             }
 
             // Plain text — run as an agent turn (streaming, so
             // text deltas + tool events surface live in the TUI).
+            // After the turn drains, replay the freshly-appended
+            // history slice into the SessionStore so /resume can
+            // restore it later.
+            let session_id = submit_app.lock().current_session_id.clone();
             let mut agent_guard = submit_agent.lock().await;
+            let history_before = agent_guard.history_len();
             let _ = agent_guard.turn_streaming(&prompt).await;
+            let appended: Vec<_> = agent_guard
+                .history_slice(history_before)
+                .iter()
+                .cloned()
+                .collect();
+            drop(agent_guard);
+            if let (Some(store), Some(sid)) = (submit_store.as_ref(), session_id) {
+                for msg in &appended {
+                    let role = msg.role.as_str();
+                    let content = msg.content.clone().unwrap_or_default();
+                    if content.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = store.add_message(&sid, role, &content).await {
+                        tracing::warn!("session store add_message failed: {e}");
+                    }
+                }
+            }
         }
     });
 
@@ -998,6 +1044,18 @@ async fn run_tui(
 
     // Run the renderer (blocks until the user quits).
     let result = fennec::tui::run(app.clone());
+
+    // Mark the active session ended (if persistence is on) so
+    // the sessions list shows a clean ended_at instead of a
+    // dangling "in progress" row. Failure here is non-fatal —
+    // the chat data is already on disk from the per-turn
+    // persistence loop above.
+    let exit_session_id = app.lock().current_session_id.clone();
+    if let (Some(store), Some(sid)) = (session_store_handle.as_ref(), exit_session_id) {
+        if let Err(e) = store.end_session(&sid, None).await {
+            tracing::warn!("end_session failed for {sid}: {e}");
+        }
+    }
 
     // Cleanly stop background tasks.
     {
@@ -1103,6 +1161,7 @@ async fn handle_command_outcome(
     outcome: fennec::tui::commands::CommandOutcome,
     app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
     agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    session_store: Option<&std::sync::Arc<fennec::sessions::SessionStore>>,
 ) {
     use fennec::tui::commands::{AgentAction, CommandOutcome};
     match outcome {
@@ -1156,8 +1215,149 @@ async fn handle_command_outcome(
                     body,
                 });
             }
+            AgentAction::SessionTitle(payload) => {
+                handle_session_title(payload, app, session_store).await;
+            }
+            AgentAction::SessionResume(target) => {
+                handle_session_resume(target, app, agent, session_store).await;
+            }
         },
     }
+}
+
+/// `/title` worker — reads or writes the current session's
+/// title via the SessionStore. `payload = None` reads, `Some`
+/// writes. Mirrors Hermes' `session.title` RPC: read returns
+/// "title: <name>" or "no title set"; write returns "session
+/// title set: <name>" with an optional "(queued while session
+/// initializes)" suffix when the row hasn't been created yet.
+async fn handle_session_title(
+    payload: Option<String>,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    store: Option<&std::sync::Arc<fennec::sessions::SessionStore>>,
+) {
+    let (sid, current_title) = {
+        let guard = app.lock();
+        (
+            guard.current_session_id.clone(),
+            guard.current_session_title.clone(),
+        )
+    };
+    let body = match (sid.as_deref(), store, payload) {
+        (None, _, _) | (_, None, _) => "no active session".to_string(),
+        (Some(_), Some(_), None) => match current_title {
+            Some(t) if !t.is_empty() => format!("title: {t}"),
+            _ => "no title set".to_string(),
+        },
+        (Some(sid), Some(store), Some(new_title)) => {
+            match store.set_session_title(sid, &new_title).await {
+                Ok(0) => format!(
+                    "session title set: {new_title} (queued while session initializes)"
+                ),
+                Ok(_) => {
+                    app.lock().current_session_title = if new_title.trim().is_empty() {
+                        None
+                    } else {
+                        Some(new_title.trim().to_string())
+                    };
+                    format!("session title set: {}", new_title.trim())
+                }
+                Err(e) => format!("title write failed: {e}"),
+            }
+        }
+    };
+    let mut guard = app.lock();
+    guard.chat.push(fennec::tui::app::ChatLine::System {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body,
+    });
+}
+
+/// `/resume` worker — looks up the target session by id, then
+/// by exact title, fetches its message history, and replays
+/// it into the agent. Mirrors Hermes' `session.resume`
+/// (`tui_gateway/server.py:2180-2221`): reset agent, load
+/// messages as conversation, re-emit a system line so the
+/// chat shows what was loaded. Empty store / unknown id
+/// produce informative error lines.
+async fn handle_session_resume(
+    target: String,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    store: Option<&std::sync::Arc<fennec::sessions::SessionStore>>,
+) {
+    let Some(store) = store else {
+        let mut guard = app.lock();
+        guard.chat.push(fennec::tui::app::ChatLine::System {
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+            body: "session store unavailable — cannot resume".into(),
+        });
+        return;
+    };
+    let record = match store.get_session(&target).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            let mut guard = app.lock();
+            guard.chat.push(fennec::tui::app::ChatLine::System {
+                time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                body: format!("session not found: {target}"),
+            });
+            return;
+        }
+        Err(e) => {
+            let mut guard = app.lock();
+            guard.chat.push(fennec::tui::app::ChatLine::System {
+                time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                body: format!("session lookup failed: {e}"),
+            });
+            return;
+        }
+    };
+    let messages = match store.get_session_messages(&record.id).await {
+        Ok(m) => m,
+        Err(e) => {
+            let mut guard = app.lock();
+            guard.chat.push(fennec::tui::app::ChatLine::System {
+                time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                body: format!("loading messages failed: {e}"),
+            });
+            return;
+        }
+    };
+
+    // Translate stored messages back into ChatMessage form. Tool
+    // calls aren't persisted in the messages table today (only
+    // role + text content) so we faithfully replay text-only
+    // turns; tool-call replay would require a richer schema.
+    use fennec::providers::traits::ChatMessage;
+    let chat_messages: Vec<ChatMessage> = messages
+        .iter()
+        .filter_map(|m| match m.role.as_str() {
+            "user" => Some(ChatMessage::user(&m.content)),
+            "assistant" => Some(ChatMessage::assistant(&m.content)),
+            "system" => Some(ChatMessage::system(&m.content)),
+            _ => None, // skip tool / tool_result roles for now
+        })
+        .collect();
+    let count = chat_messages.len();
+    {
+        let mut g = agent.lock().await;
+        g.replace_history(chat_messages);
+    }
+
+    // Mutate app state to reflect the new session, then push a
+    // confirmation system message into the chat scrollback.
+    let mut guard = app.lock();
+    guard.current_session_id = Some(record.id.clone());
+    guard.current_session_title = record.title.clone();
+    let title_label = record
+        .title
+        .clone()
+        .unwrap_or_else(|| short_id(&record.id));
+    guard.chat.push(fennec::tui::app::ChatLine::System {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body: format!("resumed: {title_label} ({count} messages)"),
+    });
 }
 
 /// Apply a single `TuiEvent` to the app state. Called from the

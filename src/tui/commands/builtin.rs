@@ -158,21 +158,18 @@ impl CommandHandler for Resume {
         "resume"
     }
     fn help(&self) -> &'static str {
-        "switch to a saved session"
+        "resume a prior session"
     }
-    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
-        if args.trim().is_empty() {
-            push_system(
-                app,
-                "resume needs a session id. Use [tab] to focus the sessions panel + ↑↓ to pick one (session-store wiring lands in F1-2).".into(),
-            );
-        } else {
-            push_system(
-                app,
-                format!("/resume {} — session-store wiring lands in F1-2.", args.trim()),
-            );
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        let target = args.trim();
+        if target.is_empty() {
+            return Ok(CommandOutcome::Status(
+                "usage: /resume <session-id-or-title>".into(),
+            ));
         }
-        Ok(CommandOutcome::Status("noted".into()))
+        Ok(CommandOutcome::Agent(AgentAction::SessionResume(
+            target.to_string(),
+        )))
     }
 }
 
@@ -182,18 +179,16 @@ impl CommandHandler for Title {
         "title"
     }
     fn help(&self) -> &'static str {
-        "get / set session title"
+        "set or show the current session title"
     }
-    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
-        if args.trim().is_empty() {
-            push_system(
-                app,
-                "current session has no persisted title yet (session-store wiring lands in F1-2).".into(),
-            );
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        let trimmed = args.trim();
+        let payload = if trimmed.is_empty() {
+            None
         } else {
-            push_system(app, format!("would set title to: {}", args.trim()));
-        }
-        Ok(CommandOutcome::Status("noted".into()))
+            Some(trimmed.to_string())
+        };
+        Ok(CommandOutcome::Agent(AgentAction::SessionTitle(payload)))
     }
 }
 
