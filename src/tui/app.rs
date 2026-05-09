@@ -504,6 +504,10 @@ pub struct App {
     /// are arriving so they accumulate into one growing message
     /// instead of pushing a new line per delta.
     pub in_flight_bot_idx: Option<usize>,
+    /// Voice subsystem handle. The `/voice` command flips its
+    /// state; the tick handler polls it for transcriptions /
+    /// errors and updates the UI accordingly.
+    pub voice: super::voice::VoiceController,
 }
 
 impl App {
@@ -526,6 +530,7 @@ impl App {
             details_visible: true,
             mouse_enabled: false,
             in_flight_bot_idx: None,
+            voice: super::voice::VoiceController::new(),
         }
     }
 
@@ -662,6 +667,19 @@ impl App {
             if t.elapsed().as_secs() >= 3 {
                 self.transient_status = None;
             }
+        }
+        // Voice subsystem: a delivered transcription drops into
+        // the input box; a delivered error shows as a transient
+        // status so the user sees mic-open failures etc.
+        if let Some(text) = self.voice.take_transcription() {
+            self.input.set(&text);
+            self.set_status(format!(
+                "transcribed ({} chars) — review + Enter to send",
+                text.chars().count()
+            ));
+        }
+        if let Some(err) = self.voice.take_error() {
+            self.set_status(format!("voice: {err}"));
         }
     }
 

@@ -58,6 +58,12 @@ serde_yaml_ng = "0.10"
 # is its preferred backend on macOS / Linux / Windows.
 ratatui = "0.30"
 crossterm = "0.29"
+# Audio capture for the TUI's voice mode (`/voice` slash command).
+# `cpal` is the cross-platform mic-input crate the Rust audio
+# ecosystem standardised on; `hound` writes the captured PCM into
+# a WAV file the existing TranscribeAudioTool can consume.
+cpal = "0.16"
+hound = "3.5"
 
 [dev-dependencies]
 tempfile = "3.15"

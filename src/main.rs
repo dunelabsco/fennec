@@ -928,6 +928,74 @@ async fn run_tui(
         }
     });
 
+    // Voice transcription polling task: when /voice off has
+    // queued a WAV file, transcribe it via the user-configured
+    // OpenAI Whisper key (same key the agent's
+    // TranscribeAudioTool uses) and deliver the text back into
+    // the TUI's input box on the next tick.
+    let voice_app = app.clone();
+    let voice_config = config.clone();
+    let voice_home = home_dir.clone();
+    let voice_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let pending = {
+                let guard = voice_app.lock();
+                if guard.should_quit {
+                    return;
+                }
+                guard.voice.take_pending_wav()
+            };
+            let Some(path) = pending else { continue };
+            // Build a transcription tool on demand. The OpenAI
+            // key is resolved the same way the agent's tool does
+            // (config.api_key first, then OPENAI_API_KEY env).
+            let key = fennec::tools::voice_tool::resolve_openai_key(
+                &voice_config.provider.name,
+                &voice_config.provider.api_key,
+            );
+            if key.is_empty() {
+                voice_app.lock().voice.deliver_error(
+                    "OPENAI_API_KEY not set; cannot transcribe".into(),
+                );
+                continue;
+            }
+            let _ = voice_home.clone(); // reserved for future cache-dir use
+            let tool =
+                match fennec::tools::voice_tool::TranscribeAudioTool::new_with_key(
+                    key,
+                    None,
+                ) {
+                    Some(t) => t,
+                    None => {
+                        voice_app.lock().voice.deliver_error(
+                            "transcription tool init failed".into(),
+                        );
+                        continue;
+                    }
+                };
+            // The tool expects a JSON arg payload with `path`.
+            let args = serde_json::json!({ "path": path.to_string_lossy() });
+            use fennec::tools::traits::Tool;
+            match tool.execute(args).await {
+                Ok(result) => {
+                    if result.success {
+                        voice_app.lock().voice.deliver_transcription(result.output);
+                    } else {
+                        voice_app.lock().voice.deliver_error(format!(
+                            "transcribe: {}",
+                            result.error.unwrap_or(result.output)
+                        ));
+                    }
+                }
+                Err(e) => voice_app
+                    .lock()
+                    .voice
+                    .deliver_error(format!("transcribe: {e}")),
+            }
+        }
+    });
+
     // Run the renderer (blocks until the user quits).
     let result = fennec::tui::run(app.clone());
 
@@ -937,6 +1005,7 @@ async fn run_tui(
         guard.should_quit = true;
     }
     submit_handle.abort();
+    voice_handle.abort();
 
     result
 }

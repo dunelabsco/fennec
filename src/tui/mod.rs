@@ -33,6 +33,7 @@ pub mod callbacks;
 pub mod commands;
 pub mod layout;
 pub mod theme;
+pub mod voice;
 
 use std::io;
 use std::sync::Arc;

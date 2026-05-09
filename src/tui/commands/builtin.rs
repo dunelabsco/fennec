@@ -454,18 +454,86 @@ impl CommandHandler for Voice {
         "voice"
     }
     fn help(&self) -> &'static str {
-        "voice mode (placeholder)"
+        "voice input mode — `/voice` toggles, `/voice tts on|off`, `/voice status`"
     }
     fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
-        let arg = args.trim();
-        push_system(
-            app,
-            format!(
-                "voice mode is wired to fennec's existing voice tools (TranscribeAudio + TextToSpeech). The TUI overlay (waveform UI) lands in F1-2. Arg seen: {:?}",
-                arg
-            ),
-        );
-        Ok(CommandOutcome::Status("noted".into()))
+        use super::super::voice::VoiceState;
+        let arg = args.trim().to_lowercase();
+        match arg.as_str() {
+            "" | "toggle" => match app.voice.state() {
+                VoiceState::Idle => {
+                    app.voice.start_recording();
+                    Ok(CommandOutcome::Status("● recording — /voice to stop".into()))
+                }
+                VoiceState::Recording => {
+                    let voice_dir = std::env::temp_dir().join("fennec-voice");
+                    match app.voice.stop_recording(&voice_dir) {
+                        Ok(_path) => Ok(CommandOutcome::Status(
+                            "transcribing…".into(),
+                        )),
+                        Err(e) => {
+                            push_system(app, format!("voice stop failed: {e}"));
+                            Ok(CommandOutcome::Status("error".into()))
+                        }
+                    }
+                }
+                VoiceState::Transcribing => Ok(CommandOutcome::Status(
+                    "still transcribing — wait a moment".into(),
+                )),
+            },
+            "on" => {
+                app.voice.start_recording();
+                Ok(CommandOutcome::Status("● recording".into()))
+            }
+            "off" => {
+                let voice_dir = std::env::temp_dir().join("fennec-voice");
+                match app.voice.stop_recording(&voice_dir) {
+                    Ok(_) => Ok(CommandOutcome::Status("transcribing…".into())),
+                    Err(e) => {
+                        push_system(app, format!("voice stop failed: {e}"));
+                        Ok(CommandOutcome::Status("error".into()))
+                    }
+                }
+            }
+            "tts" => {
+                let on = !app.voice.tts_enabled();
+                app.voice.set_tts(on);
+                Ok(CommandOutcome::Status(format!(
+                    "tts: {}",
+                    if on { "on" } else { "off" }
+                )))
+            }
+            "tts on" => {
+                app.voice.set_tts(true);
+                Ok(CommandOutcome::Status("tts: on".into()))
+            }
+            "tts off" => {
+                app.voice.set_tts(false);
+                Ok(CommandOutcome::Status("tts: off".into()))
+            }
+            "status" => {
+                let state = match app.voice.state() {
+                    VoiceState::Idle => "idle",
+                    VoiceState::Recording => "● recording",
+                    VoiceState::Transcribing => "transcribing",
+                };
+                let tts = if app.voice.tts_enabled() { "on" } else { "off" };
+                push_system(
+                    app,
+                    format!("voice: {state} · tts: {tts}"),
+                );
+                Ok(CommandOutcome::Status("ok".into()))
+            }
+            other => {
+                push_system(
+                    app,
+                    format!(
+                        "unknown /voice arg: {other:?}. usage: /voice [on|off|toggle|tts|status]"
+                    ),
+                );
+                Ok(CommandOutcome::Status("?".into()))
+            }
+        }
     }
 }
 
