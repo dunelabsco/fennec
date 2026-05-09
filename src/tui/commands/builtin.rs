@@ -316,7 +316,7 @@ impl CommandHandler for Status {
         "show gateway + agent state"
     }
     fn execute(&self, _args: &str, app: &mut App) -> Result<CommandOutcome> {
-        let connected = app.channels.iter().count();
+        let connected = app.channels.len();
         push_system(
             app,
             format!(
@@ -342,9 +342,9 @@ impl CommandHandler for Usage {
     fn execute(&self, _args: &str, app: &mut App) -> Result<CommandOutcome> {
         push_system(
             app,
-            "session token totals come from the agent — wiring \
-             lands alongside streaming text deltas (F1-1 final \
-             commit). Until then `/usage` is a placeholder."
+            "session token totals come from the agent. Wiring \
+             lands in F1-2 once the agent exposes per-turn usage \
+             counters; until then `/usage` is a placeholder."
                 .into(),
         );
         Ok(CommandOutcome::Status("ok".into()))

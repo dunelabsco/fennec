@@ -293,14 +293,15 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                     Span::styled(summary.clone(), Style::default().fg(SUBDUED)),
                 ]));
             }
-            ChatLine::ToolRunning { label, .. } => {
+            ChatLine::ToolRunning { label, started_at } => {
+                let elapsed = started_at.elapsed().as_millis();
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("    {} ", app.spinner_glyph()),
                         Style::default().fg(TOOL_PINK),
                     ),
                     Span::styled(
-                        label.clone(),
+                        format!("{label} ({elapsed}ms)"),
                         Style::default().fg(TOOL_PINK).add_modifier(Modifier::DIM),
                     ),
                 ]));
@@ -602,7 +603,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
         ),
         Span::styled("● ", Style::default().fg(MUTED_GREEN)),
         Span::styled(
-            format!("gateway up ({total} channels)"),
+            format!("agent ready · {connected}/{total} channels"),
             Style::default().fg(MUTED_GREEN),
         ),
     ];

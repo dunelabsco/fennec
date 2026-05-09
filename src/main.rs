@@ -1133,13 +1133,12 @@ async fn handle_command_outcome(
             }
             AgentAction::Retry | AgentAction::Undo | AgentAction::Steer(_) => {
                 // The agent doesn't yet expose retry/undo/steer
-                // primitives; their wiring lands alongside the
-                // streaming-turn commit. The chat-side state
-                // change has already been applied by the command
-                // handler, so the user sees an immediate visual
-                // effect; the agent-side replay arrives next.
+                // primitives. The chat-side state change has
+                // already been applied by the command handler so
+                // the user sees an immediate visual effect; the
+                // agent-side replay lands in F1-2.
                 let mut guard = app.lock();
-                guard.set_status("queued — agent-side wiring in F1-1 final");
+                guard.set_status("queued — agent-side replay arrives in F1-2");
             }
             AgentAction::Run(prompt) => {
                 let mut guard = agent.lock().await;
@@ -1200,13 +1199,22 @@ fn apply_tui_event(
             // the in-flight bot message so the next text delta
             // (after the tool result) starts a fresh message.
             guard.finalize_bot_message();
+            let started = std::time::Instant::now();
             guard.chat.push(ChatLine::ToolCall {
                 call: format!("{}({})", s.name, s.preview),
+            });
+            // Inline running indicator under the tool-call line.
+            // Replaced with ToolResult on completion so the
+            // scrollback ends up as call → result, with the spinner
+            // visible only while the tool is in flight.
+            guard.chat.push(fennec::tui::app::ChatLine::ToolRunning {
+                label: "running…".into(),
+                started_at: started,
             });
             guard.live_tool = Some(LiveTool {
                 name: s.name,
                 args_preview: s.preview,
-                started_at: std::time::Instant::now(),
+                started_at: started,
                 progress: None,
             });
         }
@@ -1220,6 +1228,15 @@ fn apply_tui_event(
                 .summary
                 .clone()
                 .unwrap_or_else(|| "(done)".to_string());
+            // Drop the most recent inline running indicator before
+            // pushing the result so the chat reads call → result.
+            if let Some(idx) = guard
+                .chat
+                .iter()
+                .rposition(|l| matches!(l, fennec::tui::app::ChatLine::ToolRunning { .. }))
+            {
+                guard.chat.remove(idx);
+            }
             guard.chat.push(ChatLine::ToolResult { summary });
             guard.recent_tools.insert(
                 0,
