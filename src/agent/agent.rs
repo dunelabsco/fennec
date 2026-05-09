@@ -13,6 +13,46 @@ use super::context::SystemPromptBuilder;
 use super::scrub;
 use super::thinking::{self, ThinkingLevel};
 
+/// Cumulative session token usage + estimated cost. Returned by
+/// [`Agent::token_usage`] for the `/usage` slash command. All
+/// counters are u64; `cost_usd` is `None` when the active model
+/// isn't in the pricing snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub api_calls: u64,
+    /// Input + cache_read + cache_write from the most recent
+    /// provider response. Used to compute `last / context_max`
+    /// for the context-window utilisation row.
+    pub last_prompt_tokens: u64,
+    /// Configured context window of the active model.
+    pub context_max: usize,
+    pub cost_usd: Option<f64>,
+}
+
+impl TokenUsage {
+    /// Total tokens across all classes (input + cache_read +
+    /// cache_write + output).
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens + self.output_tokens
+    }
+
+    /// Context utilisation as a 0..=100 percentage based on the
+    /// most recent prompt size. Returns `None` when no provider
+    /// call has happened yet or the model has no context window.
+    pub fn context_percent(&self) -> Option<u8> {
+        if self.context_max == 0 || self.last_prompt_tokens == 0 {
+            return None;
+        }
+        let pct = (self.last_prompt_tokens as f64 * 100.0) / (self.context_max as f64);
+        Some(pct.clamp(0.0, 100.0) as u8)
+    }
+}
+
 /// The core agent that orchestrates provider calls, tool execution, and memory.
 pub struct Agent {
     provider: Arc<dyn Provider>,
@@ -38,6 +78,12 @@ pub struct Agent {
     total_input_tokens: u64,
     total_output_tokens: u64,
     total_cache_read_tokens: u64,
+    total_cache_write_tokens: u64,
+    /// Number of provider HTTP calls made in this session.
+    total_api_calls: u64,
+    /// Input-token count from the most recent provider response.
+    /// Drives the context-window utilisation panel in `/usage`.
+    last_prompt_tokens: u64,
     turn_count: u64,
     /// Lifecycle hooks for real-time frontends (TUI, dashboard).
     /// Defaults to a no-op handle so existing callers (channels,
@@ -138,13 +184,20 @@ impl Agent {
         for _iteration in 0..self.max_tool_iterations {
             self.callbacks.on_status("calling provider");
             let response = self.call_provider().await?;
+            self.total_api_calls += 1;
 
             // Track token usage from this API call.
             if let Some(ref usage) = response.usage {
                 self.total_input_tokens += usage.input_tokens;
                 self.total_output_tokens += usage.output_tokens;
+                self.last_prompt_tokens = usage.input_tokens
+                    + usage.cache_read_tokens.unwrap_or(0)
+                    + usage.cache_write_tokens.unwrap_or(0);
                 if let Some(cache) = usage.cache_read_tokens {
                     self.total_cache_read_tokens += cache;
+                }
+                if let Some(cache) = usage.cache_write_tokens {
+                    self.total_cache_write_tokens += cache;
                 }
             }
 
@@ -399,6 +452,7 @@ impl Agent {
                 thinking_level: self.thinking_level,
             };
             let mut rx = self.provider.chat_stream(request).await?;
+            self.total_api_calls += 1;
 
             let mut accumulated_text = String::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -433,6 +487,19 @@ impl Agent {
                                 name,
                                 arguments,
                             });
+                        }
+                    }
+                    StreamEvent::Usage(usage) => {
+                        self.total_input_tokens += usage.input_tokens;
+                        self.total_output_tokens += usage.output_tokens;
+                        self.last_prompt_tokens = usage.input_tokens
+                            + usage.cache_read_tokens.unwrap_or(0)
+                            + usage.cache_write_tokens.unwrap_or(0);
+                        if let Some(cache) = usage.cache_read_tokens {
+                            self.total_cache_read_tokens += cache;
+                        }
+                        if let Some(cache) = usage.cache_write_tokens {
+                            self.total_cache_write_tokens += cache;
                         }
                     }
                     StreamEvent::Done => break,
@@ -612,6 +679,35 @@ impl Agent {
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.system_prompt = None;
+    }
+
+    /// Snapshot of cumulative session token usage + cost. Returned
+    /// by [`Self::token_usage`] for the `/usage` command.
+    ///
+    /// `cost_usd` is `None` when the active model isn't in the
+    /// pricing snapshot — callers render that as "—" or skip the
+    /// row, matching upstream's `cost_status: "unknown"` behavior.
+    pub fn token_usage(&self) -> TokenUsage {
+        let model = self.provider.model().to_string();
+        let context_max = self.provider.context_window();
+        let cost_usd = super::pricing::estimate_cost(
+            &model,
+            self.total_input_tokens,
+            self.total_output_tokens,
+            self.total_cache_read_tokens,
+            self.total_cache_write_tokens,
+        );
+        TokenUsage {
+            model,
+            input_tokens: self.total_input_tokens,
+            output_tokens: self.total_output_tokens,
+            cache_read_tokens: self.total_cache_read_tokens,
+            cache_write_tokens: self.total_cache_write_tokens,
+            api_calls: self.total_api_calls,
+            last_prompt_tokens: self.last_prompt_tokens,
+            context_max,
+            cost_usd,
+        }
     }
 
     /// Get a reference to the shared provider.
@@ -797,6 +893,9 @@ impl AgentBuilder {
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
+            total_cache_write_tokens: 0,
+            total_api_calls: 0,
+            last_prompt_tokens: 0,
             turn_count: 0,
             callbacks: self
                 .callbacks

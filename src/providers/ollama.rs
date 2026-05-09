@@ -175,6 +175,7 @@ impl OllamaProvider {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
                 cache_read_tokens: None,
+                cache_write_tokens: None,
             })
         } else {
             None
@@ -192,6 +193,10 @@ impl OllamaProvider {
 impl Provider for OllamaProvider {
     fn name(&self) -> &str {
         "ollama"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {

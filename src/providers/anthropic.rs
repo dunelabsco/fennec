@@ -222,8 +222,36 @@ impl AnthropicProvider {
         data: &Value,
         tx: &tokio::sync::mpsc::Sender<StreamEvent>,
         index_to_tool: &mut HashMap<u64, ToolBlockInfo>,
+        usage_acc: &mut UsageInfo,
     ) -> bool {
         match event_type {
+            "message_start" => {
+                // Anthropic emits initial usage (input_tokens, cache_read,
+                // cache_creation) on the message_start event. Output tokens
+                // accumulate via message_delta as the model emits text.
+                if let Some(u) = data.get("message").and_then(|m| m.get("usage")) {
+                    if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
+                        usage_acc.input_tokens = v;
+                    }
+                    if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+                        usage_acc.cache_read_tokens = Some(v);
+                    }
+                    if let Some(v) = u
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                    {
+                        usage_acc.cache_write_tokens = Some(v);
+                    }
+                }
+            }
+            "message_delta" => {
+                // Output tokens land here, cumulative.
+                if let Some(u) = data.get("usage") {
+                    if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+                        usage_acc.output_tokens = v;
+                    }
+                }
+            }
             "content_block_start" => {
                 let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                 let Some(block) = data.get("content_block") else { return false };
@@ -292,6 +320,11 @@ impl AnthropicProvider {
                 }
             }
             "message_stop" => {
+                // Emit accumulated usage just before terminating the
+                // stream so the agent's turn_streaming() can update its
+                // session totals on the same path the non-streaming
+                // turn() reads `ChatResponse.usage`.
+                let _ = tx.send(StreamEvent::Usage(usage_acc.clone())).await;
                 let _ = tx.send(StreamEvent::Done).await;
                 return true;
             }
@@ -372,6 +405,9 @@ impl AnthropicProvider {
             cache_read_tokens: u
                 .get("cache_read_input_tokens")
                 .and_then(|v| v.as_u64()),
+            cache_write_tokens: u
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64()),
         });
 
         Ok(ChatResponse {
@@ -386,6 +422,10 @@ impl AnthropicProvider {
 impl Provider for AnthropicProvider {
     fn name(&self) -> &str {
         "anthropic"
+    }
+
+    fn model(&self) -> &str {
+        &self.default_model
     }
 
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
@@ -497,6 +537,7 @@ impl Provider for AnthropicProvider {
             let mut sse = SseBuffer::new();
             let mut current_event_type = String::new();
             let mut index_to_tool: HashMap<u64, ToolBlockInfo> = HashMap::new();
+            let mut usage_acc = UsageInfo::default();
             // Tracks whether `handle_sse_event` already emitted Done (via
             // `message_stop` or `error`). Without this, the post-loop
             // "Done anyway" fallback fires on every successful stream too,
@@ -540,6 +581,7 @@ impl Provider for AnthropicProvider {
                                 &data,
                                 &tx,
                                 &mut index_to_tool,
+                                &mut usage_acc,
                             )
                             .await;
                             if terminated {
@@ -574,8 +616,9 @@ mod tests {
     async fn replay(events: Vec<(&str, Value)>) -> Vec<StreamEvent> {
         let (tx, mut rx) = mpsc::channel(64);
         let mut map: HashMap<u64, ToolBlockInfo> = HashMap::new();
+        let mut usage = UsageInfo::default();
         for (ty, data) in events {
-            AnthropicProvider::handle_sse_event(ty, &data, &tx, &mut map).await;
+            AnthropicProvider::handle_sse_event(ty, &data, &tx, &mut map, &mut usage).await;
         }
         drop(tx);
         let mut out = Vec::new();
@@ -774,6 +817,56 @@ mod tests {
     /// knows what went wrong) and `Done` (as a terminator so any
     /// `await`-on-Done loop terminates). It must NOT depend on the
     /// post-loop fallback for the terminator.
+    /// `message_start` carries initial usage counts (input,
+    /// cache_read, cache_creation); `message_delta` carries the
+    /// running output_tokens; `message_stop` must surface those
+    /// as a single `StreamEvent::Usage` immediately before
+    /// `Done`. Without this the agent's streaming-turn path
+    /// would never see token counts and `/usage` would silently
+    /// drop streaming-mode usage.
+    #[tokio::test]
+    async fn message_stop_emits_usage_event_with_aggregated_counts() {
+        let out = replay(vec![
+            (
+                "message_start",
+                json!({
+                    "message": {
+                        "usage": {
+                            "input_tokens": 100,
+                            "cache_read_input_tokens": 50,
+                            "cache_creation_input_tokens": 10,
+                        }
+                    }
+                }),
+            ),
+            (
+                "message_delta",
+                json!({"usage": {"output_tokens": 42}}),
+            ),
+            ("message_stop", json!({})),
+        ])
+        .await;
+        // Find the Usage event.
+        let usage = out
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("expected a Usage event before Done");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 42);
+        assert_eq!(usage.cache_read_tokens, Some(50));
+        assert_eq!(usage.cache_write_tokens, Some(10));
+        // Usage must come before Done.
+        let usage_idx = out.iter().position(|e| matches!(e, StreamEvent::Usage(_)));
+        let done_idx = out.iter().position(|e| matches!(e, StreamEvent::Done));
+        assert!(
+            usage_idx < done_idx,
+            "Usage must be emitted before Done; got {out:?}"
+        );
+    }
+
     #[tokio::test]
     async fn error_event_emits_error_then_done() {
         let out = replay(vec![(

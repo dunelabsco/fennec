@@ -1144,6 +1144,18 @@ async fn handle_command_outcome(
                 let mut guard = agent.lock().await;
                 let _ = guard.turn(&prompt).await;
             }
+            AgentAction::ShowUsage => {
+                let snapshot = {
+                    let guard = agent.lock().await;
+                    guard.token_usage()
+                };
+                let body = fennec::tui::usage_panel::render(&snapshot);
+                let mut guard = app.lock();
+                guard.chat.push(fennec::tui::app::ChatLine::System {
+                    time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                    body,
+                });
+            }
         },
     }
 }

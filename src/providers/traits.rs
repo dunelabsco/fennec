@@ -13,6 +13,11 @@ pub enum StreamEvent {
     ToolCallDelta { id: String, arguments_delta: String },
     /// A tool call's arguments are complete.
     ToolCallEnd { id: String },
+    /// Usage info for the in-flight request. Emitted once per
+    /// streamed call, typically just before [`Self::Done`]. Lets
+    /// the agent accumulate tokens / cost on the streaming path
+    /// the same way the non-streaming path reads `ChatResponse.usage`.
+    Usage(UsageInfo),
     /// The response is complete.
     Done,
     /// An error occurred during streaming.
@@ -102,11 +107,15 @@ pub struct ChatResponse {
 }
 
 /// Token usage information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageInfo {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: Option<u64>,
+    /// Tokens written to the prompt cache on this call (Anthropic
+    /// `cache_creation_input_tokens`). OpenAI doesn't return this
+    /// today; provider impls leave it `None` when unavailable.
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// Async trait for LLM providers.
@@ -114,6 +123,14 @@ pub struct UsageInfo {
 pub trait Provider: Send + Sync {
     /// Human-readable name for this provider.
     fn name(&self) -> &str;
+
+    /// Currently-configured model identifier. Used by `/usage`
+    /// (pricing lookup) and `/model` (display in the panel header).
+    /// Default returns an empty string for providers that haven't
+    /// adopted the accessor yet.
+    fn model(&self) -> &str {
+        ""
+    }
 
     /// Send a chat request and get a response.
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse>;
@@ -170,6 +187,9 @@ pub async fn default_chat_stream(
             let _ = tx
                 .send(StreamEvent::ToolCallEnd { id: tc.id.clone() })
                 .await;
+        }
+        if let Some(usage) = response.usage {
+            let _ = tx.send(StreamEvent::Usage(usage)).await;
         }
         let _ = tx.send(StreamEvent::Done).await;
     });

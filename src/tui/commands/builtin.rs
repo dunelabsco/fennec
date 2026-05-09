@@ -337,17 +337,14 @@ impl CommandHandler for Usage {
         "usage"
     }
     fn help(&self) -> &'static str {
-        "show session token usage"
+        "session usage (live counts)"
     }
-    fn execute(&self, _args: &str, app: &mut App) -> Result<CommandOutcome> {
-        push_system(
-            app,
-            "session token totals come from the agent. Wiring \
-             lands in F1-2 once the agent exposes per-turn usage \
-             counters; until then `/usage` is a placeholder."
-                .into(),
-        );
-        Ok(CommandOutcome::Status("ok".into()))
+    fn execute(&self, _args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        // Real rendering happens in main.rs after the agent lock
+        // can be acquired — token totals live on the Agent itself
+        // and the slash dispatch path holds the parking_lot App
+        // mutex, not the tokio Agent mutex.
+        Ok(CommandOutcome::Agent(AgentAction::ShowUsage))
     }
 }
 

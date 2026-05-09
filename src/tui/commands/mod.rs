@@ -37,6 +37,10 @@ pub enum AgentAction {
     /// Send `prompt` as a regular turn (used by /background and
     /// similar commands that wrap a normal turn).
     Run(String),
+    /// Render the `/usage` panel — the submit loop locks the
+    /// agent, calls `Agent::token_usage`, and pushes a formatted
+    /// system message into the chat scrollback.
+    ShowUsage,
 }
 
 /// Outcome of running a slash command. Drives the TUI's response
