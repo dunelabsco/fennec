@@ -711,7 +711,14 @@ async fn build_agent_with_callbacks(
     if let Some(handle) = callbacks {
         configured_builder = configured_builder.callbacks(handle);
     }
-    let agent = configured_builder.build().context("building agent")?;
+    let mut agent = configured_builder.build().context("building agent")?;
+
+    // Apply any persisted /tools disable list from config so a
+    // user who disabled a tool last session doesn't see it
+    // re-enabled on next launch.
+    if !config.tools.disabled.is_empty() {
+        agent.set_disabled_tools(config.tools.disabled.iter().cloned());
+    }
 
     Ok((agent, memory, cron_origin, pending_replies, chat_directory))
 }
@@ -1259,6 +1266,9 @@ async fn handle_command_outcome(
             AgentAction::SwitchModel(payload) => {
                 handle_switch_model(payload, app, agent, config, home_dir).await;
             }
+            AgentAction::ToolsToggle(payload) => {
+                handle_tools_toggle(payload, app, agent, config, home_dir).await;
+            }
         },
     }
 }
@@ -1487,6 +1497,114 @@ async fn handle_switch_model(
                 ),
             };
             push(persist_msg, app);
+        }
+    }
+}
+
+/// `/tools` worker — list every registered tool with its
+/// enabled/disabled status, or toggle the listed names. After
+/// any toggle, persist the new disabled set to
+/// `~/.fennec/config.toml` and clear the agent's chat history
+/// (matching Hermes' `_reset_session_agent` behavior on
+/// tools.configure: previously-fired tool_calls in history
+/// would otherwise reference tools the model can no longer
+/// invoke). Mid-turn toggles are rejected.
+async fn handle_tools_toggle(
+    payload: Option<(bool, Vec<String>)>,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let push = |body: String, app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>| {
+        let mut g = app.lock();
+        g.chat.push(fennec::tui::app::ChatLine::System {
+            time: now.clone(),
+            body,
+        });
+    };
+
+    match payload {
+        None => {
+            // List path — read-only, no agent mutation.
+            let guard = agent.lock().await;
+            let mut names = guard.tool_names();
+            names.sort();
+            let mut body = String::from("Tools\n");
+            for n in &names {
+                let mark = if guard.is_tool_enabled(n) { "✓" } else { "✗" };
+                body.push_str(&format!("  {mark} {n}\n"));
+            }
+            body.push_str("\nUse /tools enable|disable <name> to toggle.");
+            drop(guard);
+            push(body.trim_end().to_string(), app);
+        }
+        Some((enable, requested)) => {
+            // Write path — try-lock, mutate, persist, clear history.
+            let mut agent_lock = match agent.try_lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    push(
+                        "session busy — finish the current turn before /tools".to_string(),
+                        app,
+                    );
+                    return;
+                }
+            };
+            let mut changed: Vec<String> = Vec::new();
+            let mut unknown: Vec<String> = Vec::new();
+            for n in &requested {
+                if agent_lock.set_tool_enabled(n, enable) {
+                    changed.push(n.clone());
+                } else if !agent_lock
+                    .tool_names()
+                    .iter()
+                    .any(|t| t == n)
+                {
+                    unknown.push(n.clone());
+                }
+                // If the tool exists but is already in the requested
+                // state, set_tool_enabled returns false — no error,
+                // just no-op (matches Hermes' silent idempotence).
+            }
+            // Capture the new disabled set for persistence.
+            let new_disabled = agent_lock.disabled_tool_names();
+            // Tool change must clear chat history (Hermes' behavior).
+            if !changed.is_empty() {
+                agent_lock.clear_history();
+            }
+            drop(agent_lock);
+
+            // Persist. Best-effort.
+            let mut persisted = config.clone();
+            persisted.tools.disabled = new_disabled;
+            let path = home_dir.join("config.toml");
+            if let Err(e) = persisted.save(&path) {
+                tracing::warn!("config save failed after /tools toggle: {e}");
+            }
+
+            // Reset visible chat history too so the user sees the
+            // reset Hermes also performs.
+            if !changed.is_empty() {
+                let mut g = app.lock();
+                g.chat.clear();
+                g.in_flight_bot_idx = None;
+                g.live_tool = None;
+            }
+
+            let action = if enable { "enabled" } else { "disabled" };
+            let mut body = String::new();
+            if !changed.is_empty() {
+                body.push_str(&format!("{action} {}\n", changed.join(", ")));
+                body.push_str("session reset. new tool configuration is active.");
+            } else {
+                body.push_str(&format!("nothing to {action} (already in that state)"));
+            }
+            if !unknown.is_empty() {
+                body.push_str(&format!("\nunknown tools: {}", unknown.join(", ")));
+            }
+            push(body, app);
         }
     }
 }

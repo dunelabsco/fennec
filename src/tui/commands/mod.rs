@@ -53,6 +53,13 @@ pub enum AgentAction {
     /// rejected, mirroring Hermes' `_apply_model_switch`).
     /// `None` payload means "show". `Some(name)` means "switch".
     SwitchModel(Option<String>),
+    /// `/tools` actions. `None` lists every registered tool with
+    /// its enabled/disabled status; `Some((true, names))` enables
+    /// the listed names; `Some((false, names))` disables them.
+    /// Persistence to config.toml + chat-history reset happen
+    /// alongside the toggle in the submit loop, matching Hermes'
+    /// tools.configure (server.py:6213-6280).
+    ToolsToggle(Option<(bool, Vec<String>)>),
 }
 
 /// Outcome of running a slash command. Drives the TUI's response

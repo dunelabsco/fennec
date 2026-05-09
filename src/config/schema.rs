@@ -15,6 +15,7 @@ pub struct FennecConfig {
     pub gateway: GatewayConfig,
     pub cron: CronConfig,
     pub collective: CollectiveConfig,
+    pub tools: ToolsConfig,
 }
 
 impl Default for FennecConfig {
@@ -29,8 +30,20 @@ impl Default for FennecConfig {
             gateway: GatewayConfig::default(),
             cron: CronConfig::default(),
             collective: CollectiveConfig::default(),
+            tools: ToolsConfig::default(),
         }
     }
+}
+
+/// Tool toggle configuration. Mirrors Hermes' `tools.configure`
+/// behavior (`tui_gateway/server.py:6213-6280`): disabled tools
+/// are kept on the agent but not exposed to the model and not
+/// runnable. The `disabled` list is the source of truth — a
+/// tool is enabled iff its name is absent from the list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub disabled: Vec<String>,
 }
 
 impl FennecConfig {

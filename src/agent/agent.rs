@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -58,6 +59,11 @@ pub struct Agent {
     provider: Arc<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
     tool_specs: Vec<ToolSpec>,
+    /// Tool names the user has disabled via `/tools disable`.
+    /// Disabled tools stay registered (so re-enabling is cheap)
+    /// but are filtered out of `tool_specs` shown to the model
+    /// and rejected at dispatch time.
+    disabled_tools: HashSet<String>,
     memory: Arc<dyn Memory>,
     prompt_builder: SystemPromptBuilder,
     max_tool_iterations: usize,
@@ -348,10 +354,11 @@ impl Agent {
 
         // Get streaming receiver from provider.
         let system = self.system_prompt.as_deref();
-        let tools = if self.tool_specs.is_empty() {
+        let enabled = self.enabled_tool_specs();
+        let tools = if enabled.is_empty() {
             None
         } else {
-            Some(self.tool_specs.as_slice())
+            Some(enabled.as_slice())
         };
 
         let request = ChatRequest {
@@ -439,13 +446,14 @@ impl Agent {
         for _iteration in 0..self.max_tool_iterations {
             self.callbacks.on_status("calling provider");
 
+            let enabled = self.enabled_tool_specs();
             let request = ChatRequest {
                 system: self.system_prompt.as_deref(),
                 messages: &self.history,
-                tools: if self.tool_specs.is_empty() {
+                tools: if enabled.is_empty() {
                     None
                 } else {
-                    Some(self.tool_specs.as_slice())
+                    Some(enabled.as_slice())
                 },
                 max_tokens: self.max_tokens,
                 temperature: self.temperature,
@@ -558,10 +566,11 @@ impl Agent {
     /// Call the provider with the current history and system prompt.
     async fn call_provider(&self) -> Result<ChatResponse> {
         let system = self.system_prompt.as_deref();
-        let tools = if self.tool_specs.is_empty() {
+        let enabled = self.enabled_tool_specs();
+        let tools = if enabled.is_empty() {
             None
         } else {
-            Some(self.tool_specs.as_slice())
+            Some(enabled.as_slice())
         };
 
         let request = ChatRequest {
@@ -581,6 +590,17 @@ impl Agent {
     /// tool itself (`true` only when the tool reported success — tool output
     /// containing the substring "error" must not be confused with failure).
     async fn execute_tool(&self, name: &str, args: &serde_json::Value) -> (String, bool) {
+        // Disabled tools must not run. The model shouldn't see them
+        // in tool_specs anyway, but a stale tool_call from history
+        // (or a pathological model that ignores the spec) could
+        // still target one. Returning a clear error matches Hermes'
+        // tools.configure semantics where disabled means "ignore".
+        if self.disabled_tools.contains(name) {
+            return (
+                format!("Error: tool '{name}' is currently disabled"),
+                false,
+            );
+        }
         let (raw, success) = match self.tools.iter().find(|t| t.name() == name) {
             Some(t) => match t.execute(args.clone()).await {
                 Ok(result) => {
@@ -757,6 +777,72 @@ impl Agent {
         self.system_prompt = None;
     }
 
+    /// Enumerate every registered tool's name, regardless of
+    /// enabled state. Used by `/tools` (no arg) to show the user
+    /// what's installed.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// Whether `name` is currently enabled (not in the disabled
+    /// set). Returns `true` if the tool isn't registered at all
+    /// — callers wanting "exists and enabled" should pair this
+    /// with `tool_names`.
+    pub fn is_tool_enabled(&self, name: &str) -> bool {
+        !self.disabled_tools.contains(name)
+    }
+
+    /// Toggle `name`'s enabled state. `enabled = false` adds it
+    /// to the disabled set; `enabled = true` removes it. Returns
+    /// `true` if the call changed anything (the tool exists and
+    /// the state actually flipped). Resets the cached system
+    /// prompt so the next turn rebuilds the tool-list section.
+    pub fn set_tool_enabled(&mut self, name: &str, enabled: bool) -> bool {
+        let exists = self.tools.iter().any(|t| t.name() == name);
+        if !exists {
+            return false;
+        }
+        let changed = if enabled {
+            self.disabled_tools.remove(name)
+        } else {
+            self.disabled_tools.insert(name.to_string())
+        };
+        if changed {
+            self.system_prompt = None;
+        }
+        changed
+    }
+
+    /// Replace the disabled set wholesale — used at agent
+    /// construction to seed from `FennecConfig.tools.disabled`.
+    pub fn set_disabled_tools<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.disabled_tools = names.into_iter().map(|s| s.into()).collect();
+        self.system_prompt = None;
+    }
+
+    /// Sorted list of currently-disabled tool names, suitable for
+    /// persistence into `FennecConfig.tools.disabled`.
+    pub fn disabled_tool_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.disabled_tools.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Subset of `tool_specs` actually advertised to the model
+    /// — disabled entries are filtered out so the LLM doesn't
+    /// see them as available.
+    fn enabled_tool_specs(&self) -> Vec<ToolSpec> {
+        self.tool_specs
+            .iter()
+            .filter(|spec| !self.disabled_tools.contains(&spec.name))
+            .cloned()
+            .collect()
+    }
+
     /// Get a reference to the shared memory.
     pub fn memory(&self) -> &Arc<dyn Memory> {
         &self.memory
@@ -919,6 +1005,7 @@ impl AgentBuilder {
             provider,
             tools: self.tools,
             tool_specs,
+            disabled_tools: HashSet::new(),
             memory,
             prompt_builder,
             max_tool_iterations: self.max_tool_iterations.unwrap_or(15),

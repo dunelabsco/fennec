@@ -546,17 +546,42 @@ impl CommandHandler for Tools {
         "tools"
     }
     fn help(&self) -> &'static str {
-        "toggle a tool"
+        "list/enable/disable tools (chat history clears on change)"
     }
-    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
-        push_system(
-            app,
-            format!(
-                "tools enable/disable wiring lands in F1-2. Arg seen: {:?}",
-                args.trim()
-            ),
-        );
-        Ok(CommandOutcome::Status("noted".into()))
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            return Ok(CommandOutcome::Agent(AgentAction::ToolsToggle(None)));
+        }
+        let mut parts = trimmed.split_whitespace();
+        let verb = parts.next().unwrap_or("").to_lowercase();
+        let names: Vec<String> = parts.map(|s| s.to_string()).collect();
+        match verb.as_str() {
+            "enable" => {
+                if names.is_empty() {
+                    return Ok(CommandOutcome::Status(
+                        "usage: /tools enable <name> [name…]".into(),
+                    ));
+                }
+                Ok(CommandOutcome::Agent(AgentAction::ToolsToggle(Some((
+                    true, names,
+                )))))
+            }
+            "disable" => {
+                if names.is_empty() {
+                    return Ok(CommandOutcome::Status(
+                        "usage: /tools disable <name> [name…]".into(),
+                    ));
+                }
+                Ok(CommandOutcome::Agent(AgentAction::ToolsToggle(Some((
+                    false, names,
+                )))))
+            }
+            "list" | "" => Ok(CommandOutcome::Agent(AgentAction::ToolsToggle(None))),
+            other => Ok(CommandOutcome::Status(format!(
+                "/tools: unknown verb '{other}' (expected list/enable/disable)"
+            ))),
+        }
     }
 }
 
