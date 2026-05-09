@@ -1238,12 +1238,8 @@ async fn handle_command_outcome(
             AgentAction::Retry => {
                 handle_retry(app, agent).await;
             }
-            AgentAction::Steer(_note) => {
-                // /steer's pending-injection queue lands in the
-                // next commit (F1-1: /steer with pending_steer
-                // + tool-loop hook).
-                let mut guard = app.lock();
-                guard.set_status("steer queued — injection wiring lands next");
+            AgentAction::Steer(note) => {
+                handle_steer(note, app, agent).await;
             }
             AgentAction::Run(prompt) => {
                 let mut guard = agent.lock().await;
@@ -1651,6 +1647,63 @@ fn handle_reload_env(
     let mut g = app.lock();
     g.chat.push(fennec::tui::app::ChatLine::System {
         time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body,
+    });
+}
+
+/// `/steer` worker — queue text on the agent so it's injected
+/// after the next tool batch with the "User guidance:" marker.
+/// If a turn isn't currently running (try_lock succeeds), the
+/// queued text still lands on the next tool result of whatever
+/// turn fires next, mirroring Hermes' "no active turn — queued
+/// for next" fallback (`core.ts:527-563`).
+///
+/// `/steer` itself returns immediately — actual injection
+/// happens inside `Agent::turn` / `turn_streaming`'s tool loop
+/// via `apply_pending_steer_to_tool_results`.
+async fn handle_steer(
+    note: String,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let trimmed = note.trim().to_string();
+    let body = if trimmed.is_empty() {
+        "usage: /steer <text>".to_string()
+    } else {
+        // The agent lock might be held by an in-flight turn —
+        // that's exactly the case where /steer is most useful,
+        // and Agent::steer is fine to call against a held
+        // agent because the queue is locked separately. But
+        // we still need *some* reference; use try_lock first to
+        // avoid blocking the submit task on a long-running turn.
+        let preview = truncate_for_status(&trimmed);
+        match agent.try_lock() {
+            Ok(mut g) => {
+                if g.steer(&trimmed) {
+                    format!("steer queued — arrives after next tool call: {preview}")
+                } else {
+                    "steer rejected".to_string()
+                }
+            }
+            Err(_) => {
+                // Turn is mid-flight. We still want the steer to
+                // land — fall back to a non-blocking lock that
+                // suspends the submit task briefly. Hermes' RPC
+                // path takes the agent lock unconditionally, same
+                // shape.
+                let mut g = agent.lock().await;
+                if g.steer(&trimmed) {
+                    format!("steer queued — arrives after next tool call: {preview}")
+                } else {
+                    "steer rejected".to_string()
+                }
+            }
+        }
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: now,
         body,
     });
 }

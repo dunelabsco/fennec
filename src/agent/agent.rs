@@ -70,6 +70,13 @@ pub struct Agent {
     /// `ChatMessage`. Mirrors Hermes'
     /// `session["attached_images"]` (`tui_gateway/server.py:3361-3401`).
     pending_attachments: Vec<super::attachment::ImageAttachment>,
+    /// Steer text queued via `/steer` while a turn is running
+    /// (or pre-queued for the next turn). Drained after each
+    /// tool batch; appended as "User guidance: <text>" to the
+    /// last tool result so the model sees it before its next
+    /// reply. Multiple steer calls concatenate with newlines.
+    /// Mirrors `run_agent.py:4493-4527` + `:4545-4600`.
+    pending_steer: Option<String>,
     memory: Arc<dyn Memory>,
     prompt_builder: SystemPromptBuilder,
     max_tool_iterations: usize,
@@ -274,6 +281,13 @@ impl Agent {
                 self.history
                     .push(ChatMessage::tool_result(&tc.id, &output));
             }
+
+            // Drain any /steer text queued during the tool
+            // batch so the model sees it before its next
+            // response. If no tool ran (impossible at this
+            // point — the loop body ran), apply_pending_steer
+            // is a no-op.
+            self.apply_pending_steer_to_tool_results();
         }
 
         bail!("max tool iterations ({}) exceeded", self.max_tool_iterations)
@@ -560,6 +574,11 @@ impl Agent {
                 self.history
                     .push(ChatMessage::tool_result(&tc.id, &output));
             }
+
+            // Drain any /steer text queued during the tool batch
+            // (streaming path). Same hook as turn(): inject after
+            // tool results before looping for the next provider call.
+            self.apply_pending_steer_to_tool_results();
         }
 
         bail!(
@@ -900,6 +919,67 @@ impl Agent {
         self.pending_attachments.clear();
     }
 
+    /// Append `text` to the pending-steer queue. Multiple calls
+    /// before the next tool batch concatenate with newlines, so
+    /// the model sees them as one block. Returns `true` if the
+    /// text was accepted (matches Hermes' `agent.steer` return
+    /// at `run_agent.py:4493-4527`).
+    pub fn steer(&mut self, text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        match &mut self.pending_steer {
+            Some(existing) => {
+                existing.push('\n');
+                existing.push_str(trimmed);
+            }
+            None => self.pending_steer = Some(trimmed.to_string()),
+        }
+        true
+    }
+
+    /// Whether a steer message is currently queued. Used by the
+    /// `/steer` worker to confirm acceptance.
+    pub fn has_pending_steer(&self) -> bool {
+        self.pending_steer.is_some()
+    }
+
+    /// Drain any pending steer text onto the most recent tool
+    /// result message in `history`, formatted with the
+    /// "User guidance:" marker that mirrors Hermes'
+    /// `_apply_pending_steer_to_tool_results`
+    /// (`run_agent.py:4545-4600`). Returns `true` if a steer
+    /// was applied — callers can use this to decide whether to
+    /// loop another tool iteration.
+    ///
+    /// If no tool result exists in history (i.e. the turn
+    /// produced no tool calls before terminating), the steer
+    /// stays queued for the next turn so it isn't lost.
+    fn apply_pending_steer_to_tool_results(&mut self) -> bool {
+        let Some(text) = self.pending_steer.clone() else {
+            return false;
+        };
+        // Walk back to find the most recent tool-result row.
+        let last_tool_idx = self
+            .history
+            .iter()
+            .rposition(|m| m.role == "tool");
+        let Some(idx) = last_tool_idx else {
+            // No tool result this turn — leave the queue as-is
+            // so the next turn picks it up.
+            return false;
+        };
+        let appended = format!("\n\nUser guidance: {text}");
+        if let Some(content) = self.history[idx].content.as_mut() {
+            content.push_str(&appended);
+        } else {
+            self.history[idx].content = Some(appended);
+        }
+        self.pending_steer = None;
+        true
+    }
+
     /// Internal: drain queued attachments into the
     /// provider-facing form, used at the top of `turn` /
     /// `turn_streaming` to attach them to the outbound user
@@ -1097,6 +1177,7 @@ impl AgentBuilder {
             tool_specs,
             disabled_tools: HashSet::new(),
             pending_attachments: Vec::new(),
+            pending_steer: None,
             memory,
             prompt_builder,
             max_tool_iterations: self.max_tool_iterations.unwrap_or(15),
