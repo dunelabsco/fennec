@@ -84,6 +84,11 @@ pub enum AgentAction {
     /// selects the Nth (1-indexed). Falls back to OSC52 escape
     /// when the native clipboard isn't available.
     CopyAssistantMessage(Option<usize>),
+    /// Snapshot the current TUI display state (compact_mode +
+    /// details_mode) into config.toml so the toggle survives
+    /// restart. Emitted by `/compact` and `/details` whenever
+    /// they mutate App.
+    PersistTuiSettings,
 }
 
 /// Outcome of running a slash command. Drives the TUI's response

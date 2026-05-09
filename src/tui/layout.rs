@@ -232,49 +232,58 @@ fn current_session_label(app: &App) -> String {
 
 fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
+    let compact = app.compact_mode;
     for entry in &app.chat {
         match entry {
             ChatLine::System { time, body } => {
-                lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(SUBDUED)),
-                    Span::styled(
-                        "sys ",
-                        Style::default().fg(SUBDUED).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(time.clone(), Style::default().fg(SUBDUED)),
-                ]));
+                if !compact {
+                    lines.push(Line::from(vec![
+                        Span::styled("│ ", Style::default().fg(SUBDUED)),
+                        Span::styled(
+                            "sys ",
+                            Style::default().fg(SUBDUED).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(time.clone(), Style::default().fg(SUBDUED)),
+                    ]));
+                }
                 lines.push(Line::from(Span::styled(
                     body.clone(),
                     Style::default().fg(SUBDUED),
                 )));
             }
             ChatLine::User { time, body } => {
+                if !compact {
+                    lines.push(Line::from(vec![
+                        Span::styled("│ ", Style::default().fg(AMBER)),
+                        Span::styled(
+                            "you ",
+                            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(time.clone(), Style::default().fg(SUBDUED)),
+                    ]));
+                }
+                let prefix = if compact { "› " } else { "" };
                 lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(AMBER)),
-                    Span::styled(
-                        "you ",
-                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(time.clone(), Style::default().fg(SUBDUED)),
+                    Span::styled(prefix, Style::default().fg(AMBER)),
+                    Span::styled(body.clone(), Style::default().fg(TEXT_CREAM)),
                 ]));
-                lines.push(Line::from(Span::styled(
-                    body.clone(),
-                    Style::default().fg(TEXT_CREAM),
-                )));
             }
             ChatLine::Bot { time, body } => {
+                if !compact {
+                    lines.push(Line::from(vec![
+                        Span::styled("│ ", Style::default().fg(SAND_GOLD)),
+                        Span::styled(
+                            "fennec ",
+                            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(time.clone(), Style::default().fg(SUBDUED)),
+                    ]));
+                }
+                let prefix = if compact { "↳ " } else { "" };
                 lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(SAND_GOLD)),
-                    Span::styled(
-                        "fennec ",
-                        Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(time.clone(), Style::default().fg(SUBDUED)),
+                    Span::styled(prefix, Style::default().fg(SAND_GOLD)),
+                    Span::styled(body.clone(), Style::default().fg(TEXT_CREAM)),
                 ]));
-                lines.push(Line::from(Span::styled(
-                    body.clone(),
-                    Style::default().fg(TEXT_CREAM),
-                )));
             }
             ChatLine::ToolCall { call } => {
                 lines.push(Line::from(vec![
@@ -307,7 +316,12 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                 ]));
             }
         }
-        lines.push(Line::raw(""));
+        // Spacer between entries — only in non-compact mode.
+        // Compact view drops the blank rows so more turns fit
+        // on screen.
+        if !compact {
+            lines.push(Line::raw(""));
+        }
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }

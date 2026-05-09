@@ -16,6 +16,7 @@ pub struct FennecConfig {
     pub cron: CronConfig,
     pub collective: CollectiveConfig,
     pub tools: ToolsConfig,
+    pub tui: TuiConfig,
 }
 
 impl Default for FennecConfig {
@@ -31,8 +32,29 @@ impl Default for FennecConfig {
             cron: CronConfig::default(),
             collective: CollectiveConfig::default(),
             tools: ToolsConfig::default(),
+            tui: TuiConfig::default(),
         }
     }
+}
+
+/// User-toggleable TUI display settings that survive a restart.
+/// Mirrors Hermes' `display:` section (`config.yaml`) which
+/// persists `tui_compact`, `tui_statusbar`, `show_reasoning`,
+/// etc. across sessions. New entries here should match the
+/// command that toggles them — `/compact`, `/details`, `/skin`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// Compact transcript: skips metadata header rows + spacer
+    /// blanks. Toggled by `/compact`.
+    pub compact: bool,
+    /// Detail visibility for tool calls / reasoning. Stored as
+    /// a string so old configs without the field round-trip
+    /// cleanly (default is "expanded" which matches the F1-1
+    /// renderer's existing behavior). Valid values:
+    /// "hidden" / "collapsed" / "expanded". Toggled by
+    /// `/details`.
+    pub details: String,
 }
 
 /// Tool toggle configuration. Mirrors Hermes' `tools.configure`

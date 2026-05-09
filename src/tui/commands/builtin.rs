@@ -252,15 +252,19 @@ impl CommandHandler for Compact {
         "compact"
     }
     fn help(&self) -> &'static str {
-        "toggle compact transcript rendering"
+        "toggle compact transcript rendering (persists to config)"
     }
     fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
         let want = parse_toggle(args, app.compact_mode);
         app.compact_mode = want;
-        Ok(CommandOutcome::Status(format!(
-            "compact: {}",
-            if want { "on" } else { "off" }
-        )))
+        push_system(
+            app,
+            format!("compact: {}", if want { "on" } else { "off" }),
+        );
+        // Snapshot to config.toml so the toggle survives a
+        // restart — the submit loop handles the disk write so
+        // the command stays sync.
+        Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
     }
 }
 
@@ -920,6 +924,19 @@ mod tests {
         assert!(app.compact_mode);
         r.dispatch("compact", "off", &mut app).unwrap();
         assert!(!app.compact_mode);
+    }
+
+    #[test]
+    fn compact_emits_persist_action() {
+        // The submit loop saves config.toml when /compact fires
+        // — we verify the outcome shape so a regression that
+        // drops the persistence side gets caught here rather
+        // than as silent data loss across restarts.
+        let (outcome, _app) = dispatch("compact", "on");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::PersistTuiSettings) => {}
+            other => panic!("expected PersistTuiSettings, got {:?}", other),
+        }
     }
 
     #[test]

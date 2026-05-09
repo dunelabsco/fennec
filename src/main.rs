@@ -858,6 +858,9 @@ async fn run_tui(
     let mut app = App::new();
     app.current_session_id = current_session_id.clone();
     app.skills_dir = Some(home_dir.join("skills"));
+    // Hydrate persisted TUI display toggles. /details enum
+    // wiring comes in the next commit; /compact applies now.
+    app.compact_mode = config.tui.compact;
     // Current TUI session pinned to the top.
     app.sessions.push(SessionRow {
         code: "$ ".into(),
@@ -1285,6 +1288,9 @@ async fn handle_command_outcome(
             AgentAction::CopyAssistantMessage(n) => {
                 handle_copy_assistant(n, app);
             }
+            AgentAction::PersistTuiSettings => {
+                handle_persist_tui_settings(app, config, home_dir);
+            }
         },
     }
 }
@@ -1650,6 +1656,33 @@ fn handle_reload_env(
         time: chrono::Local::now().format("%H:%M:%S").to_string(),
         body,
     });
+}
+
+/// Persist the App's TUI display state (compact, details) into
+/// `~/.fennec/config.toml` so toggles survive a restart. Called
+/// by `/compact` and `/details` after they mutate the live
+/// state. Failure is logged but doesn't surface to the user —
+/// the in-memory toggle already took effect.
+fn handle_persist_tui_settings(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) {
+    let (compact, details) = {
+        let g = app.lock();
+        // `/details` lands its own enum next; for the /compact
+        // commit we just round-trip whatever value is already
+        // in config (preserving prior runs' setting) so the
+        // /details persistence pipe is in place.
+        (g.compact_mode, config.tui.details.clone())
+    };
+    let mut persisted = config.clone();
+    persisted.tui.compact = compact;
+    persisted.tui.details = details;
+    let path = home_dir.join("config.toml");
+    if let Err(e) = persisted.save(&path) {
+        tracing::warn!("config save failed after TUI settings change: {e}");
+    }
 }
 
 /// `/steer` worker — queue text on the agent so it's injected
