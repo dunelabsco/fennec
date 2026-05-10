@@ -46,6 +46,7 @@ pub fn register_all(r: &mut CommandRegistry) {
     r.register(Box::new(Image));
     r.register(Box::new(Paste));
     r.register(Box::new(Copy));
+    r.register(Box::new(Edit));
 }
 
 // -- Lifecycle / focus -------------------------------------------
@@ -98,6 +99,7 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("image <path>", "attach an image to the next message"),
     ("paste", "paste clipboard text into the input"),
     ("copy [n]", "copy a past assistant message to clipboard"),
+    ("edit", "open $EDITOR with the current input pre-filled (also Ctrl-G)"),
 ];
 
 struct Quit;
@@ -840,6 +842,23 @@ impl CommandHandler for Copy {
     }
 }
 
+struct Edit;
+impl CommandHandler for Edit {
+    fn name(&self) -> &'static str {
+        "edit"
+    }
+    fn help(&self) -> &'static str {
+        "open $EDITOR with the current input pre-filled (also Ctrl-G)"
+    }
+    fn execute(&self, _args: &str, app: &mut App) -> Result<CommandOutcome> {
+        // Capture the current composer text so the editor opens
+        // with whatever the user has already typed. Empty input
+        // is fine — the editor will start with an empty buffer.
+        app.pending_editor = Some(app.input.text());
+        Ok(CommandOutcome::Status("opening editor…".into()))
+    }
+}
+
 // -- Helpers ----------------------------------------------------
 
 fn push_system(app: &mut App, body: String) {
@@ -985,6 +1004,41 @@ mod tests {
         // Untouched on parse failure.
         assert_eq!(app.details_mode, initial);
         assert_eq!(initial, DetailsMode::Expanded);
+    }
+
+    #[test]
+    fn edit_command_sets_pending_editor_with_input_text() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        // Type some text before /edit so we exercise the
+        // pre-fill path.
+        for c in "draft prompt".chars() {
+            app.input.insert_char(c);
+        }
+        r.dispatch("edit", "", &mut app).unwrap();
+        assert_eq!(app.pending_editor.as_deref(), Some("draft prompt"));
+    }
+
+    #[test]
+    fn ctrl_g_in_input_focus_sets_pending_editor() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = App::new();
+        app.focus = crate::tui::app::Focus::Input;
+        for c in "ask the agent".chars() {
+            app.input.insert_char(c);
+        }
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(app.pending_editor.as_deref(), Some("ask the agent"));
+    }
+
+    #[test]
+    fn alt_g_in_input_focus_also_triggers_editor_request() {
+        // VSCode/Cursor fallback: Alt-G arrives as ALT modifier.
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = App::new();
+        app.focus = crate::tui::app::Focus::Input;
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::ALT);
+        assert_eq!(app.pending_editor.as_deref(), Some(""));
     }
 
     #[test]

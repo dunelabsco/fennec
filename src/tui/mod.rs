@@ -32,6 +32,7 @@ pub mod app;
 pub mod callbacks;
 pub mod clipboard;
 pub mod commands;
+pub mod editor;
 pub mod layout;
 pub mod theme;
 pub mod usage_panel;
@@ -42,6 +43,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -126,6 +128,62 @@ where
             let mut guard = app.lock();
             guard.on_tick();
             last_tick = Instant::now();
+        }
+
+        // Editor request: drain `pending_editor` between frames.
+        // Lives outside the per-event branch so a `/edit` slash
+        // command (which sets the field via the submit task) is
+        // observed without needing a key event to wake the loop.
+        let pending = { app.lock().pending_editor.take() };
+        if let Some(initial) = pending {
+            handle_editor_request(terminal, &app, &initial);
+            // Reset the tick so we don't immediately fire on_tick
+            // after returning from the editor.
+            last_tick = Instant::now();
+        }
+    }
+}
+
+/// Suspend the alt-screen/raw-mode wrapping, hand the terminal
+/// to `$EDITOR` for the user to edit `initial`, then re-enter
+/// the TUI and (if the editor returned non-empty) replace the
+/// composer input with the saved text. Errors are surfaced as a
+/// transient status message rather than propagated — the TUI
+/// has already been restored by the time we push the message,
+/// so the user sees their session intact.
+fn handle_editor_request<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &Arc<Mutex<App>>,
+    initial: &str,
+) {
+    // Suspend: leave alt screen, drop raw mode, show cursor so
+    // vi/nano/emacs operate the way the user expects.
+    let mut stdout = io::stdout();
+    let _ = disable_raw_mode();
+    let _ = execute!(stdout, LeaveAlternateScreen, Show);
+
+    let result = editor::open_editor_for_input(initial);
+
+    // Restore: re-enter alt screen, raw mode back on, force a
+    // full repaint so the next draw doesn't try to diff against
+    // a stale frame buffer the editor scribbled over.
+    let _ = enable_raw_mode();
+    let _ = execute!(stdout, EnterAlternateScreen);
+    let _ = terminal.clear();
+
+    let mut guard = app.lock();
+    match result {
+        Ok(Some(text)) => {
+            guard.input.set(&text);
+            guard.set_status(format!("editor: {} chars", text.chars().count()));
+        }
+        Ok(None) => {
+            // Editor cancelled or returned empty — leave input
+            // untouched, just acknowledge.
+            guard.set_status("editor: cancelled".to_string());
+        }
+        Err(e) => {
+            guard.set_status(format!("editor failed: {e}"));
         }
     }
 }

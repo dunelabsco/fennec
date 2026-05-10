@@ -569,6 +569,12 @@ pub struct App {
     /// `/skills` reads this lazily via SkillsLoader so the user
     /// sees a fresh list every time without a config reload.
     pub skills_dir: Option<std::path::PathBuf>,
+    /// Set by `/edit` (or Ctrl-G) to the current input buffer
+    /// text. The TUI event loop drains this between frames,
+    /// suspends the alt-screen, runs `$EDITOR`, and applies the
+    /// returned text via `input.set(text)` before resuming.
+    /// `None` between requests.
+    pub pending_editor: Option<String>,
 }
 
 impl App {
@@ -595,6 +601,7 @@ impl App {
             current_session_id: None,
             current_session_title: None,
             skills_dir: None,
+            pending_editor: None,
         }
     }
 
@@ -688,6 +695,16 @@ impl App {
             // Editing — undo / redo.
             KeyCode::Char('z') if ctrl => self.input.undo(),
             KeyCode::Char('y') if ctrl => self.input.redo(),
+
+            // Open $EDITOR with the current input pre-filled.
+            // Hermes uses Cmd-G (macOS) / Ctrl-G (Linux/Windows)
+            // with Alt-G as the VSCode/Cursor fallback (those
+            // terminals intercept Ctrl-G as "Find Next" before
+            // we see it). Crossterm reports Alt as the META
+            // modifier, so we accept either.
+            KeyCode::Char('g') if ctrl || alt => {
+                self.pending_editor = Some(self.input.text());
+            }
 
             // Editing — bulk delete.
             KeyCode::Char('w') if ctrl => self.input.delete_word_backward(),

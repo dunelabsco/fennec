@@ -67,9 +67,11 @@ crossterm = "0.29"
 # a WAV file the existing TranscribeAudioTool can consume.
 cpal = "0.16"
 hound = "3.5"
+# `tempfile` powers `/edit` (creates a tempdir for the editor's
+# prompt.md) plus the existing `/image`/`/paste` flows under tests.
+tempfile = "3.15"
 
 [dev-dependencies]
-tempfile = "3.15"
 tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }
 
