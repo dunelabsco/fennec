@@ -2181,6 +2181,15 @@ fn apply_tui_event(
         TuiEvent::Status(msg) => {
             guard.set_status(msg);
         }
+        TuiEvent::ApprovalRequest { request, resp_tx } => {
+            fennec::tui::callbacks::install_approval_modal(&mut guard, request, resp_tx);
+        }
+        TuiEvent::ClarifyRequest { request, resp_tx } => {
+            fennec::tui::callbacks::install_clarify_modal(&mut guard, request, resp_tx);
+        }
+        TuiEvent::SecretRequest { request, resp_tx } => {
+            fennec::tui::callbacks::install_secret_modal(&mut guard, request, resp_tx);
+        }
     }
 }
 
