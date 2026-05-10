@@ -55,6 +55,14 @@ pub struct TuiConfig {
     /// "hidden" / "collapsed" / "expanded". Toggled by
     /// `/details`.
     pub details: String,
+    /// Per-section detail overrides — set via
+    /// `/details <section> <mode>`. When a section name is
+    /// present, its value wins over the global `details` mode
+    /// for rendering that section. Valid section names:
+    /// `thinking`, `tools`, `subagents`, `activity`. Mirrors
+    /// Hermes' `details_mode.*` config keys + `ui.sections`.
+    #[serde(default)]
+    pub details_sections: std::collections::HashMap<String, String>,
 }
 
 /// Tool toggle configuration. Mirrors Hermes' `tools.configure`

@@ -313,6 +313,20 @@ impl AnthropicProvider {
                             let _ = tx.send(StreamEvent::Delta(text.to_string())).await;
                         }
                     }
+                    Some("thinking_delta") => {
+                        // Extended-thinking text. Anthropic emits
+                        // these on content_block_delta frames whose
+                        // owning content_block was a `type: thinking`
+                        // block — same shape as text_delta but with
+                        // the `thinking` field instead of `text`.
+                        if let Some(text) =
+                            delta.get("thinking").and_then(|t| t.as_str())
+                        {
+                            let _ = tx
+                                .send(StreamEvent::Reasoning(text.to_string()))
+                                .await;
+                        }
+                    }
                     Some("input_json_delta") => {
                         if let Some(partial) =
                             delta.get("partial_json").and_then(|t| t.as_str())
@@ -376,6 +390,7 @@ impl AnthropicProvider {
     /// Parse the Anthropic response JSON into our ChatResponse.
     fn parse_response(body: &Value) -> Result<ChatResponse> {
         let mut text_parts = Vec::new();
+        let mut reasoning_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
         if let Some(content) = body.get("content").and_then(|c| c.as_array()) {
@@ -384,6 +399,17 @@ impl AnthropicProvider {
                     Some("text") => {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                             text_parts.push(text.to_string());
+                        }
+                    }
+                    Some("thinking") => {
+                        // Extended-thinking blocks (Claude 4.x). The
+                        // text lives in `thinking` (not `text`).
+                        // Ignore signature / cache fields — those are
+                        // for the model's internal verification.
+                        if let Some(text) =
+                            block.get("thinking").and_then(|t| t.as_str())
+                        {
+                            reasoning_parts.push(text.to_string());
                         }
                     }
                     Some("tool_use") => {
@@ -418,6 +444,11 @@ impl AnthropicProvider {
         } else {
             Some(text_parts.join(""))
         };
+        let reasoning = if reasoning_parts.is_empty() {
+            None
+        } else {
+            Some(reasoning_parts.join("\n"))
+        };
 
         // Parse usage info.
         let usage = body.get("usage").map(|u| UsageInfo {
@@ -441,6 +472,7 @@ impl AnthropicProvider {
             content,
             tool_calls,
             usage,
+            reasoning,
         })
     }
 }
@@ -892,6 +924,71 @@ mod tests {
             usage_idx < done_idx,
             "Usage must be emitted before Done; got {out:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn thinking_delta_emits_reasoning_event() {
+        // Anthropic streams extended-thinking text as
+        // `content_block_delta` frames whose `delta.type` is
+        // `thinking_delta`. We must surface those as
+        // `StreamEvent::Reasoning(text)` so the agent's
+        // streaming path can forward them to `on_reasoning_delta`.
+        let out = replay(vec![
+            (
+                "content_block_start",
+                json!({
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "let me think... "}
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "step 1: parse"}
+                }),
+            ),
+        ])
+        .await;
+        let reasonings: Vec<String> = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Reasoning(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasonings.len(), 2, "got: {out:?}");
+        assert_eq!(reasonings[0], "let me think... ");
+        assert_eq!(reasonings[1], "step 1: parse");
+    }
+
+    #[test]
+    fn parse_response_extracts_thinking_blocks() {
+        // Non-streaming response with mixed thinking + text +
+        // tool_use blocks. parse_response must populate the
+        // `reasoning` field with the thinking text and `content`
+        // with the text-only portion.
+        let body = json!({
+            "content": [
+                {"type": "thinking", "thinking": "first I should check X"},
+                {"type": "text", "text": "Sure! "},
+                {"type": "thinking", "thinking": "now Y"},
+                {"type": "text", "text": "Here's my answer."},
+            ]
+        });
+        let resp = AnthropicProvider::parse_response(&body).unwrap();
+        assert_eq!(
+            resp.reasoning.as_deref(),
+            Some("first I should check X\nnow Y")
+        );
+        assert_eq!(resp.content.as_deref(), Some("Sure! Here's my answer."));
     }
 
     #[tokio::test]

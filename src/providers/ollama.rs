@@ -185,6 +185,7 @@ impl OllamaProvider {
             content,
             tool_calls,
             usage,
+            reasoning: None,
         })
     }
 }

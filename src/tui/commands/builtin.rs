@@ -214,6 +214,9 @@ impl CommandHandler for Save {
                 ChatLine::ToolCall { call } => body.push_str(&format!("    > tool: {call}\n")),
                 ChatLine::ToolResult { summary } => body.push_str(&format!("      {summary}\n")),
                 ChatLine::ToolRunning { label, .. } => body.push_str(&format!("    > {label}\n")),
+                ChatLine::ReasoningBlock { body: b, .. } => {
+                    body.push_str(&format!("    [thinking] {b}\n"))
+                }
             }
         }
         match std::fs::write(&path, body) {
@@ -274,11 +277,50 @@ impl CommandHandler for Details {
         "details"
     }
     fn help(&self) -> &'static str {
-        "set tool / reasoning detail visibility (hidden|collapsed|expanded)"
+        "set tool / reasoning detail visibility (hidden|collapsed|expanded), or /details <section> <mode> for per-section override"
     }
     fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
         use crate::tui::app::DetailsMode;
+        const SECTIONS: &[&str] = &["thinking", "tools", "subagents", "activity"];
+
         let trimmed = args.trim();
+
+        // Two-arg form: /details <section> <mode|reset>
+        let mut parts = trimmed.split_whitespace();
+        let first = parts.next().unwrap_or("");
+        let second = parts.next();
+        if let Some(second) = second {
+            if !SECTIONS.contains(&first) {
+                return Ok(CommandOutcome::Status(format!(
+                    "details: unknown section '{first}' (expected {})",
+                    SECTIONS.join("/")
+                )));
+            }
+            let mode = if matches!(
+                second.trim().to_lowercase().as_str(),
+                "reset" | "clear" | "default"
+            ) {
+                None
+            } else {
+                match DetailsMode::parse(second) {
+                    Some(m) => Some(m),
+                    None => {
+                        return Ok(CommandOutcome::Status(format!(
+                            "details: unknown mode '{second}' (expected hidden/collapsed/expanded/reset)"
+                        )));
+                    }
+                }
+            };
+            app.set_section_override(first.to_string(), mode);
+            let body = match mode {
+                Some(m) => format!("details {first}: {}", m.as_str()),
+                None => format!("details {first}: reset to global"),
+            };
+            push_system(app, body);
+            return Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings));
+        }
+
+        // Single-arg / no-arg form: cycle or set the global mode.
         if trimmed.is_empty() {
             // Cycle through the three modes — gives users a
             // single-keystroke toggle without remembering the
@@ -293,7 +335,7 @@ impl CommandHandler for Details {
                 Some(m) => app.details_mode = m,
                 None => {
                     return Ok(CommandOutcome::Status(format!(
-                        "details: unknown mode '{trimmed}' (expected hidden/collapsed/expanded)"
+                        "details: unknown mode '{trimmed}' (expected hidden/collapsed/expanded, or /details <section> <mode>)"
                     )));
                 }
             }
@@ -985,6 +1027,53 @@ mod tests {
         // Untouched on parse failure.
         assert_eq!(app.details_mode, initial);
         assert_eq!(initial, DetailsMode::Expanded);
+    }
+
+    #[test]
+    fn details_thinking_section_override_is_recorded() {
+        use crate::tui::app::DetailsMode;
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        // /details thinking collapsed → only thinking section
+        // gets the override; global mode stays Expanded.
+        r.dispatch("details", "thinking collapsed", &mut app).unwrap();
+        assert_eq!(app.details_mode, DetailsMode::Expanded);
+        assert_eq!(
+            app.details_section_overrides.get("thinking").copied(),
+            Some(DetailsMode::Collapsed)
+        );
+        assert_eq!(app.reasoning_mode(), DetailsMode::Collapsed);
+        // /details thinking reset → override cleared, falls back
+        // to global.
+        r.dispatch("details", "thinking reset", &mut app).unwrap();
+        assert!(app.details_section_overrides.get("thinking").is_none());
+        assert_eq!(app.reasoning_mode(), DetailsMode::Expanded);
+    }
+
+    #[test]
+    fn details_thinking_with_unknown_section_returns_status() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        let outcome = r.dispatch("details", "garbage hidden", &mut app).unwrap();
+        match outcome {
+            CommandOutcome::Status(s) => {
+                assert!(s.contains("unknown section"), "got: {s}")
+            }
+            other => panic!("expected Status, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn details_thinking_with_unknown_mode_returns_status() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        let outcome = r.dispatch("details", "thinking foo", &mut app).unwrap();
+        match outcome {
+            CommandOutcome::Status(s) => {
+                assert!(s.contains("unknown mode"), "got: {s}")
+            }
+            other => panic!("expected Status, got {:?}", other),
+        }
     }
 
     #[test]

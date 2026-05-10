@@ -864,6 +864,13 @@ async fn run_tui(
     if let Some(mode) = fennec::tui::app::DetailsMode::parse(&config.tui.details) {
         app.details_mode = mode;
     }
+    // Per-section overrides set via `/details <section> <mode>`.
+    for (section, raw) in &config.tui.details_sections {
+        if let Some(mode) = fennec::tui::app::DetailsMode::parse(raw) {
+            app.details_section_overrides
+                .insert(section.clone(), mode);
+        }
+    }
     // Current TUI session pinned to the top.
     app.sessions.push(SessionRow {
         code: "$ ".into(),
@@ -1723,13 +1730,23 @@ fn handle_persist_tui_settings(
     config: &FennecConfig,
     home_dir: &std::path::Path,
 ) {
-    let (compact, details) = {
+    let (compact, details, sections) = {
         let g = app.lock();
-        (g.compact_mode, g.details_mode.as_str().to_string())
+        let sections: std::collections::HashMap<String, String> = g
+            .details_section_overrides
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().to_string()))
+            .collect();
+        (
+            g.compact_mode,
+            g.details_mode.as_str().to_string(),
+            sections,
+        )
     };
     let mut persisted = config.clone();
     persisted.tui.compact = compact;
     persisted.tui.details = details;
+    persisted.tui.details_sections = sections;
     let path = home_dir.join("config.toml");
     if let Err(e) = persisted.save(&path) {
         tracing::warn!("config save failed after TUI settings change: {e}");
@@ -2094,6 +2111,7 @@ fn apply_tui_event(
                 body: prompt,
             });
             guard.finalize_bot_message();
+            guard.finalize_reasoning_block();
         }
         TuiEvent::TurnComplete(summary) => {
             // If streaming was active, the in-flight bot message
@@ -2113,15 +2131,18 @@ fn apply_tui_event(
                 }
                 _ => {}
             }
+            guard.finalize_reasoning_block();
             guard.live_tool = None;
         }
         TuiEvent::TextDelta(delta) => {
+            // Bot's text reply starting — close any in-flight
+            // reasoning block's live cursor since thinking is
+            // logically done.
+            guard.finalize_reasoning_block();
             guard.append_bot_delta(&delta);
         }
-        TuiEvent::ReasoningDelta(_delta) => {
-            // Reasoning rendering — F1-1 ships text streaming,
-            // reasoning-block rendering (the dim "thinking…" panel
-            // upstream shows above the reply) lands in F1-2.
+        TuiEvent::ReasoningDelta(delta) => {
+            guard.append_reasoning_delta(&delta);
         }
         TuiEvent::ToolStart(s) => {
             // A tool call breaks the streaming continuity — close

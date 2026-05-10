@@ -234,6 +234,18 @@ impl OpenAIProvider {
             .and_then(|c| c.as_str())
             .map(|s| s.to_string());
 
+        // Reasoning text — two field shapes in the wild:
+        //   - `reasoning` for native OpenAI o1/o3/o4 + OpenRouter
+        //     unified shape
+        //   - `reasoning_content` for DeepSeek / Moonshot
+        // Read both, prefer the first non-empty.
+        let reasoning = message
+            .get("reasoning")
+            .and_then(|r| r.as_str())
+            .or_else(|| message.get("reasoning_content").and_then(|r| r.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
         let mut tool_calls = Vec::new();
         if let Some(tcs) = message.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tcs {
@@ -286,6 +298,7 @@ impl OpenAIProvider {
             content,
             tool_calls,
             usage,
+            reasoning,
         })
     }
 }
