@@ -1171,11 +1171,19 @@ async fn run_tui(
             // the agent's pace reasonable; bursting all queued
             // messages at once would run them back-to-back without
             // letting the user inspect the in-between outputs.
-            {
+            //
+            // Reset `last_submitted` after draining so the queued
+            // prompt re-fires even when it happens to equal the
+            // most recently submitted prompt — without this the
+            // dedup-by-last_submitted gate above silently skips
+            // /busy queue and /busy interrupt re-fires.
+            let drained = {
                 let mut g = submit_app.lock();
-                if let Some(next) = g.queued_input.pop_front() {
-                    g.input.history.push_front(next);
-                }
+                g.queued_input.pop_front()
+            };
+            if let Some(next) = drained {
+                submit_app.lock().input.history.push_front(next);
+                last_submitted = None;
             }
         }
     });
