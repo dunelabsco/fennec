@@ -212,6 +212,12 @@ impl Agent {
 
         self.turn_count += 1;
         self.last_turn_iterations = 0;
+        // Clear any stale interrupt flag from a prior turn so
+        // the user's next prompt actually runs. `/busy interrupt`
+        // sets the flag mid-turn; this is where we reset it.
+        if let Some(ref flag) = self.interrupt_flag {
+            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         let turn_start = std::time::Instant::now();
         let tokens_before_input = self.total_input_tokens;
         let tokens_before_output = self.total_output_tokens;
@@ -488,6 +494,11 @@ impl Agent {
         self.history.push(ChatMessage::user(&effective_message));
         self.turn_count += 1;
         self.last_turn_iterations = 0;
+        // Clear any stale interrupt flag from a prior turn. See
+        // matching note in `turn` above.
+        if let Some(ref flag) = self.interrupt_flag {
+            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
 
         // Tool-iteration loop, streaming each LLM call.
         for _iteration in 0..self.max_tool_iterations {

@@ -755,6 +755,10 @@ pub struct App {
     /// the fennec-warm palette (literally the same RGB values as
     /// the existing `theme::*` constants).
     pub skin: super::skin::Skin,
+    /// Shared with the main `Agent` so `/busy interrupt` can
+    /// cooperatively cancel the running turn. `None` outside TUI
+    /// mode; populated by the bootstrap before the agent builds.
+    pub main_interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Status-bar position toggled by `/statusbar`. Mirrors the
@@ -1032,6 +1036,7 @@ impl App {
             show_reasoning: true,
             agents_diff_pair: None,
             skin: super::skin::Skin::default(),
+            main_interrupt_flag: None,
         }
     }
 

@@ -269,7 +269,7 @@ async fn build_agent(
     fennec::bus::PendingReplies,
     fennec::bus::ChatDirectory,
 )> {
-    build_agent_with_callbacks(config, home_dir, model_override, channel_map, None, None).await
+    build_agent_with_callbacks(config, home_dir, model_override, channel_map, None, None, None).await
 }
 
 async fn build_agent_with_callbacks(
@@ -279,6 +279,7 @@ async fn build_agent_with_callbacks(
     channel_map: Option<ChannelMapHandle>,
     callbacks: Option<fennec::agent::callbacks::CallbacksHandle>,
     delegation_registry: Option<fennec::agent::DelegationRegistry>,
+    interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(
     fennec::agent::Agent,
     Arc<dyn Memory>,
@@ -725,6 +726,11 @@ async fn build_agent_with_callbacks(
     if let Some(handle) = callbacks {
         configured_builder = configured_builder.callbacks(handle);
     }
+    if let Some(flag) = interrupt_flag {
+        // Wire the shared interrupt flag so `/busy interrupt`
+        // can cooperatively cancel an in-flight turn.
+        configured_builder = configured_builder.interrupt_flag(flag);
+    }
     let mut agent = configured_builder.build().context("building agent")?;
 
     // Apply any persisted /tools disable list from config so a
@@ -957,6 +963,12 @@ async fn run_tui(
     if let Some(ring) = log_ring {
         app.log_ring = ring;
     }
+    // Main-agent interrupt flag shared with the submit loop so
+    // `/busy interrupt` can cancel an in-flight turn at its next
+    // tool-iteration boundary. Agent::turn clears the flag at
+    // the top of each turn so the user's next prompt runs.
+    let main_interrupt_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.main_interrupt_flag = Some(std::sync::Arc::clone(&main_interrupt_flag));
     let app = std::sync::Arc::new(parking_lot::Mutex::new(app));
 
     // Build the agent with the TUI bridge wired in as callbacks.
@@ -971,6 +983,7 @@ async fn run_tui(
             None,
             Some(bridge_handle),
             Some(delegation_registry),
+            Some(std::sync::Arc::clone(&main_interrupt_flag)),
         )
         .await?;
     let agent = std::sync::Arc::new(tokio::sync::Mutex::new(agent));
@@ -1035,6 +1048,51 @@ async fn run_tui(
                 )
                 .await;
                 continue;
+            }
+
+            // Busy-mode gate: if a turn is already in progress
+            // (the agent mutex is held), `/busy` decides what
+            // Enter should do.
+            //   - Queue: defer the prompt to `queued_input`; it
+            //     fires after the current turn completes via the
+            //     existing queue-drain hook.
+            //   - Steer: route the prompt through `/steer`'s
+            //     injection path so it lands as user-guidance
+            //     after the next tool batch.
+            //   - Interrupt (default): set the agent's interrupt
+            //     flag so the current turn bails at its next
+            //     iteration boundary; queue the new prompt to
+            //     fire when the lock frees.
+            use fennec::tui::app::BusyMode;
+            if submit_agent.try_lock().is_err() {
+                let busy_mode = submit_app.lock().busy_mode;
+                match busy_mode {
+                    BusyMode::Queue => {
+                        let mut g = submit_app.lock();
+                        g.queued_input.push_back(prompt.clone());
+                        let pending = g.queued_input.len();
+                        g.set_status(format!(
+                            "queued (agent busy) · {pending} pending"
+                        ));
+                        continue;
+                    }
+                    BusyMode::Steer => {
+                        handle_steer(prompt.clone(), &submit_app, &submit_agent).await;
+                        continue;
+                    }
+                    BusyMode::Interrupt => {
+                        if let Some(flag) = submit_app.lock().main_interrupt_flag.clone() {
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        // Re-queue ourselves so the next loop
+                        // iteration runs the new prompt once the
+                        // interrupted turn releases the lock.
+                        let mut g = submit_app.lock();
+                        g.queued_input.push_back(prompt.clone());
+                        g.set_status("interrupting current turn".to_string());
+                        continue;
+                    }
+                }
             }
 
             // Plain text — run as an agent turn (streaming, so

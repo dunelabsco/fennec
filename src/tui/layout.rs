@@ -31,18 +31,49 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let bg = Block::default().style(Style::default().bg(s.bg_dusk).fg(s.text_cream));
     f.render_widget(bg, f.area());
 
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(10),
-            Constraint::Length(1), // status bar
-            Constraint::Length(1), // shortcuts row
-        ])
-        .split(f.area());
+    // Status-bar position controls how the outer vertical layout
+    // is composed. `Bottom` (default) keeps the legacy
+    // panes/status/shortcuts stack. `Top` pulls the status bar
+    // above the panes (shortcuts stay at the bottom). `Off`
+    // drops the status bar entirely; shortcuts still render.
+    use crate::tui::app::StatusBarPosition;
+    let (outer, status_idx_opt, panes_idx, shortcut_idx) = match app.statusbar_position {
+        StatusBarPosition::Bottom => {
+            let o = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(10),
+                    Constraint::Length(1), // status bar
+                    Constraint::Length(1), // shortcuts row
+                ])
+                .split(f.area());
+            (o, Some(1usize), 0usize, 2usize)
+        }
+        StatusBarPosition::Top => {
+            let o = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // status bar
+                    Constraint::Min(10),
+                    Constraint::Length(1), // shortcuts row
+                ])
+                .split(f.area());
+            (o, Some(0usize), 1usize, 2usize)
+        }
+        StatusBarPosition::Off => {
+            let o = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(10),
+                    Constraint::Length(1), // shortcuts row
+                ])
+                .split(f.area());
+            (o, None, 0usize, 1usize)
+        }
+    };
 
-    let main_area = outer[0];
-    let status_area = outer[1];
-    let shortcut_area = outer[2];
+    let main_area = outer[panes_idx];
+    let shortcut_area = outer[shortcut_idx];
 
     let narrow = main_area.width < 120;
     let cols = if narrow {
@@ -66,7 +97,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if !narrow {
         draw_right_column(f, cols[2], app);
     }
-    draw_status(f, status_area, app, narrow);
+    if let Some(idx) = status_idx_opt {
+        draw_status(f, outer[idx], app, narrow);
+    }
     draw_shortcuts(f, shortcut_area, app);
 
     // Fullscreen overlays render last so they paint over the
@@ -299,13 +332,41 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
             }
             ChatLine::ToolCall { call } => match app.details_mode {
                 DetailsMode::Hidden => {
-                    // Skip entirely.
+                    // Skip entirely — but /verbose forces tool
+                    // calls back into view even when Hidden, on
+                    // the assumption that "verbose" is the user
+                    // saying "yes, show me more, not less."
+                    if app.verbosity
+                        == crate::tui::app::VerbosityMode::Verbose
+                    {
+                        lines.push(Line::from(vec![
+                            Span::styled("    ▸ ", Style::default().fg(s.tool_pink)),
+                            Span::styled(
+                                call.clone(),
+                                Style::default().fg(s.tool_pink),
+                            ),
+                        ]));
+                    }
                 }
                 DetailsMode::Collapsed => {
                     // Header only — drop the args portion (the
                     // text after "name(...)") so a long path or
                     // SQL string doesn't wrap. We split at the
                     // first '(' to extract the bare tool name.
+                    //
+                    // /verbose flips this: in Verbose mode the
+                    // collapsed view shows the full `call`
+                    // (name + args) so the user can scan the
+                    // arguments without expanding /details.
+                    let show_full = app.verbosity
+                        == crate::tui::app::VerbosityMode::Verbose;
+                    let label = if show_full {
+                        call.clone()
+                    } else {
+                        call.split_once('(')
+                            .map(|(name, _rest)| name.to_string())
+                            .unwrap_or_else(|| call.clone())
+                    };
                     let bare = call
                         .split_once('(')
                         .map(|(name, _rest)| name)
@@ -319,10 +380,7 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(" · ", Style::default().fg(s.subdued)),
-                        Span::styled(
-                            bare.to_string(),
-                            Style::default().fg(s.tool_pink),
-                        ),
+                        Span::styled(label, Style::default().fg(s.tool_pink)),
                     ]));
                     if bare == "delegate" {
                         append_inline_spawn_tree(&mut lines, app);
@@ -354,7 +412,20 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                     // Hidden: skip. Collapsed: skip too (the
                     // header in the matching ToolCall row is
                     // enough; the result body is the "detail"
-                    // we're collapsing).
+                    // we're collapsing). Verbose mode overrides
+                    // both — the user explicitly asked for more,
+                    // not less.
+                    if app.verbosity
+                        == crate::tui::app::VerbosityMode::Verbose
+                    {
+                        lines.push(Line::from(vec![
+                            Span::styled("    ↳ ", Style::default().fg(s.subdued)),
+                            Span::styled(
+                                summary.clone(),
+                                Style::default().fg(s.subdued),
+                            ),
+                        ]));
+                    }
                 }
                 DetailsMode::Expanded => {
                     lines.push(Line::from(vec![
