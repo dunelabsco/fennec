@@ -828,6 +828,7 @@ async fn run_tui(
     config: FennecConfig,
     home_dir: std::path::PathBuf,
     model_override: Option<String>,
+    log_ring: Option<fennec::tui::log_ring::LogRing>,
 ) -> Result<()> {
     use fennec::sessions::store::SessionStore;
     use fennec::tui::app::{App, ChatLine, SessionRow};
@@ -878,6 +879,20 @@ async fn run_tui(
     if let Some(mode) = fennec::tui::app::DetailsMode::parse(&config.tui.details) {
         app.details_mode = mode;
     }
+    if let Some(p) = fennec::tui::app::StatusBarPosition::parse(&config.tui.statusbar) {
+        app.statusbar_position = p;
+    }
+    if let Some(s) = fennec::tui::app::IndicatorStyle::parse(&config.tui.indicator) {
+        app.indicator_style = s;
+    }
+    if let Some(v) = fennec::tui::app::VerbosityMode::parse(&config.tui.verbose) {
+        app.verbosity = v;
+    }
+    if let Some(b) = fennec::tui::app::BusyMode::parse(&config.tui.busy) {
+        app.busy_mode = b;
+    }
+    app.personality_name = config.tui.personality.clone();
+    app.skin_name = config.tui.skin.clone();
     // Current TUI session pinned to the top.
     app.sessions.push(SessionRow {
         code: "$ ".into(),
@@ -931,6 +946,9 @@ async fn run_tui(
     // `DelegateTool` (so spawns honour the gate).
     let delegation_registry = fennec::agent::DelegationRegistry::default();
     app.delegation_registry = Some(delegation_registry.clone());
+    if let Some(ring) = log_ring {
+        app.log_ring = ring;
+    }
     let app = std::sync::Arc::new(parking_lot::Mutex::new(app));
 
     // Build the agent with the TUI bridge wired in as callbacks.
@@ -1063,6 +1081,18 @@ async fn run_tui(
                     {
                         tracing::warn!("session store add_message failed: {e}");
                     }
+                }
+            }
+
+            // Drain one /queue entry into the input history so the
+            // next loop iteration picks it up. One per turn keeps
+            // the agent's pace reasonable; bursting all queued
+            // messages at once would run them back-to-back without
+            // letting the user inspect the in-between outputs.
+            {
+                let mut g = submit_app.lock();
+                if let Some(next) = g.queued_input.pop_front() {
+                    g.input.history.push_front(next);
                 }
             }
         }
@@ -1340,6 +1370,26 @@ async fn handle_command_outcome(
             }
             AgentAction::PersistTuiSettings => {
                 handle_persist_tui_settings(app, config, home_dir);
+            }
+            AgentAction::SetThinkingLevel(level) => {
+                let mut g = agent.lock().await;
+                g.set_thinking_level(level);
+                drop(g);
+                let line = format!("thinking level set: {:?}", level);
+                let mut app_g = app.lock();
+                app_g.set_status(line);
+            }
+            AgentAction::SetPersona(persona) => {
+                let mut g = agent.lock().await;
+                g.set_persona(persona);
+                drop(g);
+                handle_persist_tui_settings(app, config, home_dir);
+            }
+            AgentAction::BranchSession(title) => {
+                handle_branch_session(title, app, agent, session_store).await;
+            }
+            AgentAction::ReloadSkills => {
+                handle_reload_skills(app, agent, home_dir).await;
             }
         },
     }
@@ -1743,17 +1793,183 @@ fn handle_persist_tui_settings(
     config: &FennecConfig,
     home_dir: &std::path::Path,
 ) {
-    let (compact, details) = {
+    let snap = {
         let g = app.lock();
-        (g.compact_mode, g.details_mode.as_str().to_string())
+        (
+            g.compact_mode,
+            g.details_mode.as_str().to_string(),
+            g.statusbar_position.as_str().to_string(),
+            g.indicator_style.as_str().to_string(),
+            g.verbosity.as_str().to_string(),
+            g.busy_mode.as_str().to_string(),
+            g.personality_name.clone(),
+            g.skin_name.clone(),
+        )
     };
     let mut persisted = config.clone();
-    persisted.tui.compact = compact;
-    persisted.tui.details = details;
+    persisted.tui.compact = snap.0;
+    persisted.tui.details = snap.1;
+    persisted.tui.statusbar = snap.2;
+    persisted.tui.indicator = snap.3;
+    persisted.tui.verbose = snap.4;
+    persisted.tui.busy = snap.5;
+    persisted.tui.personality = snap.6;
+    persisted.tui.skin = snap.7;
     let path = home_dir.join("config.toml");
     if let Err(e) = persisted.save(&path) {
         tracing::warn!("config save failed after TUI settings change: {e}");
     }
+}
+
+/// `/branch` worker — clone the current session's history into a
+/// fresh row in the SessionStore. The new session inherits every
+/// stored message (including tool calls / results) so the user
+/// can continue from the same context but explore a different
+/// path. The current session is kept active; switching to the
+/// new branch happens via `/resume <id>`.
+async fn handle_branch_session(
+    title: Option<String>,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    _agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    store: Option<&std::sync::Arc<fennec::sessions::SessionStore>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let store = match store {
+        Some(s) => s.clone(),
+        None => {
+            let mut g = app.lock();
+            g.chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: "/branch: no session store available".into(),
+            });
+            return;
+        }
+    };
+    let parent_id = match app.lock().current_session_id.clone() {
+        Some(id) => id,
+        None => {
+            let mut g = app.lock();
+            g.chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: "/branch: no active session to fork".into(),
+            });
+            return;
+        }
+    };
+    let messages = match store.get_session_messages(&parent_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            let mut g = app.lock();
+            g.chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: format!("/branch: failed to read parent history: {e}"),
+            });
+            return;
+        }
+    };
+    let new_id = match store.create_session("cli").await {
+        Ok(id) => id,
+        Err(e) => {
+            let mut g = app.lock();
+            g.chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: format!("/branch: failed to create new session: {e}"),
+            });
+            return;
+        }
+    };
+    // Copy each stored message into the new session, preserving
+    // role + content (tool-call structure isn't surfaced through
+    // add_message; that's a known limitation — assistant tool
+    // calls round-trip as plain text).
+    for m in &messages {
+        if let Err(e) = store
+            .add_message(&new_id, &m.role, &m.content)
+            .await
+        {
+            tracing::warn!("/branch: failed copying message: {e}");
+            break;
+        }
+    }
+    if let Some(title) = title.as_deref().filter(|t| !t.trim().is_empty()) {
+        let _ = store.set_session_title(&new_id, title).await;
+    }
+    let body = match title.as_deref().filter(|t| !t.trim().is_empty()) {
+        Some(t) => format!(
+            "branched → {t}  ·  /resume {} to switch",
+            short_session_id(&new_id)
+        ),
+        None => format!(
+            "branched → {} (untitled)  ·  /resume to switch",
+            short_session_id(&new_id)
+        ),
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System { time: now, body });
+}
+
+fn short_session_id(id: &str) -> String {
+    if id.len() > 8 {
+        id[..8].to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+/// `/reload-skills` worker — re-run `SkillsLoader::load_from_directory`
+/// against `~/.fennec/skills/` and rebuild the live agent's
+/// `skills_prompt`. The agent's cached `system_prompt` is also
+/// cleared so the new skills land on the next turn.
+async fn handle_reload_skills(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    home_dir: &std::path::Path,
+) {
+    use fennec::skills::SkillsLoader;
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let skills_dir = home_dir.join("skills");
+    let loaded = if skills_dir.exists() {
+        match tokio::task::spawn_blocking({
+            let dir = skills_dir.clone();
+            move || SkillsLoader::load_from_directory(&dir)
+        })
+        .await
+        {
+            Ok(Ok(skills)) => skills,
+            Ok(Err(e)) => {
+                let mut g = app.lock();
+                g.chat.push(fennec::tui::app::ChatLine::System {
+                    time: now,
+                    body: format!("/reload-skills: load failed: {e}"),
+                });
+                return;
+            }
+            Err(e) => {
+                let mut g = app.lock();
+                g.chat.push(fennec::tui::app::ChatLine::System {
+                    time: now,
+                    body: format!("/reload-skills: task panicked: {e}"),
+                });
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let count = loaded.len();
+    let prompt = SkillsLoader::build_skills_prompt(&loaded);
+    {
+        let mut g = agent.lock().await;
+        g.set_skills_prompt(prompt);
+    }
+    let mut guard = app.lock();
+    guard.chat.push(fennec::tui::app::ChatLine::System {
+        time: now,
+        body: format!(
+            "/reload-skills: {count} skill{} reloaded · effective next turn",
+            if count == 1 { "" } else { "s" }
+        ),
+    });
 }
 
 /// `/steer` worker — queue text on the agent so it's injected
@@ -2592,11 +2808,29 @@ async fn run_gateway(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+
+    // Tracing: in TUI mode, route output into an in-process ring
+    // buffer so `/logs` has data and so log lines don't corrupt
+    // the alt-screen render. Other modes use the default stderr
+    // writer.
+    let tui_log_ring: Option<fennec::tui::log_ring::LogRing> = match &cli.command {
+        Commands::Agent { tui: true, .. } => {
+            let ring = fennec::tui::log_ring::LogRing::new();
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_writer(ring.clone())
+                .with_ansi(false)
+                .init();
+            Some(ring)
+        }
+        _ => {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .init();
+            None
+        }
+    };
 
     // Load config: try from config dir, fall back to defaults.
     let home_dir = FennecConfig::resolve_home(cli.config_dir.as_deref());
@@ -2611,7 +2845,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Agent { message, model, tui } => {
             if tui {
-                run_tui(config, home_dir, model).await?;
+                run_tui(config, home_dir, model, tui_log_ring).await?;
             } else {
                 run_agent(config, home_dir, message, model).await?;
             }

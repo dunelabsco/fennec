@@ -880,6 +880,24 @@ impl Agent {
         self.system_prompt = None;
     }
 
+    /// Swap the persona string injected into the system prompt.
+    /// Rebuilds the cached `SystemPromptBuilder` with the same
+    /// name + new persona and clears `system_prompt` so the
+    /// next turn rebuilds from scratch. Used by `/personality`.
+    pub fn set_persona(&mut self, persona: impl Into<String>) {
+        let name = self.prompt_builder.identity_name().to_string();
+        self.prompt_builder = SystemPromptBuilder::new(name, persona);
+        self.system_prompt = None;
+    }
+
+    /// Replace the pre-rendered skills prompt fragment and
+    /// invalidate the cached system prompt so the next turn
+    /// picks up the new skills. Used by `/reload-skills`.
+    pub fn set_skills_prompt(&mut self, prompt: String) {
+        self.skills_prompt = prompt;
+        self.system_prompt = None;
+    }
+
     /// Enumerate every registered tool's name, regardless of
     /// enabled state. Used by `/tools` (no arg) to show the user
     /// what's installed.

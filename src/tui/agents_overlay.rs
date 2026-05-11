@@ -113,9 +113,111 @@ pub fn draw_agents_overlay(f: &mut Frame, screen: Rect, app: &App) {
             .split(body[0])
     };
 
-    draw_tree_pane(f, panes[0], app, tree);
-    draw_detail_pane(f, panes[1], app, tree);
+    // /replay-diff mode swaps the two-pane layout for a
+    // side-by-side diff of the chosen snapshots.
+    if let Some((a, b)) = app.agents_diff_pair {
+        draw_diff_view(f, body[0], app, a, b);
+    } else {
+        draw_tree_pane(f, panes[0], app, tree);
+        draw_detail_pane(f, panes[1], app, tree);
+    }
     draw_overlay_footer(f, body[1], app, tree);
+}
+
+/// Side-by-side comparison of two completed spawn-tree snapshots.
+/// Reads `(a, b)` as 1-based indices into `spawn_history`. Renders
+/// summary stats for each + a delta row. Modelled on the upstream's
+/// `replay-diff` (`agentsOverlay.tsx:573-678`) but trimmed to the
+/// metrics Fennec's `AggregateMetrics` actually carries — no
+/// per-token graph, no Gantt diff.
+fn draw_diff_view(f: &mut Frame, area: Rect, app: &App, a: usize, b: usize) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(PANEL_BORDER))
+        .title(Line::from(vec![
+            Span::styled("┤ ", Style::default().fg(PANEL_BORDER)),
+            Span::styled("diff", Style::default().fg(SAND_GOLD)),
+            Span::styled(
+                format!(" · {a} → {b} "),
+                Style::default().fg(SUBDUED),
+            ),
+            Span::styled("├", Style::default().fg(PANEL_BORDER)),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let snap_a = app.spawn_history.get(a.saturating_sub(1));
+    let snap_b = app.spawn_history.get(b.saturating_sub(1));
+    let (Some(snap_a), Some(snap_b)) = (snap_a, snap_b) else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "snapshot pair out of range",
+                Style::default().fg(SUBDUED),
+            ))),
+            inner,
+        );
+        return;
+    };
+
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    draw_diff_pane(f, panes[0], "baseline", a, &snap_a.tree);
+    draw_diff_pane(f, panes[1], "candidate", b, &snap_b.tree);
+}
+
+fn draw_diff_pane(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    index: usize,
+    tree: &SpawnTree,
+) {
+    let totals = tree_totals(tree);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("[{index}] {label} "),
+            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("· {} agent{}", tree.len(), plural(tree.len())),
+            Style::default().fg(SUBDUED),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(diff_field("tools", &totals.subtree_tools.to_string()));
+    lines.push(diff_field(
+        "duration",
+        &format!("{} ms", totals.subtree_duration_ms),
+    ));
+    lines.push(diff_field("depth", &totals.max_depth.to_string()));
+    lines.push(diff_field(
+        "tokens",
+        &format!(
+            "{} in · {} out",
+            totals.input_tokens, totals.output_tokens
+        ),
+    ));
+    if totals.cost_usd > 0.0 {
+        lines.push(diff_field("cost", &format!("${:.4}", totals.cost_usd)));
+    }
+    if totals.files_touched > 0 {
+        lines.push(diff_field("files", &totals.files_touched.to_string()));
+    }
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn diff_field(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {label:<10}"), Style::default().fg(SUBDUED)),
+        Span::styled(value.to_string(), Style::default().fg(TEXT_CREAM)),
+    ])
 }
 
 fn plural(n: usize) -> &'static str {

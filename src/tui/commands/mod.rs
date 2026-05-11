@@ -85,10 +85,29 @@ pub enum AgentAction {
     /// when the native clipboard isn't available.
     CopyAssistantMessage(Option<usize>),
     /// Snapshot the current TUI display state (compact_mode +
-    /// details_mode) into config.toml so the toggle survives
-    /// restart. Emitted by `/compact` and `/details` whenever
-    /// they mutate App.
+    /// details_mode + statusbar + indicator + verbosity + busy +
+    /// personality + skin) into config.toml so the toggle
+    /// survives restart. Emitted by every command that mutates a
+    /// persisted field in `TuiConfig`.
     PersistTuiSettings,
+    /// Set the agent's thinking effort. `Off`/`Low`/`Medium`/
+    /// `High`/`XHigh`. Mid-turn requests are honoured on the
+    /// next tool iteration. Emitted by `/reasoning <level>`.
+    SetThinkingLevel(crate::agent::thinking::ThinkingLevel),
+    /// Swap the persona string the agent injects into its
+    /// system prompt on the next turn. Empty string restores the
+    /// IdentityConfig.persona default. Emitted by `/personality`.
+    SetPersona(String),
+    /// Fork the current session into a fresh row in the
+    /// SessionStore, copying the existing history. `None` lets
+    /// the store pick a default title; `Some(title)` sets one.
+    /// Emitted by `/branch [name]` (alias `/fork`).
+    BranchSession(Option<String>),
+    /// Re-scan `~/.fennec/skills/` + rebuild the skills prompt
+    /// fragment on the live agent. Real reload (not the existing
+    /// `/reload-mcp` placeholder pattern). Emitted by
+    /// `/reload-skills`.
+    ReloadSkills,
 }
 
 /// Outcome of running a slash command. Drives the TUI's response
