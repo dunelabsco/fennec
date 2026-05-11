@@ -893,6 +893,14 @@ async fn run_tui(
     }
     app.personality_name = config.tui.personality.clone();
     app.skin_name = config.tui.skin.clone();
+    // Resolve the skin name on startup so the renderer reads the
+    // user's chosen palette from the first frame onwards.
+    match fennec::tui::skin::Skin::resolve(&config.tui.skin, &home_dir) {
+        Ok(s) => app.skin = s,
+        Err(e) => {
+            tracing::warn!("skin resolve failed; falling back to fennec-warm: {e}");
+        }
+    }
     // Current TUI session pinned to the top.
     app.sessions.push(SessionRow {
         code: "$ ".into(),
@@ -1416,6 +1424,9 @@ async fn handle_command_outcome(
             AgentAction::RollbackTo(hash) => {
                 handle_rollback_to(hash, app, agent, session_store).await;
             }
+            AgentAction::ApplyUserSkin(name) => {
+                handle_apply_user_skin(name, app, config, home_dir);
+            }
         },
     }
 }
@@ -1938,6 +1949,39 @@ fn short_session_id(id: &str) -> String {
         id[..8].to_string()
     } else {
         id.to_string()
+    }
+}
+
+/// `/skin <name>` worker for user-defined skins — built-ins are
+/// applied directly in the command handler. Loads
+/// `~/.fennec/skins/<name>.toml`, applies on success, persists.
+fn handle_apply_user_skin(
+    name: String,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) {
+    use fennec::tui::skin::Skin as SkinTy;
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    match SkinTy::resolve(&name, home_dir) {
+        Ok(loaded) => {
+            {
+                let mut g = app.lock();
+                g.skin = loaded;
+                g.skin_name = name.clone();
+            }
+            app.lock().chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: format!("/skin: loaded user skin '{name}'"),
+            });
+            handle_persist_tui_settings(app, config, home_dir);
+        }
+        Err(e) => {
+            app.lock().chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: format!("/skin: {e}"),
+            });
+        }
     }
 }
 

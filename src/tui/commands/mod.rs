@@ -121,6 +121,11 @@ pub enum AgentAction {
     /// No filesystem rollback (deliberate scope choice).
     RollbackList,
     RollbackTo(String),
+    /// Apply a user-defined skin from `~/.fennec/skins/<name>.toml`.
+    /// Built-in skins (`fennec-warm`, `mono`, `light`, `cool`) are
+    /// applied directly in the command handler — this variant
+    /// only fires for non-built-in names that need disk lookup.
+    ApplyUserSkin(String),
 }
 
 /// Outcome of running a slash command. Drives the TUI's response

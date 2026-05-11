@@ -63,6 +63,7 @@ pub fn register_all(r: &mut CommandRegistry) {
     r.register(Box::new(ReplayDiff));
     r.register(Box::new(Compress));
     r.register(Box::new(Rollback));
+    r.register(Box::new(Skin));
 }
 
 // -- Lifecycle / focus -------------------------------------------
@@ -131,6 +132,7 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("replay-diff", "diff two spawn-tree snapshots in the overlay"),
     ("compress [topic]", "summarise older history into one message"),
     ("rollback", "list checkpoints or restore one (rollback list|<hash>)"),
+    ("skin [name]", "swap theme variant (fennec-warm|mono|light|cool|list)"),
 ];
 
 struct Quit;
@@ -1485,6 +1487,59 @@ impl CommandHandler for Compress {
     }
 }
 
+struct Skin;
+impl CommandHandler for Skin {
+    fn name(&self) -> &'static str {
+        "skin"
+    }
+    fn help(&self) -> &'static str {
+        "swap theme variant (empty = status, list = enumerate built-ins)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let raw = args.trim();
+        let lower = raw.to_lowercase();
+        if raw.is_empty() {
+            let active = if app.skin_name.is_empty() {
+                "fennec-warm"
+            } else {
+                app.skin_name.as_str()
+            };
+            push_system(app, format!("skin: {active}"));
+            return Ok(CommandOutcome::Status("ok".into()));
+        }
+        if lower == "list" || lower == "ls" {
+            let names = crate::tui::skin::Skin::builtin_names();
+            push_system(app, format!("skins: {}", names.join(", ")));
+            return Ok(CommandOutcome::Status("ok".into()));
+        }
+        // Resolve via the user's fennec home so `~/.fennec/skins/<name>.toml`
+        // gets picked up. The submit-loop side actually applies the
+        // resolved skin to `app.skin` because it has the home_dir handle;
+        // we just record the request via PersistTuiSettings here. The
+        // app's skin_name field captures the intent; the bootstrap
+        // resolver applies on next render via apply_skin_name().
+        app.skin_name = raw.to_string();
+        match crate::tui::skin::Skin::builtin(raw) {
+            Some(s) => {
+                app.skin = s;
+                push_system(app, format!("skin → {raw}"));
+                Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
+            }
+            None => {
+                // User-defined skin — actual load happens in the
+                // submit loop where the home_dir handle is available.
+                push_system(
+                    app,
+                    format!("skin → {raw}  (resolving from ~/.fennec/skins/{raw}.toml)"),
+                );
+                Ok(CommandOutcome::Agent(AgentAction::ApplyUserSkin(
+                    raw.to_string(),
+                )))
+            }
+        }
+    }
+}
+
 struct Rollback;
 impl CommandHandler for Rollback {
     fn name(&self) -> &'static str {
@@ -1929,7 +1984,7 @@ mod tests {
             "reload", "reload-mcp", "image", "paste", "copy", "agents",
             "fortune", "queue", "statusbar", "logs", "indicator",
             "reload-skills", "verbose", "busy", "reasoning", "personality",
-            "branch", "replay", "replay-diff", "compress", "rollback",
+            "branch", "replay", "replay-diff", "compress", "rollback", "skin",
         ] {
             assert!(
                 names.contains(required),
@@ -2188,6 +2243,48 @@ mod tests {
                 assert_eq!(h, "deadbeef");
             }
             other => panic!("expected RollbackTo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn skin_no_arg_reports_active_palette() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("skin", "", &mut app).unwrap();
+        assert!(last_system_body(&app).unwrap().contains("fennec-warm"));
+    }
+
+    #[test]
+    fn skin_list_enumerates_builtins() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("skin", "list", &mut app).unwrap();
+        let body = last_system_body(&app).unwrap();
+        assert!(body.contains("fennec-warm"));
+        assert!(body.contains("mono"));
+        assert!(body.contains("light"));
+        assert!(body.contains("cool"));
+    }
+
+    #[test]
+    fn skin_builtin_swaps_app_skin() {
+        let (outcome, app) = dispatch("skin", "mono");
+        assert_eq!(app.skin_name, "mono");
+        assert_eq!(app.skin.name, "mono");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::PersistTuiSettings) => {}
+            other => panic!("expected PersistTuiSettings, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn skin_unknown_dispatches_apply_user_skin() {
+        let (outcome, _app) = dispatch("skin", "custom-name");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::ApplyUserSkin(name)) => {
+                assert_eq!(name, "custom-name");
+            }
+            other => panic!("expected ApplyUserSkin, got {:?}", other),
         }
     }
 

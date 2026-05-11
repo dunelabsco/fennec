@@ -35,6 +35,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod layout;
 pub mod log_ring;
+pub mod skin;
 pub mod spawn_tree;
 pub mod theme;
 pub mod usage_panel;

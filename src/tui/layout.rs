@@ -23,11 +23,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::app::{App, ChannelConnState, ChatLine, DetailsMode, Focus, SessionRow};
-use super::theme::*;
+use super::skin::Skin;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    let s = &app.skin;
     // Whole-screen background. Each panel paints over it.
-    let bg = Block::default().style(Style::default().bg(BG_DUSK).fg(TEXT_CREAM));
+    let bg = Block::default().style(Style::default().bg(s.bg_dusk).fg(s.text_cream));
     f.render_widget(bg, f.area());
 
     let outer = Layout::default()
@@ -80,10 +81,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 // -- Sessions panel ---------------------------------------------
 
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
+    let s = &app.skin;
     let border_color = if app.focus == Focus::Sessions {
-        SAND_GOLD
+        s.sand_gold
     } else {
-        PANEL_BORDER
+        s.panel_border
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -104,42 +106,42 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
         .split(inner);
 
     let controls = Line::from(vec![
-        Span::styled(" [f]", Style::default().fg(SAND_GOLD)),
-        Span::styled("all ", Style::default().fg(TEXT_CREAM)),
-        Span::styled("[s]", Style::default().fg(SAND_GOLD)),
-        Span::styled("recent ", Style::default().fg(TEXT_CREAM)),
-        Span::styled("[/]", Style::default().fg(SAND_GOLD)),
-        Span::styled("find", Style::default().fg(TEXT_CREAM)),
+        Span::styled(" [f]", Style::default().fg(s.sand_gold)),
+        Span::styled("all ", Style::default().fg(s.text_cream)),
+        Span::styled("[s]", Style::default().fg(s.sand_gold)),
+        Span::styled("recent ", Style::default().fg(s.text_cream)),
+        Span::styled("[/]", Style::default().fg(s.sand_gold)),
+        Span::styled("find", Style::default().fg(s.text_cream)),
     ]);
     f.render_widget(Paragraph::new(controls), layout[0]);
 
-    f.render_widget(divider(inner.width), layout[1]);
+    f.render_widget(divider(inner.width, s), layout[1]);
 
     let new_session = Line::from(vec![
         Span::styled(
             " + ",
-            Style::default().fg(MUTED_GREEN).add_modifier(Modifier::BOLD),
+            Style::default().fg(s.muted_green).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "new session",
-            Style::default().fg(MUTED_GREEN).add_modifier(Modifier::BOLD),
+            Style::default().fg(s.muted_green).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  [n]", Style::default().fg(SUBDUED)),
+        Span::styled("  [n]", Style::default().fg(s.subdued)),
     ]);
     f.render_widget(Paragraph::new(new_session), layout[2]);
 
-    f.render_widget(divider(inner.width), layout[3]);
+    f.render_widget(divider(inner.width, s), layout[3]);
 
     let items: Vec<ListItem> = app
         .sessions
         .iter()
-        .map(|s| session_row(s, area.width))
+        .map(|row| session_row(row, area.width, s))
         .collect();
     let list = List::new(items)
         .highlight_style(
             Style::default()
-                .bg(HIGHLIGHT_BG)
-                .fg(TEXT_CREAM)
+                .bg(s.highlight_bg)
+                .fg(s.text_cream)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(" ");
@@ -148,56 +150,57 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(list, layout[4], &mut state);
 }
 
-fn session_row<'a>(s: &'a SessionRow, panel_width: u16) -> ListItem<'a> {
-    let count_color = if s.has_unread { AMBER } else { SUBDUED };
-    let count_modifier = if s.has_unread {
+fn session_row<'a>(row: &'a SessionRow, panel_width: u16, s: &Skin) -> ListItem<'a> {
+    let count_color = if row.has_unread { s.amber } else { s.subdued };
+    let count_modifier = if row.has_unread {
         Modifier::BOLD
     } else {
         Modifier::empty()
     };
-    let code_color = code_color_for(&s.code);
-    let subject_max = (panel_width as usize).saturating_sub(18 + s.who.chars().count());
+    let code_color = code_color_for(&row.code, s);
+    let subject_max = (panel_width as usize).saturating_sub(18 + row.who.chars().count());
     ListItem::new(Line::from(vec![
         Span::styled(
-            format!("{} ", s.code),
+            format!("{} ", row.code),
             Style::default().fg(code_color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{} ", s.who),
-            Style::default().fg(TEXT_CREAM),
+            format!("{} ", row.who),
+            Style::default().fg(s.text_cream),
         ),
         Span::styled(
-            truncate(&s.subject, subject_max),
-            Style::default().fg(SUBDUED),
+            truncate(&row.subject, subject_max),
+            Style::default().fg(s.subdued),
         ),
         Span::styled(
-            format!("  {}", s.count),
+            format!("  {}", row.count),
             Style::default().fg(count_color).add_modifier(count_modifier),
         ),
     ]))
 }
 
 /// Source-code color mapping. Mirrors the prototype's palette.
-fn code_color_for(code: &str) -> Color {
+fn code_color_for(code: &str, s: &Skin) -> Color {
     match code.trim() {
         "TG" => Color::Rgb(0x6B, 0xA8, 0xC7),
-        "SL" => TOOL_PINK,
-        "SG" => MUTED_GREEN,
+        "SL" => s.tool_pink,
+        "SG" => s.muted_green,
         "DC" => Color::Rgb(0x90, 0x9B, 0xC7),
-        "MX" => TOOL_PINK,
-        "@" => SAND_GOLD,
-        "$" => AMBER,
-        _ => TEXT_CREAM,
+        "MX" => s.tool_pink,
+        "@" => s.sand_gold,
+        "$" => s.amber,
+        _ => s.text_cream,
     }
 }
 
 // -- Chat panel -------------------------------------------------
 
 fn draw_chat(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
+    let s = &app.skin;
     let border_color = if app.focus == Focus::Chat || app.focus == Focus::Input {
-        SAND_GOLD
+        s.sand_gold
     } else {
-        PANEL_BORDER
+        s.panel_border
     };
     let session_label = current_session_label(app);
     let block = Block::default()
@@ -205,10 +208,10 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(border_color))
         .title(Line::from(vec![
-            Span::styled("┤ ", Style::default().fg(PANEL_BORDER)),
-            Span::styled("chat ", Style::default().fg(SAND_GOLD)),
-            Span::styled(session_label, Style::default().fg(SUBDUED)),
-            Span::styled(" ├", Style::default().fg(PANEL_BORDER)),
+            Span::styled("┤ ", Style::default().fg(s.panel_border)),
+            Span::styled("chat ", Style::default().fg(s.sand_gold)),
+            Span::styled(session_label, Style::default().fg(s.subdued)),
+            Span::styled(" ├", Style::default().fg(s.panel_border)),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -239,6 +242,7 @@ fn current_session_label(app: &App) -> String {
 }
 
 fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
+    let s = &app.skin;
     let mut lines: Vec<Line> = Vec::new();
     let compact = app.compact_mode;
     for entry in &app.chat {
@@ -246,51 +250,51 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
             ChatLine::System { time, body } => {
                 if !compact {
                     lines.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(SUBDUED)),
+                        Span::styled("│ ", Style::default().fg(s.subdued)),
                         Span::styled(
                             "sys ",
-                            Style::default().fg(SUBDUED).add_modifier(Modifier::BOLD),
+                            Style::default().fg(s.subdued).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(time.clone(), Style::default().fg(SUBDUED)),
+                        Span::styled(time.clone(), Style::default().fg(s.subdued)),
                     ]));
                 }
                 lines.push(Line::from(Span::styled(
                     body.clone(),
-                    Style::default().fg(SUBDUED),
+                    Style::default().fg(s.subdued),
                 )));
             }
             ChatLine::User { time, body } => {
                 if !compact {
                     lines.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(AMBER)),
+                        Span::styled("│ ", Style::default().fg(s.amber)),
                         Span::styled(
                             "you ",
-                            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                            Style::default().fg(s.amber).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(time.clone(), Style::default().fg(SUBDUED)),
+                        Span::styled(time.clone(), Style::default().fg(s.subdued)),
                     ]));
                 }
                 let prefix = if compact { "› " } else { "" };
                 lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(AMBER)),
-                    Span::styled(body.clone(), Style::default().fg(TEXT_CREAM)),
+                    Span::styled(prefix, Style::default().fg(s.amber)),
+                    Span::styled(body.clone(), Style::default().fg(s.text_cream)),
                 ]));
             }
             ChatLine::Bot { time, body } => {
                 if !compact {
                     lines.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(SAND_GOLD)),
+                        Span::styled("│ ", Style::default().fg(s.sand_gold)),
                         Span::styled(
                             "fennec ",
-                            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
+                            Style::default().fg(s.sand_gold).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(time.clone(), Style::default().fg(SUBDUED)),
+                        Span::styled(time.clone(), Style::default().fg(s.subdued)),
                     ]));
                 }
                 let prefix = if compact { "↳ " } else { "" };
                 lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(SAND_GOLD)),
-                    Span::styled(body.clone(), Style::default().fg(TEXT_CREAM)),
+                    Span::styled(prefix, Style::default().fg(s.sand_gold)),
+                    Span::styled(body.clone(), Style::default().fg(s.text_cream)),
                 ]));
             }
             ChatLine::ToolCall { call } => match app.details_mode {
@@ -307,17 +311,17 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                         .map(|(name, _rest)| name)
                         .unwrap_or(call.as_str());
                     lines.push(Line::from(vec![
-                        Span::styled("    ▸ ", Style::default().fg(TOOL_PINK)),
+                        Span::styled("    ▸ ", Style::default().fg(s.tool_pink)),
                         Span::styled(
                             "tool",
                             Style::default()
-                                .fg(TOOL_PINK)
+                                .fg(s.tool_pink)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(" · ", Style::default().fg(SUBDUED)),
+                        Span::styled(" · ", Style::default().fg(s.subdued)),
                         Span::styled(
                             bare.to_string(),
-                            Style::default().fg(TOOL_PINK),
+                            Style::default().fg(s.tool_pink),
                         ),
                     ]));
                     if bare == "delegate" {
@@ -330,15 +334,15 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                         .map(|(name, _rest)| name)
                         .unwrap_or(call.as_str());
                     lines.push(Line::from(vec![
-                        Span::styled("    ▸ ", Style::default().fg(TOOL_PINK)),
+                        Span::styled("    ▸ ", Style::default().fg(s.tool_pink)),
                         Span::styled(
                             "tool",
                             Style::default()
-                                .fg(TOOL_PINK)
+                                .fg(s.tool_pink)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(" · ", Style::default().fg(SUBDUED)),
-                        Span::styled(call.clone(), Style::default().fg(TOOL_PINK)),
+                        Span::styled(" · ", Style::default().fg(s.subdued)),
+                        Span::styled(call.clone(), Style::default().fg(s.tool_pink)),
                     ]));
                     if bare == "delegate" {
                         append_inline_spawn_tree(&mut lines, app);
@@ -354,10 +358,10 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                 }
                 DetailsMode::Expanded => {
                     lines.push(Line::from(vec![
-                        Span::styled("    ↳ ", Style::default().fg(SUBDUED)),
+                        Span::styled("    ↳ ", Style::default().fg(s.subdued)),
                         Span::styled(
                             summary.clone(),
-                            Style::default().fg(SUBDUED),
+                            Style::default().fg(s.subdued),
                         ),
                     ]));
                 }
@@ -373,12 +377,12 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("    {} ", app.spinner_glyph()),
-                            Style::default().fg(TOOL_PINK),
+                            Style::default().fg(s.tool_pink),
                         ),
                         Span::styled(
                             format!("{label} ({elapsed}ms)"),
                             Style::default()
-                                .fg(TOOL_PINK)
+                                .fg(s.tool_pink)
                                 .add_modifier(Modifier::DIM),
                         ),
                     ]));
@@ -401,6 +405,7 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
 /// Hermes' `thinking.tsx:889-890` rule). Multiple parallel
 /// delegates skip the inline view and rely on `/agents` to surface.
 fn append_inline_spawn_tree(lines: &mut Vec<Line<'static>>, app: &App) {
+    let s = &app.skin;
     let tree = if !app.spawn_tree.is_empty() {
         &app.spawn_tree
     } else if let Some(snap) = app.spawn_history.get(0) {
@@ -428,19 +433,19 @@ fn append_inline_spawn_tree(lines: &mut Vec<Line<'static>>, app: &App) {
                 Span::styled(
                     "▍ ",
                     Style::default().fg(match bucket {
-                        2 => AMBER,
-                        3 => TOOL_PINK,
-                        _ => TERRACOTTA,
+                        2 => s.amber,
+                        3 => s.tool_pink,
+                        _ => s.terracotta,
                     }),
                 )
             } else {
                 Span::styled("  ", Style::default())
             };
             let glyph_color = match node.status {
-                super::spawn_tree::SubagentStatus::Completed => MUTED_GREEN,
+                super::spawn_tree::SubagentStatus::Completed => s.muted_green,
                 super::spawn_tree::SubagentStatus::Failed
-                | super::spawn_tree::SubagentStatus::Interrupted => TERRACOTTA,
-                _ => AMBER,
+                | super::spawn_tree::SubagentStatus::Interrupted => s.terracotta,
+                _ => s.amber,
             };
             let goal_preview: String = node
                 .goal
@@ -453,14 +458,14 @@ fn append_inline_spawn_tree(lines: &mut Vec<Line<'static>>, app: &App) {
                 String::new()
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{indent}└─ "), Style::default().fg(SUBDUED)),
+                Span::styled(format!("{indent}└─ "), Style::default().fg(s.subdued)),
                 heat,
                 Span::styled(
                     format!("{} ", node.status.glyph()),
                     Style::default().fg(glyph_color),
                 ),
-                Span::styled(goal_preview, Style::default().fg(TEXT_CREAM)),
-                Span::styled(suffix, Style::default().fg(SUBDUED)),
+                Span::styled(goal_preview, Style::default().fg(s.text_cream)),
+                Span::styled(suffix, Style::default().fg(s.subdued)),
             ]));
         }
     }
@@ -469,7 +474,7 @@ fn append_inline_spawn_tree(lines: &mut Vec<Line<'static>>, app: &App) {
             Span::styled("        ", Style::default()),
             Span::styled(
                 format!("…+{} more · /agents for full tree", total - 6),
-                Style::default().fg(SUBDUED).add_modifier(Modifier::ITALIC),
+                Style::default().fg(s.subdued).add_modifier(Modifier::ITALIC),
             ),
         ]));
     }
@@ -489,6 +494,7 @@ fn push_inline_descendants(
 }
 
 fn draw_chat_bottom(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
+    let s = &app.skin;
     let layout = if narrow {
         Layout::default()
             .direction(Direction::Vertical)
@@ -518,21 +524,21 @@ fn draw_chat_bottom(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
             Line::from(vec![
                 Span::styled(
                     format!(" {} ", app.spinner_glyph()),
-                    Style::default().fg(TOOL_PINK),
+                    Style::default().fg(s.tool_pink),
                 ),
-                Span::styled("running ", Style::default().fg(SUBDUED)),
-                Span::styled(t.name.clone(), Style::default().fg(TOOL_PINK)),
+                Span::styled("running ", Style::default().fg(s.subdued)),
+                Span::styled(t.name.clone(), Style::default().fg(s.tool_pink)),
                 Span::styled(
                     format!(" ({}ms)  ", t.started_at.elapsed().as_millis()),
-                    Style::default().fg(SUBDUED),
+                    Style::default().fg(s.subdued),
                 ),
-                Span::styled("[t] ", Style::default().fg(SAND_GOLD)),
-                Span::styled("tool detail", Style::default().fg(SUBDUED)),
+                Span::styled("[t] ", Style::default().fg(s.sand_gold)),
+                Span::styled("tool detail", Style::default().fg(s.subdued)),
             ])
         } else if let Some((msg, _)) = &app.transient_status {
             Line::from(Span::styled(
                 format!(" {}", msg),
-                Style::default().fg(SUBDUED),
+                Style::default().fg(s.subdued),
             ))
         } else {
             Line::raw("")
@@ -549,7 +555,7 @@ fn draw_chat_bottom(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(SAND_GOLD));
+        .border_style(Style::default().fg(s.sand_gold));
     // The block borders consume rows 0 and 2 of the next 3 rows;
     // we use the inner of a manually-split 3-row box.
     let box_top = layout[idx];
@@ -565,15 +571,15 @@ fn draw_chat_bottom(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
     let cursor = if app.cursor_visible { "█" } else { " " };
     let prompt = if app.input.is_empty() {
         Line::from(vec![
-            Span::styled(" › ", Style::default().fg(SAND_GOLD)),
-            Span::styled(cursor, Style::default().fg(SAND_GOLD)),
-            Span::styled("  type a message…", Style::default().fg(SUBDUED)),
+            Span::styled(" › ", Style::default().fg(s.sand_gold)),
+            Span::styled(cursor, Style::default().fg(s.sand_gold)),
+            Span::styled("  type a message…", Style::default().fg(s.subdued)),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" › ", Style::default().fg(SAND_GOLD)),
-            Span::styled(app.input.text(), Style::default().fg(TEXT_CREAM)),
-            Span::styled(cursor, Style::default().fg(SAND_GOLD)),
+            Span::styled(" › ", Style::default().fg(s.sand_gold)),
+            Span::styled(app.input.text(), Style::default().fg(s.text_cream)),
+            Span::styled(cursor, Style::default().fg(s.sand_gold)),
         ])
     };
     f.render_widget(Paragraph::new(prompt), inner);
@@ -583,12 +589,12 @@ fn draw_chat_bottom(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
     // Hint row below the input.
     if idx < layout.len() {
         let hint = Line::from(vec![
-            Span::styled(" [enter] ", Style::default().fg(SAND_GOLD)),
-            Span::styled("send  ", Style::default().fg(SUBDUED)),
-            Span::styled("[shift-enter] ", Style::default().fg(SAND_GOLD)),
-            Span::styled("newline  ", Style::default().fg(SUBDUED)),
-            Span::styled("[ctrl-c] ", Style::default().fg(SAND_GOLD)),
-            Span::styled("cancel turn", Style::default().fg(SUBDUED)),
+            Span::styled(" [enter] ", Style::default().fg(s.sand_gold)),
+            Span::styled("send  ", Style::default().fg(s.subdued)),
+            Span::styled("[shift-enter] ", Style::default().fg(s.sand_gold)),
+            Span::styled("newline  ", Style::default().fg(s.subdued)),
+            Span::styled("[ctrl-c] ", Style::default().fg(s.sand_gold)),
+            Span::styled("cancel turn", Style::default().fg(s.subdued)),
         ]);
         f.render_widget(Paragraph::new(hint), layout[idx]);
     }
@@ -606,10 +612,11 @@ fn draw_right_column(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_tool_live(f: &mut Frame, area: Rect, app: &App) {
+    let s = &app.skin;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(TOOL_PINK));
+        .border_style(Style::default().fg(s.tool_pink));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -631,28 +638,28 @@ fn draw_tool_live(f: &mut Frame, area: Rect, app: &App) {
         let header = Line::from(vec![
             Span::styled(
                 format!("{} ", app.spinner_glyph()),
-                Style::default().fg(TOOL_PINK),
+                Style::default().fg(s.tool_pink),
             ),
-            Span::styled("running ", Style::default().fg(SUBDUED)),
+            Span::styled("running ", Style::default().fg(s.subdued)),
             Span::styled(
                 t.name.clone(),
-                Style::default().fg(TOOL_PINK).add_modifier(Modifier::BOLD),
+                Style::default().fg(s.tool_pink).add_modifier(Modifier::BOLD),
             ),
         ]);
         f.render_widget(Paragraph::new(header), layout[0]);
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("args ", Style::default().fg(SUBDUED)),
-                Span::styled(t.args_preview.clone(), Style::default().fg(TEXT_CREAM)),
+                Span::styled("args ", Style::default().fg(s.subdued)),
+                Span::styled(t.args_preview.clone(), Style::default().fg(s.text_cream)),
             ])),
             layout[1],
         );
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("started ", Style::default().fg(SUBDUED)),
+                Span::styled("started ", Style::default().fg(s.subdued)),
                 Span::styled(
                     format!("{}ms ago", t.started_at.elapsed().as_millis()),
-                    Style::default().fg(TEXT_CREAM),
+                    Style::default().fg(s.text_cream),
                 ),
             ])),
             layout[3],
@@ -664,18 +671,18 @@ fn draw_tool_live(f: &mut Frame, area: Rect, app: &App) {
             ((elapsed * 100) / cycle) as u8
         });
         let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(SAND_GOLD).bg(HIGHLIGHT_BG))
+            .gauge_style(Style::default().fg(s.sand_gold).bg(s.highlight_bg))
             .percent(u16::from(progress))
             .label(Span::styled(
                 format!("{progress}%"),
-                Style::default().fg(TEXT_CREAM),
+                Style::default().fg(s.text_cream),
             ));
         f.render_widget(gauge, layout[5]);
     } else {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "no tool running",
-                Style::default().fg(SUBDUED),
+                Style::default().fg(s.subdued),
             ))),
             layout[0],
         );
@@ -684,7 +691,7 @@ fn draw_tool_live(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "recent",
-            Style::default().fg(SUBDUED).add_modifier(Modifier::BOLD),
+            Style::default().fg(s.subdued).add_modifier(Modifier::BOLD),
         ))),
         layout[6],
     );
@@ -694,17 +701,17 @@ fn draw_tool_live(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|t| {
             let (mark, mark_color) = if t.ok {
-                ("✓ ", MUTED_GREEN)
+                ("✓ ", s.muted_green)
             } else {
-                ("✗ ", TERRACOTTA)
+                ("✗ ", s.terracotta)
             };
             Line::from(vec![
                 Span::styled(mark, Style::default().fg(mark_color)),
                 Span::styled(
                     format!("{} ", t.name),
-                    Style::default().fg(TEXT_CREAM),
+                    Style::default().fg(s.text_cream),
                 ),
-                Span::styled(t.note.clone(), Style::default().fg(SUBDUED)),
+                Span::styled(t.note.clone(), Style::default().fg(s.subdued)),
             ])
         })
         .collect();
@@ -712,10 +719,11 @@ fn draw_tool_live(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_channels(f: &mut Frame, area: Rect, app: &App) {
+    let s = &app.skin;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(PANEL_BORDER));
+        .border_style(Style::default().fg(s.panel_border));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -724,12 +732,12 @@ fn draw_channels(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|c| {
             let state_color = match c.state {
-                ChannelConnState::Connected => MUTED_GREEN,
-                ChannelConnState::Polling => AMBER,
-                ChannelConnState::Attached => SAND_GOLD,
-                ChannelConnState::Idle => SUBDUED,
-                ChannelConnState::Disconnected => SUBDUED,
-                ChannelConnState::Error => TERRACOTTA,
+                ChannelConnState::Connected => s.muted_green,
+                ChannelConnState::Polling => s.amber,
+                ChannelConnState::Attached => s.sand_gold,
+                ChannelConnState::Idle => s.subdued,
+                ChannelConnState::Disconnected => s.subdued,
+                ChannelConnState::Error => s.terracotta,
             };
             let state_text = match c.state {
                 ChannelConnState::Connected => "connected",
@@ -743,13 +751,13 @@ fn draw_channels(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(
                     format!("{} ", c.code),
                     Style::default()
-                        .fg(code_color_for(&c.code))
+                        .fg(code_color_for(&c.code, s))
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("{:<8}", c.name), Style::default().fg(TEXT_CREAM)),
+                Span::styled(format!("{:<8}", c.name), Style::default().fg(s.text_cream)),
                 Span::styled("● ", Style::default().fg(state_color)),
                 Span::styled(format!("{:<10}", state_text), Style::default().fg(state_color)),
-                Span::styled(c.detail.clone(), Style::default().fg(SUBDUED)),
+                Span::styled(c.detail.clone(), Style::default().fg(s.subdued)),
             ])
         })
         .collect();
@@ -759,6 +767,7 @@ fn draw_channels(f: &mut Frame, area: Rect, app: &App) {
 // -- Status + shortcuts row -------------------------------------
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
+    let s = &app.skin;
     let connected = app
         .channels
         .iter()
@@ -769,29 +778,29 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
         Span::styled(
             " fennec ",
             Style::default()
-                .bg(SAND_GOLD)
-                .fg(BG_DUSK)
+                .bg(s.sand_gold)
+                .fg(s.bg_dusk)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(" v{}  ", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(SUBDUED),
+            Style::default().fg(s.subdued),
         ),
-        Span::styled("● ", Style::default().fg(MUTED_GREEN)),
+        Span::styled("● ", Style::default().fg(s.muted_green)),
         Span::styled(
             format!("agent ready · {connected}/{total} channels"),
-            Style::default().fg(MUTED_GREEN),
+            Style::default().fg(s.muted_green),
         ),
     ];
     if narrow {
-        spans.push(Span::styled("  ● ", Style::default().fg(MUTED_GREEN)));
+        spans.push(Span::styled("  ● ", Style::default().fg(s.muted_green)));
         spans.push(Span::styled(
             format!("channels {connected}/{total}"),
-            Style::default().fg(MUTED_GREEN),
+            Style::default().fg(s.muted_green),
         ));
     }
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(SHORTCUT_BG)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(s.shortcut_bg)),
         area,
     );
 
@@ -799,42 +808,43 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
     let clock = chrono::Local::now().format("%H:%M:%S").to_string();
     let clock_line = Line::from(vec![Span::styled(
         format!("{clock} "),
-        Style::default().fg(SUBDUED),
+        Style::default().fg(s.subdued),
     )])
     .alignment(Alignment::Right);
     f.render_widget(
-        Paragraph::new(clock_line).style(Style::default().bg(SHORTCUT_BG)),
+        Paragraph::new(clock_line).style(Style::default().bg(s.shortcut_bg)),
         area,
     );
 }
 
 fn draw_shortcuts(f: &mut Frame, area: Rect, _app: &App) {
+    let s = &_app.skin;
     let line = Line::from(vec![
-        Span::styled(" [q] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("quit  ", Style::default().fg(SUBDUED)),
-        Span::styled("[↑↓] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("navigate  ", Style::default().fg(SUBDUED)),
-        Span::styled("[↵] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("send  ", Style::default().fg(SUBDUED)),
-        Span::styled("[/] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("command  ", Style::default().fg(SUBDUED)),
-        Span::styled("[tab] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("next pane  ", Style::default().fg(SUBDUED)),
-        Span::styled("[?] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("help", Style::default().fg(SUBDUED)),
+        Span::styled(" [q] ", Style::default().fg(s.sand_gold)),
+        Span::styled("quit  ", Style::default().fg(s.subdued)),
+        Span::styled("[↑↓] ", Style::default().fg(s.sand_gold)),
+        Span::styled("navigate  ", Style::default().fg(s.subdued)),
+        Span::styled("[↵] ", Style::default().fg(s.sand_gold)),
+        Span::styled("send  ", Style::default().fg(s.subdued)),
+        Span::styled("[/] ", Style::default().fg(s.sand_gold)),
+        Span::styled("command  ", Style::default().fg(s.subdued)),
+        Span::styled("[tab] ", Style::default().fg(s.sand_gold)),
+        Span::styled("next pane  ", Style::default().fg(s.subdued)),
+        Span::styled("[?] ", Style::default().fg(s.sand_gold)),
+        Span::styled("help", Style::default().fg(s.subdued)),
     ]);
     f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(SHORTCUT_BG)),
+        Paragraph::new(line).style(Style::default().bg(s.shortcut_bg)),
         area,
     );
 }
 
 // -- Helpers ----------------------------------------------------
 
-fn divider(width: u16) -> Paragraph<'static> {
+fn divider(width: u16, s: &Skin) -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(
         "─".repeat(width as usize),
-        Style::default().fg(PANEL_BORDER),
+        Style::default().fg(s.panel_border),
     )))
 }
 

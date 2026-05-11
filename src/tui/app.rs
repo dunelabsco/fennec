@@ -749,6 +749,12 @@ pub struct App {
     /// snapshot pair to render in the agents overlay's diff view.
     /// `None` = normal single-tree mode. Set by `/replay-diff`.
     pub agents_diff_pair: Option<(usize, usize)>,
+    /// Active skin (theme variant). Renderers read every colour
+    /// from this struct rather than the `theme::*` constants so
+    /// `/skin <name>` can swap palettes at runtime. Default is
+    /// the fennec-warm palette (literally the same RGB values as
+    /// the existing `theme::*` constants).
+    pub skin: super::skin::Skin,
 }
 
 /// Status-bar position toggled by `/statusbar`. Mirrors the
@@ -1025,6 +1031,7 @@ impl App {
             skin_name: String::new(),
             show_reasoning: true,
             agents_diff_pair: None,
+            skin: super::skin::Skin::default(),
         }
     }
 
