@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-/// Per-process delegation caps. Numbers track Hermes defaults so
-/// behaviour is predictable for users coming from there.
+/// Per-process delegation caps. Numbers track upstream defaults
+/// so behaviour is predictable for users coming from there.
 #[derive(Debug, Clone, Copy)]
 pub struct DelegationCaps {
     /// Maximum spawn depth (0 = main agent only, 1 = main may

@@ -6,7 +6,7 @@
 //! (`arboard::Clipboard::get_image`) is exposed as raw RGBA so
 //! the caller can re-encode to PNG before persisting.
 //!
-//! Mirrors Hermes' clipboard plumbing
+//! Mirrors the upstream's clipboard plumbing
 //! (`tui_gateway/server.py:3321-3358` for image paste,
 //! `ui-tui/src/app/slash/commands/core/core.ts:325-372` for
 //! /copy with OSC52 fallback).

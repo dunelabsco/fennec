@@ -1427,6 +1427,10 @@ impl CommandHandler for Replay {
             }
         };
         app.agents_history_index = index;
+        // Clear any in-flight diff pair so reopening the overlay
+        // after a /replay-diff session shows the single-tree
+        // view, not the side-by-side diff.
+        app.agents_diff_pair = None;
         app.show_agents_overlay = true;
         app.agents_cursor = app.agents_flat_node_ids().first().cloned();
         push_system(app, format!("replay · {index}/{max}"));
@@ -1513,14 +1517,16 @@ impl CommandHandler for Skin {
             return Ok(CommandOutcome::Status("ok".into()));
         }
         // Resolve via the user's fennec home so `~/.fennec/skins/<name>.toml`
-        // gets picked up. The submit-loop side actually applies the
-        // resolved skin to `app.skin` because it has the home_dir handle;
-        // we just record the request via PersistTuiSettings here. The
-        // app's skin_name field captures the intent; the bootstrap
-        // resolver applies on next render via apply_skin_name().
-        app.skin_name = raw.to_string();
+        // Built-ins are applied immediately; user-defined skins
+        // need disk lookup, so we defer to `ApplyUserSkin` which
+        // runs in the submit loop where `home_dir` is in scope.
+        // For built-ins we set `skin_name` AND `skin` together;
+        // for user skins we wait — the worker sets both fields
+        // only on successful resolve so a missing file doesn't
+        // leave the persisted name pointing at a phantom skin.
         match crate::tui::skin::Skin::builtin(raw) {
             Some(s) => {
+                app.skin_name = raw.to_string();
                 app.skin = s;
                 push_system(app, format!("skin → {raw}"));
                 Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
@@ -2032,14 +2038,16 @@ mod tests {
     }
 
     #[test]
-    fn statusbar_toggle_cycles_off_and_top() {
+    fn statusbar_toggle_cycles_all_three_positions() {
         let r = CommandRegistry::with_builtins();
         let mut app = App::new();
         assert_eq!(app.statusbar_position, StatusBarPosition::Bottom);
         r.dispatch("statusbar", "toggle", &mut app).unwrap();
-        assert_eq!(app.statusbar_position, StatusBarPosition::Off);
-        r.dispatch("sb", "toggle", &mut app).unwrap();
         assert_eq!(app.statusbar_position, StatusBarPosition::Top);
+        r.dispatch("sb", "toggle", &mut app).unwrap();
+        assert_eq!(app.statusbar_position, StatusBarPosition::Off);
+        r.dispatch("statusbar", "toggle", &mut app).unwrap();
+        assert_eq!(app.statusbar_position, StatusBarPosition::Bottom);
     }
 
     #[test]

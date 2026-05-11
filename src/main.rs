@@ -2204,13 +2204,16 @@ async fn handle_rollback_to(
         let mut g = agent.lock().await;
         g.clear_history();
     }
-    // Trim chat scrollback to roughly match — drop entries after
-    // the index corresponding to message_count. The chat pane
-    // mixes system / user / bot / tool lines so we can't index
-    // exactly; truncate by user-message count instead.
+    // Trim chat scrollback to roughly match. `checkpoint.message_count`
+    // counts both user AND assistant rows in the SQL table (one
+    // per send-or-receive). The chat pane mixes those plus tool
+    // calls / system lines, so we count User+Bot lines as
+    // "messages" and stop once we've passed that many. System +
+    // tool-result lines stay (they're context for the kept
+    // messages); anything visually past the cut is dropped.
     {
         let mut g = app.lock();
-        truncate_chat_to_user_count(&mut g, checkpoint.message_count);
+        truncate_chat_to_message_count(&mut g, checkpoint.message_count);
     }
     app.lock().chat.push(fennec::tui::app::ChatLine::System {
         time: now,
@@ -2222,19 +2225,20 @@ async fn handle_rollback_to(
     });
 }
 
-/// Trim chat scrollback so it has at most `keep_count` user
-/// messages. Used by `/rollback` to keep the visual transcript
-/// roughly in sync with the database state. System + assistant +
-/// tool lines that appeared before the cut point stay; everything
-/// after the Nth user message is dropped.
-fn truncate_chat_to_user_count(app: &mut fennec::tui::App, keep_count: usize) {
+/// Trim chat scrollback so it has at most `keep_count` chat
+/// messages (counting `User` + `Bot` lines, matching the SQL
+/// table's row count). Used by `/rollback`. System / tool lines
+/// before the cut point stay (they're context for the kept
+/// messages); everything visually past the cut is dropped.
+fn truncate_chat_to_message_count(app: &mut fennec::tui::App, keep_count: usize) {
     use fennec::tui::app::ChatLine;
-    let mut user_seen = 0usize;
+    let mut msg_seen = 0usize;
     let mut cut_at = app.chat.len();
     for (i, line) in app.chat.iter().enumerate() {
-        if matches!(line, ChatLine::User { .. }) {
-            user_seen += 1;
-            if user_seen > keep_count {
+        let is_msg = matches!(line, ChatLine::User { .. } | ChatLine::Bot { .. });
+        if is_msg {
+            msg_seen += 1;
+            if msg_seen > keep_count {
                 cut_at = i;
                 break;
             }
@@ -2785,7 +2789,7 @@ fn apply_tui_event(
             guard.spawn_tree.on_complete(complete);
             // When every node has reached a terminal status, snapshot
             // the live tree onto history and reset for the next spawn
-            // round. Mirrors Hermes' auto-promote-on-settle behavior.
+            // round. Auto-promote-on-settle behavior.
             if guard.spawn_tree.is_settled() {
                 let settled = std::mem::take(&mut guard.spawn_tree);
                 guard.spawn_history.push(settled);

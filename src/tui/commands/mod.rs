@@ -45,27 +45,27 @@ pub enum AgentAction {
     /// `None` means "show the current title". Empty string means
     /// "clear the title". A non-empty string sets the title.
     SessionTitle(Option<String>),
-    /// Resume a saved session by id-or-title (Hermes' fallback
+    /// Resume a saved session by id-or-title (the upstream's fallback
     /// matches by exact title when no id matches).
     SessionResume(String),
     /// Show the active model and a known-models list, or swap
     /// to a different model live (mid-turn requests are
-    /// rejected, mirroring Hermes' `_apply_model_switch`).
+    /// rejected, mirroring the upstream's `_apply_model_switch`).
     /// `None` payload means "show". `Some(name)` means "switch".
     SwitchModel(Option<String>),
     /// `/tools` actions. `None` lists every registered tool with
     /// its enabled/disabled status; `Some((true, names))` enables
     /// the listed names; `Some((false, names))` disables them.
     /// Persistence to config.toml + chat-history reset happen
-    /// alongside the toggle in the submit loop, matching Hermes'
+    /// alongside the toggle in the submit loop, matching the upstream's
     /// tools.configure (server.py:6213-6280).
     ToolsToggle(Option<(bool, Vec<String>)>),
     /// Re-read `~/.fennec/.env` into the running process so
     /// changed env-only credentials (API keys, base URLs) take
-    /// effect on the next provider call. Mirrors Hermes' reload.env.
+    /// effect on the next provider call. Mirrors the upstream's reload.env.
     ReloadEnv,
     /// Rescan MCP servers configured for the running session.
-    /// Hermes' reload.mcp shuts down + rediscovers; Fennec's
+    /// the upstream's reload.mcp shuts down + rediscovers; Fennec's
     /// agent doesn't currently boot any MCP clients, so this
     /// surfaces an honest "not yet wired" status instead of a
     /// silent no-op.

@@ -38,7 +38,7 @@ fn collect_subtree_ids_sorted(
 }
 
 /// Comparator used to order sibling rows under the active
-/// overlay sort mode. Mirrors Hermes' `SORT_COMPARATORS` table
+/// overlay sort mode. Mirrors the upstream's `SORT_COMPARATORS` table
 /// (`agentsOverlay.tsx:67-72`).
 fn compare_nodes(
     tree: &SpawnTree,
@@ -74,7 +74,7 @@ fn compare_nodes(
     }
 }
 
-/// Ranks statuses for the "Status" sort mode. Matches Hermes'
+/// Ranks statuses for the "Status" sort mode. Matches the upstream's
 /// `STATUS_RANK` (`agentsOverlay.tsx:59-65`) so failed agents
 /// surface first, completed last.
 fn status_rank(status: super::spawn_tree::SubagentStatus) -> u8 {
@@ -88,7 +88,7 @@ fn status_rank(status: super::spawn_tree::SubagentStatus) -> u8 {
     }
 }
 
-/// Whether a node passes the active filter. Mirrors Hermes'
+/// Whether a node passes the active filter. Mirrors the upstream's
 /// `FILTER_PREDICATES` table. Note: `leaf` checks for zero
 /// children in the *spawn tree*, not the registry, so an
 /// archived snapshot with no recorded children counts as a leaf.
@@ -637,7 +637,7 @@ pub struct App {
     /// `/details` mode — controls visibility of inline tool
     /// details (call args, running spinner, result summary) and
     /// reasoning blocks when those land in F1-2. Three settings
-    /// matching Hermes (`ui-tui/src/app/slash/commands/ops.ts`):
+    /// matching the upstream (`ui-tui/src/app/slash/commands/ops.ts`):
     ///   - Hidden: skip tool blocks entirely
     ///   - Collapsed: render only `▸ tool · name` (no args / no
     ///     result body)
@@ -693,7 +693,7 @@ pub struct App {
     /// 0 = live spawn tree; 1..N pulls the Nth-most-recent
     /// snapshot from `spawn_history`. Bumped by `[` `<` / `]` `>`.
     /// When the live tree clears mid-turn, `on_tick` auto-follows
-    /// onto index 1 with a flash message — matches Hermes'
+    /// onto index 1 with a flash message — matches the upstream's
     /// "turn finished · inspect freely" pattern.
     pub agents_history_index: usize,
     /// Transient one-liner shown in the overlay footer.
@@ -789,16 +789,20 @@ impl StatusBarPosition {
             Self::Off => "off",
         }
     }
+    /// 3-state cycle: Bottom → Top → Off → Bottom. Visits every
+    /// position so `/statusbar toggle` from the default actually
+    /// surfaces Top instead of jumping straight to Off.
     pub fn toggle(self) -> Self {
         match self {
-            Self::Off => Self::Top,
-            _ => Self::Off,
+            Self::Bottom => Self::Top,
+            Self::Top => Self::Off,
+            Self::Off => Self::Bottom,
         }
     }
 }
 
 /// Spinner-indicator style. `Braille` is the existing 10-frame
-/// braille animation; the alternatives match Hermes' allowed set
+/// braille animation; the alternatives mirror the upstream
 /// so config files round-trip between agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndicatorStyle {
@@ -1507,7 +1511,7 @@ impl App {
             && !self.spawn_history.is_empty()
         {
             // Already on index 0; bump to 1 only if there's a
-            // snapshot newer than what we just settled (Hermes
+            // snapshot newer than what we just settled (the upstream
             // uses the same "snapshot we just pushed" trigger).
             // SpawnHistory.push happens elsewhere when a tree
             // settles, so by the time we observe is_empty +

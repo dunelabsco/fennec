@@ -473,7 +473,7 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
 /// Compact inline rendering of the live spawn-tree, anchored
 /// under a `delegate` tool call in chat scrollback. Only fires
 /// when there's exactly one delegate call active (mirrors
-/// Hermes' `thinking.tsx:889-890` rule). Multiple parallel
+/// the upstream's `thinking.tsx:889-890` rule). Multiple parallel
 /// delegates skip the inline view and rely on `/agents` to surface.
 fn append_inline_spawn_tree(lines: &mut Vec<Line<'static>>, app: &App) {
     let s = &app.skin;

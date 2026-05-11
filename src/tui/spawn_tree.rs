@@ -7,11 +7,11 @@
 //! happen in `apply_tui_event` as `TuiEvent::Subagent*` events
 //! arrive from the agent's callback bridge.
 //!
-//! Shape mirrors what the upstream Hermes overlay tracks (per
+//! Shape mirrors what the upstream the upstream overlay tracks (per
 //! `ui-tui/src/components/agentsOverlay.tsx:391-525`) — status,
 //! goal, tool count, duration, hot-branch heat — but the rendering
 //! follows Fennec's three-pane palette and side-by-side layout
-//! rather than Hermes' mode-switching list↔detail pane.
+//! rather than the upstream's mode-switching list↔detail pane.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -19,7 +19,7 @@ use std::time::Instant;
 use crate::agent::callbacks::{SubagentComplete, SubagentSpawn, ToolStart};
 
 /// Maximum number of completed spawn trees retained in memory
-/// for `/replay <N>`. Matches Hermes' HISTORY_LIMIT.
+/// for `/replay <N>`. Matches the upstream's HISTORY_LIMIT.
 pub const SPAWN_HISTORY_CAP: usize = 10;
 
 /// Lifecycle status of a single sub-agent node.
@@ -159,7 +159,7 @@ pub struct AggregateMetrics {
     pub subtree_tools: usize,
     pub local_duration_ms: u64,
     /// Sum of every descendant's duration_ms (max of overlapping
-    /// runs would be more "human"; this matches Hermes).
+    /// runs would be more "human"; this matches the upstream).
     pub subtree_duration_ms: u64,
     pub descendant_count: usize,
     pub max_depth: usize,
@@ -174,7 +174,7 @@ pub struct AggregateMetrics {
     /// `files_read.len() + files_written.len()`).
     pub files_touched: usize,
     /// Tree-wide hotness = subtree_tools / subtree_duration_s.
-    /// Returns 0.0 when duration is zero. Mirrors Hermes'
+    /// Returns 0.0 when duration is zero. Mirrors the upstream's
     /// `aggregate.hotness`.
     pub hotness: f64,
 }
@@ -197,7 +197,7 @@ impl SpawnTree {
     }
 
     /// Whether the tree has any nodes. Empty trees are skipped
-    /// when promoting to history (matches Hermes' "drop empty
+    /// when promoting to history (matches the upstream's "drop empty
     /// snapshots").
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
@@ -493,7 +493,7 @@ impl SpawnHistory {
     }
 
     /// Push a settled tree onto the history. Empty trees are
-    /// dropped (matches Hermes' "drop empty" rule). Evicts the
+    /// dropped (matches the upstream's "drop empty" rule). Evicts the
     /// oldest entry once the cap is reached.
     pub fn push(&mut self, tree: SpawnTree) {
         if tree.is_empty() {
@@ -530,7 +530,7 @@ impl SpawnHistory {
 }
 
 /// Auto-generate a label from the goal of the first root +
-/// a node count. Mirrors Hermes' `spawnHistoryStore.ts`
+/// a node count. Mirrors the upstream's `spawnHistoryStore.ts`
 /// fallback heuristic.
 fn label_for(tree: &SpawnTree) -> String {
     let count = tree.len();

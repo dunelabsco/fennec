@@ -8,7 +8,7 @@
 //! usable.
 //!
 //! Visual language follows Fennec's existing palette + border
-//! style, not Hermes' specific UX:
+//! style, not the upstream's specific UX:
 //!   - s.sand_gold title + outer double border
 //!   - s.subdued metadata, s.muted_green/s.amber/s.terracotta status dots
 //!   - The same `▸ tool · name(args)` glyphs the chat panel uses
@@ -16,7 +16,7 @@
 //!   - Single-line key-hint footer in s.sand_gold/s.subdued
 //!
 //! Hot-branch heat marker uses an s.amber → s.terracotta gradient
-//! (matching our existing alert palette). Hermes' algorithm is
+//! (matching our existing alert palette). the upstream's algorithm is
 //! ported verbatim — `tools / sec` normalised to tree peak.
 
 use ratatui::Frame;
@@ -162,12 +162,107 @@ fn draw_diff_view(f: &mut Frame, area: Rect, app: &App, a: usize, b: usize) {
         return;
     };
 
+    // Layout: two snapshot panes side-by-side on top, a single
+    // delta row underneath. The delta row makes the side-by-side
+    // a real diff (not just two adjacent totals).
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(8)])
+        .split(inner);
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(inner);
+        .split(split[0]);
     draw_diff_pane(f, panes[0], "baseline", a, &snap_a.tree, s);
     draw_diff_pane(f, panes[1], "candidate", b, &snap_b.tree, s);
+    draw_diff_deltas(f, split[1], &snap_a.tree, &snap_b.tree, s);
+}
+
+/// Render the Δ metrics row that makes diff-view a real diff.
+/// One line per metric: `tools: 12 → 18 (+6)`. Sign is `+/-/±0`.
+fn draw_diff_deltas(
+    f: &mut Frame,
+    area: Rect,
+    a: &SpawnTree,
+    b: &SpawnTree,
+    s: &Skin,
+) {
+    let ta = tree_totals(a);
+    let tb = tree_totals(b);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " Δ metrics",
+        Style::default().fg(s.sand_gold).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(delta_field_u(
+        "tools",
+        ta.subtree_tools as i64,
+        tb.subtree_tools as i64,
+        s,
+    ));
+    lines.push(delta_field_u(
+        "duration",
+        ta.subtree_duration_ms as i64,
+        tb.subtree_duration_ms as i64,
+        s,
+    ));
+    lines.push(delta_field_u(
+        "depth",
+        ta.max_depth as i64,
+        tb.max_depth as i64,
+        s,
+    ));
+    lines.push(delta_field_u(
+        "tokens",
+        (ta.input_tokens + ta.output_tokens) as i64,
+        (tb.input_tokens + tb.output_tokens) as i64,
+        s,
+    ));
+    if ta.cost_usd > 0.0 || tb.cost_usd > 0.0 {
+        let delta = tb.cost_usd - ta.cost_usd;
+        let sign = if delta > 0.0 {
+            "+"
+        } else if delta < 0.0 {
+            "-"
+        } else {
+            "±"
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:<10}", "cost"), Style::default().fg(s.subdued)),
+            Span::styled(
+                format!("${:.4} → ${:.4}  ({sign}${:.4})", ta.cost_usd, tb.cost_usd, delta.abs()),
+                Style::default().fg(s.text_cream),
+            ),
+        ]));
+    }
+    if ta.files_touched > 0 || tb.files_touched > 0 {
+        lines.push(delta_field_u(
+            "files",
+            ta.files_touched as i64,
+            tb.files_touched as i64,
+            s,
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn delta_field_u(label: &str, a: i64, b: i64, s: &Skin) -> Line<'static> {
+    let delta = b - a;
+    let sign = match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => "+",
+        std::cmp::Ordering::Less => "-",
+        std::cmp::Ordering::Equal => "±",
+    };
+    Line::from(vec![
+        Span::styled(format!(" {label:<10}"), Style::default().fg(s.subdued)),
+        Span::styled(
+            format!("{a} → {b}  ({sign}{})", delta.abs()),
+            Style::default().fg(s.text_cream),
+        ),
+    ])
 }
 
 fn draw_diff_pane(
@@ -259,7 +354,7 @@ fn tree_totals(tree: &SpawnTree) -> super::spawn_tree::AggregateMetrics {
 
 /// 8-step unicode bar sparkline derived from agents-per-depth.
 /// Zero columns render as a space so a sparse tree doesn't read
-/// as uniform activity. Matches Hermes' `SPARK_RAMP`.
+/// as uniform activity. Matches the upstream's `SPARK_RAMP`.
 fn sparkline(widths: &[u32]) -> String {
     const RAMP: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
     let max = widths.iter().copied().max().unwrap_or(0);
@@ -418,7 +513,7 @@ fn draw_tree_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
 /// (first roots in render order). Each row is `id · ▓▓▓` with
 /// the bar showing the node's lifetime relative to the earliest
 /// `started_at`. The cursor's row is highlighted. Matches
-/// Hermes' `GanttStrip` (`agentsOverlay.tsx:216-348`) without
+/// the upstream's `GanttStrip` (`agentsOverlay.tsx:216-348`) without
 /// the live-tick refresh — ratatui's full-frame redraw already
 /// covers that.
 fn draw_gantt_strip(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
@@ -883,7 +978,7 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
 
 /// Push a section-header line to the detail-pane output. `▾`
 /// signals the section is open, `▸` collapsed (rendered for
-/// parity with Hermes' visual language — Fennec currently always
+/// parity with the upstream's visual language — Fennec currently always
 /// shows the section body when open, since no key toggle is
 /// wired). `count` adds `(N)` when present.
 fn push_section_header(
