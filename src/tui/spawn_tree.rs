@@ -89,11 +89,54 @@ pub struct SubagentNode {
     /// Free-text progress notes (status messages from the
     /// sub-agent's own `on_status` calls).
     pub notes: Vec<String>,
+    /// Streaming reasoning deltas (collected from
+    /// `on_subagent_thinking`). Each entry is a single delta; the
+    /// renderer can join them when displaying.
+    pub thinking: Vec<String>,
     /// Final assistant text on success / error string on failure.
     /// Populated by `SubagentComplete`.
     pub output: Option<String>,
     /// Direct children's ids (depth-1 descendants in the tree).
     pub children: Vec<String>,
+    /// Depth in the spawn tree (0 = root). Lifted from
+    /// `SubagentSpawn`. Allows the renderer to compute per-depth
+    /// aggregates (the header sparkline) without re-walking.
+    pub depth: u32,
+    /// Sibling index — order in which the parent spawned this
+    /// node. Drives stable rendering when network reordering
+    /// shuffles events between siblings.
+    pub index: u32,
+    /// Provider model the sub-agent ran against. `None` when
+    /// inheriting from the parent and not materialised at spawn
+    /// time. Used by the overlay header's status-mix chip.
+    pub model: Option<String>,
+    /// Toolset bundles granted at spawn time (empty when
+    /// inheriting from the parent).
+    pub toolsets: Vec<String>,
+    /// Iteration count from `SubagentComplete` — provider rounds
+    /// the sub-agent's turn consumed.
+    pub iteration: u32,
+    /// API call count from `SubagentComplete`.
+    pub api_calls: u32,
+    /// Token usage rolled up from `SubagentComplete`.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// USD cost from `SubagentComplete` (0.0 when model pricing
+    /// isn't known).
+    pub cost_usd: f64,
+    /// Files the sub-agent read / wrote during its turn (best
+    /// effort — captured by the observer from `read_file` /
+    /// `write_file` / `edit_file` tool args).
+    pub files_read: Vec<String>,
+    pub files_written: Vec<String>,
+    /// Structured tail of the last N tool calls — used by the
+    /// detail pane's Output section, especially for archived
+    /// snapshots where the live tools list is empty.
+    pub output_tail: Vec<crate::agent::callbacks::SubagentOutputEntry>,
+    /// Optional final summary text (one-line). Surfaced in the
+    /// detail pane's Summary section.
+    pub summary: Option<String>,
 }
 
 impl SubagentNode {
@@ -120,6 +163,20 @@ pub struct AggregateMetrics {
     pub subtree_duration_ms: u64,
     pub descendant_count: usize,
     pub max_depth: usize,
+    /// Count of running / queued descendants (drives the `⚡N`
+    /// active badge in the detail pane).
+    pub active_count: usize,
+    /// Token + cost rollups across the subtree.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+    /// Total files-touched count across the subtree (sum of
+    /// `files_read.len() + files_written.len()`).
+    pub files_touched: usize,
+    /// Tree-wide hotness = subtree_tools / subtree_duration_s.
+    /// Returns 0.0 when duration is zero. Mirrors Hermes'
+    /// `aggregate.hotness`.
+    pub hotness: f64,
 }
 
 /// Live spawn tree. New events from the callback bridge mutate
@@ -195,8 +252,23 @@ impl SpawnTree {
             finished_at: None,
             tools: Vec::new(),
             notes: Vec::new(),
+            thinking: Vec::new(),
             output: None,
             children: Vec::new(),
+            depth: spawn.depth,
+            index: spawn.index,
+            model: spawn.model,
+            toolsets: spawn.toolsets,
+            iteration: 0,
+            api_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            cost_usd: 0.0,
+            files_read: Vec::new(),
+            files_written: Vec::new(),
+            output_tail: Vec::new(),
+            summary: None,
         };
         self.nodes.insert(spawn.id, node);
     }
@@ -228,7 +300,36 @@ impl SpawnTree {
                 SubagentStatus::Failed
             };
             node.finished_at = Some(Instant::now());
+            node.iteration = complete.iteration;
+            node.api_calls = complete.api_calls;
+            node.input_tokens = complete.input_tokens;
+            node.output_tokens = complete.output_tokens;
+            node.reasoning_tokens = complete.reasoning_tokens;
+            node.cost_usd = complete.cost_usd;
+            node.files_read = complete.files_read;
+            node.files_written = complete.files_written;
+            node.output_tail = complete.output_tail;
+            // Take a one-line summary from the first non-empty
+            // line of `output` so the detail-pane Summary section
+            // can render even when the full output is multi-line.
+            node.summary = complete
+                .output
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.to_string());
             node.output = Some(complete.output);
+        }
+    }
+
+    /// Append a streaming thinking delta to the node's
+    /// reasoning log. Capped at 32 entries (oldest dropped) so
+    /// long reasoning runs don't unbounded-grow memory.
+    pub fn on_thinking(&mut self, id: &str, delta: String) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            if node.thinking.len() == 32 {
+                node.thinking.remove(0);
+            }
+            node.thinking.push(delta);
         }
     }
 
@@ -274,9 +375,22 @@ impl SpawnTree {
         let Some(root) = self.nodes.get(id) else {
             return AggregateMetrics::default();
         };
+        let active_self = if matches!(
+            root.status,
+            SubagentStatus::Running | SubagentStatus::Queued
+        ) {
+            1
+        } else {
+            0
+        };
         let mut metrics = AggregateMetrics {
             local_tools: root.tools.len(),
             local_duration_ms: root.duration_ms(),
+            active_count: active_self,
+            input_tokens: root.input_tokens,
+            output_tokens: root.output_tokens,
+            cost_usd: root.cost_usd,
+            files_touched: root.files_read.len() + root.files_written.len(),
             ..Default::default()
         };
         let mut max_depth = 0usize;
@@ -294,6 +408,17 @@ impl SpawnTree {
             if let Some(child) = self.nodes.get(&child_id) {
                 subtree_tools += child.tools.len();
                 subtree_duration += child.duration_ms();
+                metrics.input_tokens += child.input_tokens;
+                metrics.output_tokens += child.output_tokens;
+                metrics.cost_usd += child.cost_usd;
+                metrics.files_touched +=
+                    child.files_read.len() + child.files_written.len();
+                if matches!(
+                    child.status,
+                    SubagentStatus::Running | SubagentStatus::Queued
+                ) {
+                    metrics.active_count += 1;
+                }
                 for grand in &child.children {
                     stack.push((grand.clone(), depth + 1));
                 }
@@ -303,6 +428,10 @@ impl SpawnTree {
         metrics.subtree_duration_ms = subtree_duration;
         metrics.descendant_count = descendant_count;
         metrics.max_depth = max_depth;
+        let dur_s = subtree_duration as f64 / 1000.0;
+        if dur_s > 0.0 {
+            metrics.hotness = subtree_tools as f64 / dur_s;
+        }
         metrics
     }
 
@@ -441,6 +570,10 @@ mod tests {
             id: id.to_string(),
             parent_id: parent.map(String::from),
             goal: goal.to_string(),
+            depth: 0,
+            index: 0,
+            model: None,
+            toolsets: Vec::new(),
         }
     }
 
@@ -449,6 +582,7 @@ mod tests {
             tool_id: format!("tc_{name}"),
             name: name.to_string(),
             preview: format!("{name}(...)"),
+            ..Default::default()
         }
     }
 
@@ -483,6 +617,7 @@ mod tests {
             success: true,
             duration_ms: 100,
             tools_used: vec![],
+            ..Default::default()
         });
         assert_eq!(t.nodes["a"].status, SubagentStatus::Completed);
         assert_eq!(t.nodes["a"].output.as_deref(), Some("done"));
@@ -548,6 +683,7 @@ mod tests {
             success: true,
             duration_ms: 1,
             tools_used: vec![],
+            ..Default::default()
         });
         assert!(!t.is_settled());
         t.on_complete(SubagentComplete {
@@ -556,6 +692,7 @@ mod tests {
             success: true,
             duration_ms: 1,
             tools_used: vec![],
+            ..Default::default()
         });
         assert!(t.is_settled());
     }

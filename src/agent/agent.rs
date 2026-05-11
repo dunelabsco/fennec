@@ -104,6 +104,18 @@ pub struct Agent {
     /// Drives the context-window utilisation panel in `/usage`.
     last_prompt_tokens: u64,
     turn_count: u64,
+    /// Iterations the most recent `turn` / `turn_streaming` call
+    /// consumed (the count of provider rounds it took to settle
+    /// on a final assistant message). Reset at the top of each
+    /// turn; surfaced via [`Self::last_turn_iterations`] so
+    /// sub-agent observers can record it.
+    last_turn_iterations: u32,
+    /// Cooperative-interrupt flag. When set, the tool-call loop
+    /// bails at the next iteration boundary with an
+    /// `interrupted` error. Wired by [`crate::agent::delegation`]
+    /// for sub-agents the user kills via `/agents x` / `X`. Main
+    /// agents leave it null — interrupt isn't surfaced for them.
+    interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Lifecycle hooks for real-time frontends (TUI, dashboard).
     /// Defaults to a no-op handle so existing callers (channels,
     /// batch runs) pay no cost. Frontends register their own
@@ -199,12 +211,17 @@ impl Agent {
         self.history.push(user_msg);
 
         self.turn_count += 1;
+        self.last_turn_iterations = 0;
         let turn_start = std::time::Instant::now();
         let tokens_before_input = self.total_input_tokens;
         let tokens_before_output = self.total_output_tokens;
 
         // Tool call loop.
         for _iteration in 0..self.max_tool_iterations {
+            self.last_turn_iterations = self.last_turn_iterations.saturating_add(1);
+            if self.is_interrupted() {
+                bail!("interrupted by user");
+            }
             self.callbacks.on_status("calling provider");
             let response = self.call_provider().await?;
             self.total_api_calls += 1;
@@ -267,6 +284,7 @@ impl Agent {
                     tool_id: tc.id.clone(),
                     name: tc.name.clone(),
                     preview: preview_for_args(&tc.arguments),
+                    args: tc.arguments.clone(),
                 });
                 let started = std::time::Instant::now();
                 let (output, success) = self.execute_tool(&tc.name, &tc.arguments).await;
@@ -469,9 +487,14 @@ impl Agent {
         };
         self.history.push(ChatMessage::user(&effective_message));
         self.turn_count += 1;
+        self.last_turn_iterations = 0;
 
         // Tool-iteration loop, streaming each LLM call.
         for _iteration in 0..self.max_tool_iterations {
+            self.last_turn_iterations = self.last_turn_iterations.saturating_add(1);
+            if self.is_interrupted() {
+                bail!("interrupted by user");
+            }
             self.callbacks.on_status("calling provider");
 
             let enabled = self.enabled_tool_specs();
@@ -561,6 +584,7 @@ impl Agent {
                     tool_id: tc.id.clone(),
                     name: tc.name.clone(),
                     preview: preview_for_args(&tc.arguments),
+                    args: tc.arguments.clone(),
                 });
                 let started = std::time::Instant::now();
                 let (output, success) = self.execute_tool(&tc.name, &tc.arguments).await;
@@ -799,6 +823,24 @@ impl Agent {
     /// `cost_usd` is `None` when the active model isn't in the
     /// pricing snapshot — callers render that as "—" or skip the
     /// row, matching upstream's `cost_status: "unknown"` behavior.
+    /// Iterations consumed by the most recent `turn` /
+    /// `turn_streaming` call. 0 before the first turn. Sub-agent
+    /// observers read this after `turn` returns to record the
+    /// `iteration` field on `SubagentComplete`.
+    pub fn last_turn_iterations(&self) -> u32 {
+        self.last_turn_iterations
+    }
+
+    /// True when an external interrupt flag has been set on this
+    /// agent. Cooperative — the tool loop bails at the next
+    /// iteration boundary; in-flight provider calls finish first.
+    fn is_interrupted(&self) -> bool {
+        match self.interrupt_flag.as_ref() {
+            Some(flag) => flag.load(std::sync::atomic::Ordering::SeqCst),
+            None => false,
+        }
+    }
+
     pub fn token_usage(&self) -> TokenUsage {
         let model = self.provider.model().to_string();
         let context_max = self.provider.context_window();
@@ -1049,6 +1091,7 @@ pub struct AgentBuilder {
     collective: Option<Arc<CollectiveSearch>>,
     skills_prompt: Option<String>,
     callbacks: Option<super::callbacks::CallbacksHandle>,
+    interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl AgentBuilder {
@@ -1068,7 +1111,19 @@ impl AgentBuilder {
             collective: None,
             skills_prompt: None,
             callbacks: None,
+            interrupt_flag: None,
         }
+    }
+
+    /// Wire a cooperative-interrupt flag. The agent loop polls it
+    /// at each tool-iteration boundary and bails when set. Used
+    /// by sub-agents the user kills via the spawn-tree overlay.
+    pub fn interrupt_flag(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.interrupt_flag = Some(flag);
+        self
     }
 
     pub fn provider(mut self, provider: impl Into<Arc<dyn Provider>>) -> Self {
@@ -1198,6 +1253,8 @@ impl AgentBuilder {
             total_api_calls: 0,
             last_prompt_tokens: 0,
             turn_count: 0,
+            last_turn_iterations: 0,
+            interrupt_flag: self.interrupt_flag,
             callbacks: self
                 .callbacks
                 .unwrap_or_else(super::callbacks::noop_callbacks),

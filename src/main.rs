@@ -269,7 +269,7 @@ async fn build_agent(
     fennec::bus::PendingReplies,
     fennec::bus::ChatDirectory,
 )> {
-    build_agent_with_callbacks(config, home_dir, model_override, channel_map, None).await
+    build_agent_with_callbacks(config, home_dir, model_override, channel_map, None, None).await
 }
 
 async fn build_agent_with_callbacks(
@@ -278,6 +278,7 @@ async fn build_agent_with_callbacks(
     model_override: Option<String>,
     channel_map: Option<ChannelMapHandle>,
     callbacks: Option<fennec::agent::callbacks::CallbacksHandle>,
+    delegation_registry: Option<fennec::agent::DelegationRegistry>,
 ) -> Result<(
     fennec::agent::Agent,
     Arc<dyn Memory>,
@@ -704,6 +705,12 @@ async fn build_agent_with_callbacks(
         // /agents overlay.
         delegate_tool = delegate_tool.with_callbacks(Arc::clone(cb));
     }
+    if let Some(ref reg) = delegation_registry {
+        // Wire the shared delegation registry so pause / caps /
+        // active map / interrupt flag are honoured by every
+        // sub-agent spawn through this DelegateTool.
+        delegate_tool = delegate_tool.with_registry(reg.clone());
+    }
     builder = builder.tool(Box::new(delegate_tool));
 
     let mut configured_builder = builder
@@ -919,6 +926,11 @@ async fn run_tui(
             prior_sessions.len()
         ),
     }];
+    // Shared delegation state — pause flag + caps + active map.
+    // Held by both `App` (so /agents commands can read it) and
+    // `DelegateTool` (so spawns honour the gate).
+    let delegation_registry = fennec::agent::DelegationRegistry::default();
+    app.delegation_registry = Some(delegation_registry.clone());
     let app = std::sync::Arc::new(parking_lot::Mutex::new(app));
 
     // Build the agent with the TUI bridge wired in as callbacks.
@@ -932,6 +944,7 @@ async fn run_tui(
             model_override,
             None,
             Some(bridge_handle),
+            Some(delegation_registry),
         )
         .await?;
     let agent = std::sync::Arc::new(tokio::sync::Mutex::new(agent));
@@ -2189,6 +2202,13 @@ fn apply_tui_event(
             guard.set_status(msg);
         }
         TuiEvent::SubagentSpawn(spawn) => {
+            // When a fresh root spawn arrives and we'd been
+            // viewing a history snapshot, snap back to live so
+            // the user sees the new turn's tree.
+            if spawn.parent_id.is_none() && guard.agents_history_index > 0 {
+                guard.agents_history_index = 0;
+                guard.agents_cursor = None;
+            }
             // Default the overlay cursor to the first root we
             // see so /agents has something selected when the
             // user opens it. Subsequent spawns leave the cursor
@@ -2209,11 +2229,8 @@ fn apply_tui_event(
             // (no per-token detail panel yet).
             let _ = id;
         }
-        TuiEvent::SubagentThinking { id, delta: _ } => {
-            // Reasoning during a sub-agent isn't surfaced in the
-            // overlay's detail pane today — node has `notes` for
-            // free-text progress. Wire later if needed.
-            let _ = id;
+        TuiEvent::SubagentThinking { id, delta } => {
+            guard.spawn_tree.on_thinking(&id, delta);
         }
         TuiEvent::SubagentTool { id, start } => {
             guard.spawn_tree.on_tool(&id, start);

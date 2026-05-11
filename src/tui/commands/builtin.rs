@@ -874,22 +874,51 @@ impl CommandHandler for Agents {
                 app.show_agents_overlay = false;
                 Ok(CommandOutcome::Status("agents overlay closed".into()))
             }
-            "pause" | "resume" | "status" => {
-                // Hermes pauses/resumes the delegation manager
-                // globally. Fennec doesn't currently expose a
-                // pause flag on the agent (DelegateTool runs
-                // synchronously and there's no scheduler to
-                // pause). Surface an honest "not yet wired"
-                // message; this hooks up alongside the
-                // background-tasks PR.
-                push_system(
-                    app,
-                    format!(
-                        "/agents {trimmed}: delegation pause/resume isn't wired into the agent yet — \
-                         lands alongside the /background + /stop scheduler work"
-                    ),
-                );
-                Ok(CommandOutcome::Status("noted".into()))
+            "pause" | "resume" => {
+                let target_paused = trimmed == "pause";
+                match app.delegation_registry.as_ref() {
+                    Some(reg) => {
+                        reg.set_paused(target_paused);
+                        let line = if target_paused {
+                            "delegation · paused"
+                        } else {
+                            "delegation · resumed"
+                        };
+                        push_system(app, line.to_string());
+                        Ok(CommandOutcome::Status(line.into()))
+                    }
+                    None => {
+                        push_system(
+                            app,
+                            "/agents pause: delegation registry not attached (TUI mode only)".into(),
+                        );
+                        Ok(CommandOutcome::Status("no registry".into()))
+                    }
+                }
+            }
+            "status" => {
+                match app.delegation_registry.as_ref() {
+                    Some(reg) => {
+                        let (paused, caps) = reg.status();
+                        let active = reg.active_snapshot();
+                        let line = format!(
+                            "delegation · {} · caps d{}/{} · {} active",
+                            if paused { "paused" } else { "active" },
+                            caps.max_spawn_depth,
+                            caps.max_concurrent_children,
+                            active.len(),
+                        );
+                        push_system(app, line.clone());
+                        Ok(CommandOutcome::Status(line))
+                    }
+                    None => {
+                        push_system(
+                            app,
+                            "/agents status: delegation registry not attached (TUI mode only)".into(),
+                        );
+                        Ok(CommandOutcome::Status("no registry".into()))
+                    }
+                }
             }
             other => Ok(CommandOutcome::Status(format!(
                 "/agents: unknown subcommand '{other}' (expected pause/resume/status or no arg)"
@@ -1064,9 +1093,10 @@ mod tests {
     }
 
     #[test]
-    fn agents_pause_surfaces_not_yet_wired_message() {
+    fn agents_pause_without_registry_explains_tui_only() {
         let r = CommandRegistry::with_builtins();
         let mut app = App::new();
+        assert!(app.delegation_registry.is_none());
         r.dispatch("agents", "pause", &mut app).unwrap();
         let body = app
             .chat
@@ -1077,7 +1107,39 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert!(body.contains("isn't wired"), "got: {body}");
+        assert!(body.contains("not attached"), "got: {body}");
+    }
+
+    #[test]
+    fn agents_pause_with_registry_flips_pause_flag() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        let reg = crate::agent::DelegationRegistry::default();
+        app.delegation_registry = Some(reg.clone());
+        assert!(!reg.is_paused());
+        r.dispatch("agents", "pause", &mut app).unwrap();
+        assert!(reg.is_paused());
+        r.dispatch("agents", "resume", &mut app).unwrap();
+        assert!(!reg.is_paused());
+    }
+
+    #[test]
+    fn agents_status_with_registry_renders_one_liner() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        app.delegation_registry = Some(crate::agent::DelegationRegistry::default());
+        r.dispatch("agents", "status", &mut app).unwrap();
+        let body = app
+            .chat
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                ChatLine::System { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(body.contains("delegation · active · caps d"), "got: {body}");
+        assert!(body.contains("0 active"), "got: {body}");
     }
 
     #[test]

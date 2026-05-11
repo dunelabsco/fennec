@@ -8,8 +8,9 @@ use crate::tools::traits::Tool;
 
 use super::callbacks::{
     AgentCallbacks, ApprovalRequest, CallbacksHandle, ClarifyRequest, SecretRequest,
-    ToolComplete, ToolProgress, ToolStart,
+    SubagentOutputEntry, ToolComplete, ToolProgress, ToolStart,
 };
+use super::delegation::{DelegationRegistry, SpawnRefusal};
 use super::AgentBuilder;
 
 /// Result of a subagent task execution.
@@ -37,6 +38,12 @@ pub struct SubagentManager {
     /// dispatch). When set, freshly-spawned sub-agents record
     /// it as their `parent_id`.
     current_parent_id: Option<String>,
+    /// Shared delegation state — pause flag, caps, active
+    /// registry. Constructed at process startup and propagated
+    /// through `DelegateTool::with_registry`. `None` for
+    /// non-TUI callers; spawn behaves as before in that case
+    /// (no caps, no pause check, no observer).
+    registry: Option<DelegationRegistry>,
 }
 
 impl SubagentManager {
@@ -47,6 +54,7 @@ impl SubagentManager {
             provider,
             callbacks: None,
             current_parent_id: None,
+            registry: None,
         }
     }
 
@@ -63,6 +71,15 @@ impl SubagentManager {
     /// delegations form a tree in the TUI's overlay.
     pub fn with_parent(mut self, parent_id: impl Into<String>) -> Self {
         self.current_parent_id = Some(parent_id.into());
+        self
+    }
+
+    /// Attach the shared delegation registry so spawns honour the
+    /// pause flag + concurrency caps, record themselves in the
+    /// active map, and receive an interrupt flag the inner agent
+    /// loop polls.
+    pub fn with_registry(mut self, registry: DelegationRegistry) -> Self {
+        self.registry = Some(registry);
         self
     }
 
@@ -89,16 +106,41 @@ impl SubagentManager {
         // Generate a stable id for this sub-agent so the parent's
         // callback handle can correlate its lifecycle events.
         let subagent_id = format!("sa_{}", uuid::Uuid::new_v4().simple());
+        let provider_model = self.provider.model().to_string();
+
+        // Try to register with the delegation registry. Returns
+        // depth + sibling index + an interrupt flag the inner
+        // agent loop will poll. When no registry is attached the
+        // sub-agent runs without caps + without a cancel hook.
+        let (depth, index, interrupt_flag) = match self.registry.as_ref() {
+            Some(reg) => match reg.try_register(
+                subagent_id.clone(),
+                self.current_parent_id.clone(),
+                task.to_string(),
+                Some(provider_model.clone()),
+            ) {
+                Ok(tuple) => (tuple.0, tuple.1, Some(tuple.2)),
+                Err(refusal) => {
+                    return Ok(refused_result(refusal, tool_names));
+                }
+            },
+            None => (0, 0, None),
+        };
 
         // Fire `on_subagent_spawn` before we start the actual
         // turn so the spawn-tree overlay shows the node as
         // queued/starting from the moment the parent decided
         // to delegate.
+        let observer = Arc::new(SubagentObserver::default());
         if let Some(ref parent_cb) = self.callbacks {
             parent_cb.on_subagent_spawn(super::callbacks::SubagentSpawn {
                 id: subagent_id.clone(),
                 parent_id: self.current_parent_id.clone(),
                 goal: task.to_string(),
+                depth,
+                index,
+                model: Some(provider_model.clone()),
+                toolsets: Vec::new(),
             });
         }
 
@@ -118,8 +160,20 @@ impl SubagentManager {
             let wrapper: CallbacksHandle = Arc::new(SubagentCallbacks {
                 parent: Arc::clone(parent_cb),
                 subagent_id: subagent_id.clone(),
+                observer: Arc::clone(&observer),
             });
             builder = builder.callbacks(wrapper);
+        } else {
+            // Even without a parent bridge, install a callbacks
+            // handle that drains into the observer so we still
+            // record output_tail / files for the registry's view.
+            let wrapper: CallbacksHandle = Arc::new(ObserverOnlyCallbacks {
+                observer: Arc::clone(&observer),
+            });
+            builder = builder.callbacks(wrapper);
+        }
+        if let Some(ref flag) = interrupt_flag {
+            builder = builder.interrupt_flag(Arc::clone(flag));
         }
         let mut agent = builder.build()?;
 
@@ -137,6 +191,9 @@ impl SubagentManager {
             Ok(text) => (text, true),
             Err(e) => (format!("Subagent failed: {e}"), false),
         };
+        let usage = agent.token_usage();
+        let iteration = agent.last_turn_iterations();
+        let (output_tail, files_read, files_written) = observer.drain();
         if let Some(ref parent_cb) = self.callbacks {
             parent_cb.on_subagent_complete(super::callbacks::SubagentComplete {
                 id: subagent_id.clone(),
@@ -144,7 +201,19 @@ impl SubagentManager {
                 success,
                 duration_ms,
                 tools_used: tool_names.clone(),
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                reasoning_tokens: 0,
+                cost_usd: usage.cost_usd.unwrap_or(0.0),
+                files_read,
+                files_written,
+                output_tail,
+                iteration,
+                api_calls: usage.api_calls as u32,
             });
+        }
+        if let Some(ref reg) = self.registry {
+            reg.unregister(&subagent_id);
         }
 
         Ok(SubagentResult {
@@ -152,6 +221,85 @@ impl SubagentManager {
             tools_used: tool_names,
             success,
         })
+    }
+}
+
+/// Per-spawn accumulator for the metrics that the lifecycle
+/// events don't already carry: the structured `output_tail` (last
+/// N tool calls + previews), `files_read`, `files_written`. Drained
+/// by [`SubagentManager::spawn`] just before emitting
+/// `on_subagent_complete`.
+#[derive(Debug, Default)]
+struct SubagentObserver {
+    inner: parking_lot::Mutex<ObserverInner>,
+}
+
+#[derive(Debug, Default)]
+struct ObserverInner {
+    output_tail: std::collections::VecDeque<SubagentOutputEntry>,
+    files_read: Vec<String>,
+    files_written: Vec<String>,
+}
+
+impl SubagentObserver {
+    const TAIL_CAP: usize = 8;
+
+    fn record_tool(&self, start: &ToolStart) {
+        let mut g = self.inner.lock();
+        if g.output_tail.len() == Self::TAIL_CAP {
+            g.output_tail.pop_front();
+        }
+        g.output_tail.push_back(SubagentOutputEntry {
+            tool: start.name.clone(),
+            preview: start.preview.clone(),
+            is_error: false,
+        });
+        // Best-effort file tracking — extract a `path` arg when
+        // the tool is one of the canonical file tools. Hermes
+        // does this server-side via a `file_state` registry; the
+        // names match what `src/tools/files.rs` exposes.
+        if let Some(path) = start.args.get("path").and_then(|v| v.as_str()) {
+            match start.name.as_str() {
+                "read_file" => g.files_read.push(path.to_string()),
+                "write_file" | "edit_file" => g.files_written.push(path.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    fn drain(&self) -> (Vec<SubagentOutputEntry>, Vec<String>, Vec<String>) {
+        let mut g = self.inner.lock();
+        let tail = g.output_tail.drain(..).collect();
+        let read = std::mem::take(&mut g.files_read);
+        let written = std::mem::take(&mut g.files_written);
+        (tail, read, written)
+    }
+}
+
+/// Callbacks adapter used when the sub-agent has no parent bridge
+/// to forward to but the manager still wants to accumulate the
+/// observer-tracked metrics (output_tail, files). Functionally a
+/// drop-in for the no-op handle except that `on_tool_start`
+/// updates the observer.
+struct ObserverOnlyCallbacks {
+    observer: Arc<SubagentObserver>,
+}
+
+impl AgentCallbacks for ObserverOnlyCallbacks {
+    fn on_tool_start(&self, start: ToolStart) {
+        self.observer.record_tool(&start);
+    }
+}
+
+/// Build a failed `SubagentResult` to return when the registry
+/// refuses to register a spawn (paused, depth cap, concurrency
+/// cap). Surfaces the refusal reason in the `output` field so the
+/// parent agent sees it as the tool's reply text.
+fn refused_result(refusal: SpawnRefusal, tool_names: Vec<String>) -> SubagentResult {
+    SubagentResult {
+        output: refusal.message(),
+        tools_used: tool_names,
+        success: false,
     }
 }
 
@@ -166,6 +314,7 @@ impl SubagentManager {
 struct SubagentCallbacks {
     parent: CallbacksHandle,
     subagent_id: String,
+    observer: Arc<SubagentObserver>,
 }
 
 impl AgentCallbacks for SubagentCallbacks {
@@ -178,6 +327,7 @@ impl AgentCallbacks for SubagentCallbacks {
     }
 
     fn on_tool_start(&self, start: ToolStart) {
+        self.observer.record_tool(&start);
         self.parent.on_subagent_tool(&self.subagent_id, start);
     }
 
@@ -272,9 +422,11 @@ mod tests {
     #[test]
     fn subagent_callbacks_route_standard_events_to_parent_with_id() {
         let parent = Arc::new(CapturingParent::default());
+        let observer = Arc::new(SubagentObserver::default());
         let wrapper = SubagentCallbacks {
             parent: parent.clone() as CallbacksHandle,
             subagent_id: "sa_test".to_string(),
+            observer: Arc::clone(&observer),
         };
 
         wrapper.on_text_delta("hello");
@@ -283,6 +435,7 @@ mod tests {
             tool_id: "t1".into(),
             name: "read_file".into(),
             preview: "Cargo.toml".into(),
+            args: serde_json::json!({ "path": "Cargo.toml" }),
         });
         wrapper.on_status("compressing context");
 
@@ -294,6 +447,13 @@ mod tests {
         assert_eq!(tool, vec![("sa_test".into(), "read_file".into())]);
         let progress = parent.progress.lock().clone();
         assert_eq!(progress, vec![("sa_test".into(), "compressing context".into())]);
+        // Observer should also have captured the tool call into
+        // output_tail + recorded the read_file path.
+        let (tail, read, written) = observer.drain();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].tool, "read_file");
+        assert_eq!(read, vec!["Cargo.toml".to_string()]);
+        assert!(written.is_empty());
     }
 
     #[test]
@@ -302,6 +462,7 @@ mod tests {
         let wrapper = SubagentCallbacks {
             parent: parent.clone() as CallbacksHandle,
             subagent_id: "sa_test".to_string(),
+            observer: Arc::new(SubagentObserver::default()),
         };
 
         wrapper.on_turn_start("go");
@@ -316,6 +477,7 @@ mod tests {
         let wrapper = SubagentCallbacks {
             parent: Arc::new(CapturingParent::default()) as CallbacksHandle,
             subagent_id: "sa_test".to_string(),
+            observer: Arc::new(SubagentObserver::default()),
         };
 
         assert!(!wrapper.on_approval_request(ApprovalRequest {

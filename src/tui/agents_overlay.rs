@@ -23,7 +23,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 
 use super::app::App;
 use super::spawn_tree::{SpawnTree, SubagentStatus};
@@ -45,7 +48,37 @@ pub fn draw_agents_overlay(f: &mut Frame, screen: Rect, app: &App) {
 
     let tree = active_tree(app);
     let total = tree.len();
-    let title = format!(" /agents · spawn tree · {total} agent{}", plural(total));
+    let agg = tree_totals(tree);
+    let replay_badge = if app.agents_replay_mode() {
+        format!(
+            " · replay {}/{}",
+            app.agents_history_index,
+            app.spawn_history.len()
+        )
+    } else if !tree.is_empty() && app.agents_history_index == 0 && app.spawn_tree.is_empty()
+    {
+        " · finished".to_string()
+    } else {
+        String::new()
+    };
+    let caps_badge = app
+        .delegation_registry
+        .as_ref()
+        .map(|reg| {
+            let caps = reg.caps();
+            let paused_marker = if reg.is_paused() { " · ⏸ paused" } else { "" };
+            format!(
+                " · caps d{}/{}{paused_marker}",
+                caps.max_spawn_depth, caps.max_concurrent_children
+            )
+        })
+        .unwrap_or_default();
+    let title = format!(
+        " /agents · {total} agent{} · d{} · {}t{replay_badge}{caps_badge} ",
+        plural(total),
+        agg.max_depth,
+        agg.subtree_tools,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
@@ -82,25 +115,99 @@ pub fn draw_agents_overlay(f: &mut Frame, screen: Rect, app: &App) {
 
     draw_tree_pane(f, panes[0], app, tree);
     draw_detail_pane(f, panes[1], app, tree);
-    draw_overlay_footer(f, body[1], tree);
+    draw_overlay_footer(f, body[1], app, tree);
 }
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Pick the active tree to display. Live tree wins when
-/// non-empty; otherwise fall back to the most recent settled
-/// snapshot from history. Returns a reference into the App so
-/// the renderer can read without cloning.
+/// Pick the active tree to display. Honours `agents_history_index`
+/// (0 = live, N>0 = Nth-newest history snapshot) and falls back
+/// to history[0] when the live tree is empty at index 0 so the
+/// user isn't dropped into a blank overlay.
 fn active_tree<'a>(app: &'a App) -> &'a SpawnTree {
-    if !app.spawn_tree.is_empty() {
-        &app.spawn_tree
-    } else if let Some(snap) = app.spawn_history.get(0) {
-        &snap.tree
-    } else {
-        &app.spawn_tree
+    let primary = app.agents_effective_tree();
+    if primary.is_empty() && app.agents_history_index == 0 {
+        if let Some(snap) = app.spawn_history.get(0) {
+            return &snap.tree;
+        }
     }
+    primary
+}
+
+/// Compute aggregate totals across every root in `tree`. Used by
+/// the header chips (`d{depth} · {tools}t`).
+fn tree_totals(tree: &SpawnTree) -> super::spawn_tree::AggregateMetrics {
+    let mut totals = super::spawn_tree::AggregateMetrics::default();
+    for root in &tree.root_ids {
+        let m = tree.aggregate(root);
+        totals.subtree_tools += m.subtree_tools;
+        totals.subtree_duration_ms += m.subtree_duration_ms;
+        totals.descendant_count += m.descendant_count + 1;
+        totals.max_depth = totals.max_depth.max(m.max_depth + 1);
+    }
+    totals
+}
+
+/// 8-step unicode bar sparkline derived from agents-per-depth.
+/// Zero columns render as a space so a sparse tree doesn't read
+/// as uniform activity. Matches Hermes' `SPARK_RAMP`.
+fn sparkline(widths: &[u32]) -> String {
+    const RAMP: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    let max = widths.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return String::new();
+    }
+    widths
+        .iter()
+        .map(|w| {
+            if *w == 0 {
+                " ".to_string()
+            } else {
+                let idx = ((*w as usize - 1) * (RAMP.len() - 1)) / max.max(1) as usize;
+                RAMP[idx.min(RAMP.len() - 1)].to_string()
+            }
+        })
+        .collect()
+}
+
+/// Count of nodes at each depth, indexed by depth.
+fn width_by_depth(tree: &SpawnTree) -> Vec<u32> {
+    let mut widths: Vec<u32> = Vec::new();
+    for node in tree.nodes.values() {
+        let d = node.depth as usize;
+        if widths.len() <= d {
+            widths.resize(d + 1, 0);
+        }
+        widths[d] += 1;
+    }
+    widths
+}
+
+/// Frequency of model names — top 4 entries joined as
+/// `"haiku×3 · sonnet×1"`. Returns empty when no models are
+/// recorded on the nodes.
+fn status_mix(tree: &SpawnTree) -> String {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for node in tree.nodes.values() {
+        if let Some(ref m) = node.model {
+            let short = m.split('/').next_back().unwrap_or(m).to_string();
+            *counts.entry(short).or_insert(0) += 1;
+        }
+    }
+    if counts.is_empty() {
+        return String::new();
+    }
+    let mut entries: Vec<(String, u32)> = counts.into_iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries
+        .into_iter()
+        .take(4)
+        .map(|(k, v)| format!("{k}×{v}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn draw_tree_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
@@ -127,10 +234,70 @@ fn draw_tree_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
         return;
     }
 
+    // Reserve top 3 rows for the gantt strip when there's room.
+    let gantt_h: u16 = 3;
+    let (gantt_area, body_area) = if inner.height > gantt_h + 4 {
+        (
+            Some(Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: gantt_h,
+            }),
+            Rect {
+                x: inner.x,
+                y: inner.y + gantt_h,
+                width: inner.width,
+                height: inner.height - gantt_h,
+            },
+        )
+    } else {
+        (None, inner)
+    };
+    if let Some(area) = gantt_area {
+        draw_gantt_strip(f, area, app, tree);
+    }
+    let inner = body_area;
+
+    // Header strip inside the tree pane: sparkline + model mix.
+    let widths = width_by_depth(tree);
+    let spark = sparkline(&widths);
+    let mix = status_mix(tree);
+    let mut header_spans = Vec::new();
+    if !spark.is_empty() {
+        header_spans.push(Span::styled(spark, Style::default().fg(SAND_GOLD)));
+    }
+    if !mix.is_empty() {
+        if !header_spans.is_empty() {
+            header_spans.push(Span::styled("  ", Style::default().fg(SUBDUED)));
+        }
+        header_spans.push(Span::styled(mix, Style::default().fg(SUBDUED)));
+    }
+
     let mut lines: Vec<Line> = Vec::new();
+    if !header_spans.is_empty() {
+        lines.push(Line::from(header_spans));
+        lines.push(Line::from(""));
+    }
+
     let peak = tree.peak_hotness();
-    for root_id in &tree.root_ids {
-        render_subtree(tree, root_id, 0, app.agents_cursor.as_deref(), peak, &mut lines);
+    let flat = app.agents_flat_node_ids();
+    if flat.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("no rows match filter: {}", app.agents_filter.label()),
+            Style::default().fg(SUBDUED),
+        )));
+    } else {
+        for id in &flat {
+            if let Some(node) = tree.nodes.get(id) {
+                lines.push(render_row(
+                    tree,
+                    node,
+                    app.agents_cursor.as_deref(),
+                    peak,
+                ));
+            }
+        }
     }
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
@@ -138,36 +305,109 @@ fn draw_tree_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
     );
 }
 
-/// Recursively render a node + its descendants as indented rows.
-fn render_subtree(
+/// Render a small horizontal time-bar strip for up to 6 nodes
+/// (first roots in render order). Each row is `id · ▓▓▓` with
+/// the bar showing the node's lifetime relative to the earliest
+/// `started_at`. The cursor's row is highlighted. Matches
+/// Hermes' `GanttStrip` (`agentsOverlay.tsx:216-348`) without
+/// the live-tick refresh — ratatui's full-frame redraw already
+/// covers that.
+fn draw_gantt_strip(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
+    use std::time::Instant;
+    // Pick nodes: first 6 roots; if there are fewer than 6
+    // roots, pad with their first descendants.
+    let mut node_ids: Vec<String> = tree
+        .root_ids
+        .iter()
+        .take(6)
+        .cloned()
+        .collect();
+    if node_ids.len() < 6 {
+        for n in tree.nodes.values() {
+            if n.parent_id.is_some() && !node_ids.contains(&n.id) {
+                node_ids.push(n.id.clone());
+                if node_ids.len() == 6 {
+                    break;
+                }
+            }
+        }
+    }
+    if node_ids.is_empty() {
+        return;
+    }
+    // Compute lifetime window.
+    let now = Instant::now();
+    let earliest = node_ids
+        .iter()
+        .filter_map(|id| tree.nodes.get(id))
+        .map(|n| n.started_at)
+        .min()
+        .unwrap_or(now);
+    let latest = node_ids
+        .iter()
+        .filter_map(|id| tree.nodes.get(id))
+        .map(|n| n.finished_at.unwrap_or(now))
+        .max()
+        .unwrap_or(now);
+    let total_ms = latest
+        .duration_since(earliest)
+        .as_millis()
+        .max(1) as u64;
+    let bar_w = area.width.saturating_sub(8) as u64; // leave 8 cells for label
+    if bar_w == 0 {
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(node_ids.len());
+    for id in node_ids.iter().take(area.height as usize) {
+        let Some(node) = tree.nodes.get(id) else { continue };
+        let end = node.finished_at.unwrap_or(now);
+        let start_offset = node.started_at.duration_since(earliest).as_millis() as u64;
+        let dur = end.duration_since(node.started_at).as_millis() as u64;
+        let start_col = (start_offset * bar_w / total_ms) as usize;
+        let end_col = ((start_offset + dur) * bar_w / total_ms) as usize;
+        let bar_len = end_col.saturating_sub(start_col).max(1);
+        let pad = " ".repeat(start_col.min(bar_w as usize));
+        let bar: String = "▓".repeat(bar_len.min(bar_w as usize - start_col));
+        let id_label = if id.len() > 6 {
+            format!("{}…", &id[..5])
+        } else {
+            format!("{:<6}", id)
+        };
+        let is_selected = app.agents_cursor.as_deref() == Some(id.as_str());
+        let bar_color = status_color(node.status);
+        let label_color = if is_selected { SAND_GOLD } else { SUBDUED };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{id_label} "), Style::default().fg(label_color)),
+            Span::styled(pad, Style::default()),
+            Span::styled(bar, Style::default().fg(bar_color)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render a single row for the tree pane. Uses the node's
+/// `depth` for indent so the row reads as part of the tree even
+/// after sort + filter shuffle the linear order.
+fn render_row(
     tree: &SpawnTree,
-    id: &str,
-    depth: usize,
+    node: &super::spawn_tree::SubagentNode,
     cursor_id: Option<&str>,
     peak: f64,
-    out: &mut Vec<Line<'static>>,
-) {
-    let Some(node) = tree.nodes.get(id) else {
-        return;
-    };
-    let indent = "  ".repeat(depth);
-    let is_selected = cursor_id == Some(id);
-    let metrics = tree.aggregate(id);
-    let bucket = tree.hot_bucket(id, peak);
+) -> Line<'static> {
+    let indent = "  ".repeat(node.depth as usize);
+    let is_selected = cursor_id == Some(node.id.as_str());
+    let metrics = tree.aggregate(&node.id);
+    let bucket = tree.hot_bucket(&node.id, peak);
     let heat_color = heat_color_for(bucket);
-    let goal_preview = truncate_goal(&node.goal, 28usize.saturating_sub(depth * 2));
-
+    let goal_preview =
+        truncate_goal(&node.goal, 28usize.saturating_sub(node.depth as usize * 2));
     let row_bg = if is_selected { HIGHLIGHT_BG } else { BG_DUSK };
     let row_style = Style::default().bg(row_bg);
-
     let glyph_color = status_color(node.status);
     let mut spans = Vec::with_capacity(8);
-    spans.push(Span::styled(format!("{indent}"), row_style));
+    spans.push(Span::styled(indent, row_style));
     if bucket >= 2 {
-        spans.push(Span::styled(
-            "▍ ".to_string(),
-            row_style.fg(heat_color),
-        ));
+        spans.push(Span::styled("▍ ".to_string(), row_style.fg(heat_color)));
     } else {
         spans.push(Span::styled("  ".to_string(), row_style));
     }
@@ -191,21 +431,31 @@ fn render_subtree(
             row_style.fg(SUBDUED),
         ));
     }
-    out.push(Line::from(spans));
-
-    for child_id in node.children.iter() {
-        render_subtree(tree, child_id, depth + 1, cursor_id, peak, out);
+    if metrics.active_count > 0 {
+        spans.push(Span::styled(
+            format!(" ⚡{}", metrics.active_count),
+            row_style.fg(AMBER),
+        ));
     }
+    Line::from(spans)
 }
 
+
 fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
+    let focused = app.agents_detail_focused;
+    let border_color = if focused { SAND_GOLD } else { PANEL_BORDER };
+    let title_label = if focused {
+        Span::styled("detail · scrolling", Style::default().fg(SAND_GOLD))
+    } else {
+        Span::styled("detail", Style::default().fg(SAND_GOLD))
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(PANEL_BORDER))
+        .border_style(Style::default().fg(border_color))
         .title(Line::from(vec![
             Span::styled("┤ ", Style::default().fg(PANEL_BORDER)),
-            Span::styled("detail", Style::default().fg(SAND_GOLD)),
+            title_label,
             Span::styled(" ├", Style::default().fg(PANEL_BORDER)),
         ]));
     let inner = block.inner(area);
@@ -244,65 +494,207 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
             Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            truncate_goal(&node.goal, inner.width.saturating_sub(15) as usize),
+            format!("{} ", node.status.glyph()),
+            Style::default().fg(status_color(node.status)),
+        ),
+        Span::styled(
+            truncate_goal(&node.goal, inner.width.saturating_sub(18) as usize),
             Style::default().fg(TEXT_CREAM).add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::raw(""));
-    lines.push(meta_line("status", node.status.label(), status_color(node.status)));
+
+    // ── Header meta row (always visible) ─────────────────────
     lines.push(meta_line(
-        "duration",
-        &format!("{} ms", node.duration_ms()),
-        SUBDUED,
+        "depth",
+        &format!("{} · {}", node.depth, node.status.label()),
+        status_color(node.status),
     ));
+    if let Some(ref m) = node.model {
+        lines.push(meta_line("model", m, SUBDUED));
+    }
+    if !node.toolsets.is_empty() {
+        lines.push(meta_line("toolsets", &node.toolsets.join(", "), SUBDUED));
+    }
     lines.push(meta_line(
         "tools",
         &format!("{} (subtree {})", metrics.local_tools, metrics.subtree_tools),
         SUBDUED,
     ));
-    if metrics.descendant_count > 0 {
+    lines.push(meta_line(
+        "subtree",
+        &format!(
+            "{} agent{} · d{} · ⚡{}",
+            metrics.descendant_count,
+            if metrics.descendant_count == 1 { "" } else { "s" },
+            metrics.max_depth,
+            metrics.active_count,
+        ),
+        SUBDUED,
+    ));
+    if node.duration_ms() > 0 {
         lines.push(meta_line(
-            "descendants",
-            &format!("{} (max depth {})", metrics.descendant_count, metrics.max_depth),
+            "elapsed",
+            &format_duration_ms(node.duration_ms()),
+            SUBDUED,
+        ));
+    }
+    if node.iteration > 0 {
+        lines.push(meta_line("iteration", &node.iteration.to_string(), SUBDUED));
+    }
+    if node.api_calls > 0 {
+        lines.push(meta_line(
+            "api calls",
+            &node.api_calls.to_string(),
             SUBDUED,
         ));
     }
     lines.push(Line::raw(""));
 
-    if !node.tools.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "tools used:",
-            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
-        )));
-        for tool in node.tools.iter().take(20) {
+    // ── Budget section ───────────────────────────────────────
+    let local_tokens = node.input_tokens + node.output_tokens;
+    let subtree_tokens = metrics.input_tokens + metrics.output_tokens - local_tokens;
+    let local_cost = node.cost_usd;
+    let subtree_cost = metrics.cost_usd - local_cost;
+    if local_tokens > 0 || local_cost > 0.0 || subtree_tokens > 0 || subtree_cost > 0.0 {
+        push_section_header(&mut lines, "Budget", None, true);
+        if local_tokens > 0 {
+            let mut value = format!(
+                "{} in · {} out",
+                fmt_tokens(node.input_tokens),
+                fmt_tokens(node.output_tokens),
+            );
+            if node.reasoning_tokens > 0 {
+                value.push_str(&format!(" · {} reasoning", fmt_tokens(node.reasoning_tokens)));
+            }
+            lines.push(field_line("tokens", &value));
+        }
+        if local_cost > 0.0 {
+            let mut value = fmt_cost(local_cost);
+            if subtree_cost >= 0.01 {
+                value.push_str(&format!(" · subtree +{}", fmt_cost(subtree_cost)));
+            }
+            lines.push(field_line("cost", &value));
+        }
+        if subtree_tokens > 0 {
+            lines.push(field_line(
+                "subtree tokens",
+                &format!("+{}", fmt_tokens(subtree_tokens)),
+            ));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    // ── Files section ────────────────────────────────────────
+    if !node.files_read.is_empty() || !node.files_written.is_empty() {
+        push_section_header(
+            &mut lines,
+            "Files",
+            Some(node.files_read.len() + node.files_written.len()),
+            false,
+        );
+        for p in node.files_written.iter().take(8) {
+            lines.push(Line::from(Span::styled(
+                format!("  +{p}"),
+                Style::default().fg(MUTED_GREEN),
+            )));
+        }
+        for p in node.files_read.iter().take(8) {
             lines.push(Line::from(vec![
-                Span::styled("  ▸ ", Style::default().fg(TOOL_PINK)),
-                Span::styled(
-                    tool.name.clone(),
-                    Style::default().fg(TOOL_PINK).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" · ", Style::default().fg(SUBDUED)),
-                Span::styled(
-                    truncate_inline(&tool.preview, inner.width as usize),
-                    Style::default().fg(SUBDUED),
-                ),
+                Span::styled("  · ", Style::default().fg(SUBDUED)),
+                Span::styled(p.clone(), Style::default().fg(TEXT_CREAM)),
             ]));
         }
-        if node.tools.len() > 20 {
+        let overflow = node.files_read.len().saturating_sub(8)
+            + node.files_written.len().saturating_sub(8);
+        if overflow > 0 {
             lines.push(Line::from(Span::styled(
-                format!("  …and {} more", node.tools.len() - 20),
+                format!("  …+{overflow} more"),
                 Style::default().fg(SUBDUED),
             )));
         }
         lines.push(Line::raw(""));
     }
 
+    // ── Tool calls section ───────────────────────────────────
+    let tool_count = if node.tools.is_empty() {
+        node.output_tail.len()
+    } else {
+        node.tools.len()
+    };
+    if tool_count > 0 {
+        push_section_header(&mut lines, "Tool calls", Some(tool_count), true);
+        if !node.tools.is_empty() {
+            for tool in node.tools.iter().take(20) {
+                lines.push(Line::from(vec![
+                    Span::styled("  ▸ ", Style::default().fg(TOOL_PINK)),
+                    Span::styled(
+                        tool.name.clone(),
+                        Style::default().fg(TOOL_PINK).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" · ", Style::default().fg(SUBDUED)),
+                    Span::styled(
+                        truncate_inline(&tool.preview, inner.width as usize),
+                        Style::default().fg(SUBDUED),
+                    ),
+                ]));
+            }
+            if node.tools.len() > 20 {
+                lines.push(Line::from(Span::styled(
+                    format!("  …+{} more", node.tools.len() - 20),
+                    Style::default().fg(SUBDUED),
+                )));
+            }
+        } else {
+            // Archived snapshot fallback: show the output_tail
+            // names if no live tools are recorded.
+            for entry in node.output_tail.iter().take(20) {
+                lines.push(Line::from(vec![
+                    Span::styled("  ▸ ", Style::default().fg(TOOL_PINK)),
+                    Span::styled(
+                        entry.tool.clone(),
+                        Style::default().fg(TOOL_PINK).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+
+    // ── Output tail section ──────────────────────────────────
+    if !node.output_tail.is_empty() {
+        push_section_header(
+            &mut lines,
+            "Output",
+            Some(node.output_tail.len()),
+            true,
+        );
+        for entry in node.output_tail.iter() {
+            let tool_color = if entry.is_error { TERRACOTTA } else { SAND_GOLD };
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    entry.tool.clone(),
+                    Style::default().fg(tool_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ", Style::default()),
+                Span::styled(
+                    truncate_inline(&entry.preview, inner.width as usize),
+                    if entry.is_error {
+                        Style::default().fg(TERRACOTTA)
+                    } else {
+                        Style::default().fg(TEXT_CREAM)
+                    },
+                ),
+            ]));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    // ── Progress section (notes) ─────────────────────────────
     if !node.notes.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "progress notes:",
-            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
-        )));
-        for note in node.notes.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+        push_section_header(&mut lines, "Progress", Some(node.notes.len()), false);
+        for note in node.notes.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
             lines.push(Line::from(vec![
                 Span::styled("  · ", Style::default().fg(SUBDUED)),
                 Span::styled(
@@ -314,25 +706,124 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
         lines.push(Line::raw(""));
     }
 
-    if let Some(ref out) = node.output {
+    // ── Summary section ──────────────────────────────────────
+    if let Some(ref summary) = node.summary {
+        push_section_header(&mut lines, "Summary", None, true);
         lines.push(Line::from(Span::styled(
-            "output:",
-            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
+            format!("  {summary}"),
+            Style::default().fg(TEXT_CREAM),
         )));
-        // Show the first ~12 lines of output, wrap=trim:false
-        // so paragraph takes care of long lines.
+        lines.push(Line::raw(""));
+    } else if let Some(ref out) = node.output {
+        push_section_header(&mut lines, "Output text", None, true);
         for raw in out.split('\n').take(12) {
             lines.push(Line::from(Span::styled(
-                raw.to_string(),
+                format!("  {raw}"),
                 Style::default().fg(TEXT_CREAM),
             )));
         }
     }
 
+    // Clamp the scroll offset to the content size so `G` (which
+    // sets MAX/2) parks at the last visible row instead of past
+    // the end. Rough heuristic: each line is one row pre-wrap.
+    let viewport_h = inner.height.max(1);
+    let max_scroll = (lines.len() as u16).saturating_sub(viewport_h);
+    let scroll = app.agents_detail_scroll.min(max_scroll);
+
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         inner,
     );
+    // Right-edge scrollbar: only render when there's something
+    // to scroll. Sits in the rightmost column of the inner rect
+    // (one cell wide, full height).
+    if max_scroll > 0 && inner.width >= 1 {
+        let bar_area = Rect {
+            x: inner.x + inner.width - 1,
+            y: inner.y,
+            width: 1,
+            height: inner.height,
+        };
+        let mut state = ScrollbarState::new(max_scroll as usize).position(scroll as usize);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .style(Style::default().fg(if app.agents_detail_focused {
+                    SAND_GOLD
+                } else {
+                    SUBDUED
+                })),
+            bar_area,
+            &mut state,
+        );
+    }
+}
+
+/// Push a section-header line to the detail-pane output. `▾`
+/// signals the section is open, `▸` collapsed (rendered for
+/// parity with Hermes' visual language — Fennec currently always
+/// shows the section body when open, since no key toggle is
+/// wired). `count` adds `(N)` when present.
+fn push_section_header(
+    lines: &mut Vec<Line<'static>>,
+    title: &str,
+    count: Option<usize>,
+    open: bool,
+) {
+    let glyph = if open { "▾" } else { "▸" };
+    let count_suffix = count
+        .map(|n| format!(" ({n})"))
+        .unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{glyph} {title}{count_suffix}"),
+            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+}
+
+fn field_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label:<10}"), Style::default().fg(SUBDUED)),
+        Span::styled(value.to_string(), Style::default().fg(TEXT_CREAM)),
+    ])
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn fmt_cost(usd: f64) -> String {
+    if usd >= 1.0 {
+        format!("${usd:.2}")
+    } else if usd >= 0.01 {
+        format!("${usd:.3}")
+    } else if usd > 0.0 {
+        format!("${usd:.4}")
+    } else {
+        "$0".to_string()
+    }
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    let secs = ms as f64 / 1000.0;
+    if secs >= 60.0 {
+        let m = (secs / 60.0).floor() as u64;
+        let s = secs - (m as f64 * 60.0);
+        format!("{m}m {s:.1}s")
+    } else if secs >= 1.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{ms} ms")
+    }
 }
 
 fn meta_line(label: &str, value: &str, color: Color) -> Line<'static> {
@@ -366,27 +857,52 @@ fn heat_color_for(bucket: usize) -> Color {
     }
 }
 
-fn draw_overlay_footer(f: &mut Frame, area: Rect, tree: &SpawnTree) {
-    let live_marker = if tree.is_settled() && !tree.is_empty() {
-        " · finished — inspecting last tree"
+fn draw_overlay_footer(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
+    // Transient flash takes priority over the legend when set.
+    if let Some((body, _)) = app.agents_flash.as_ref() {
+        let flash = Paragraph::new(Line::from(Span::styled(
+            format!(" ⚑ {body}"),
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        )));
+        f.render_widget(flash, area);
+        return;
+    }
+    let mode_marker = if app.agents_replay_mode() {
+        format!(
+            " · replay {}/{}",
+            app.agents_history_index,
+            app.spawn_history.len()
+        )
     } else if tree.is_empty() {
-        " · no tree"
+        " · no tree".to_string()
+    } else if tree.is_settled() {
+        " · settled".to_string()
     } else {
-        " · live"
+        " · live".to_string()
     };
     let footer = Line::from(vec![
         Span::styled(" ↑↓/jk ", Style::default().fg(SAND_GOLD)),
-        Span::styled("navigate ", Style::default().fg(SUBDUED)),
-        Span::styled("[g/G] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("top/bottom ", Style::default().fg(SUBDUED)),
-        Span::styled("[x] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("kill ", Style::default().fg(SUBDUED)),
-        Span::styled("[X] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("kill subtree ", Style::default().fg(SUBDUED)),
+        Span::styled("nav ", Style::default().fg(SUBDUED)),
+        Span::styled("[s] ", Style::default().fg(SAND_GOLD)),
+        Span::styled(
+            format!("sort:{} ", app.agents_sort.label()),
+            Style::default().fg(SUBDUED),
+        ),
+        Span::styled("[f] ", Style::default().fg(SAND_GOLD)),
+        Span::styled(
+            format!("filter:{} ", app.agents_filter.label()),
+            Style::default().fg(SUBDUED),
+        ),
+        Span::styled("[]/<> ", Style::default().fg(SAND_GOLD)),
+        Span::styled("history ", Style::default().fg(SUBDUED)),
+        Span::styled("[p] ", Style::default().fg(SAND_GOLD)),
+        Span::styled("pause ", Style::default().fg(SUBDUED)),
+        Span::styled("[x/X] ", Style::default().fg(SAND_GOLD)),
+        Span::styled("kill[+sub] ", Style::default().fg(SUBDUED)),
         Span::styled("[q/esc] ", Style::default().fg(SAND_GOLD)),
         Span::styled("close", Style::default().fg(SUBDUED)),
         Span::styled(
-            live_marker.to_string(),
+            mode_marker,
             Style::default().fg(SUBDUED).add_modifier(Modifier::DIM),
         ),
     ]);

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::agent::callbacks::CallbacksHandle;
+use crate::agent::delegation::DelegationRegistry;
 use crate::agent::subagent::SubagentManager;
 use crate::memory::traits::Memory;
 use crate::providers::traits::Provider;
@@ -21,6 +22,11 @@ pub struct DelegateTool {
     /// each spawned sub-agent's lifecycle events fire on this
     /// handle so the TUI's spawn-tree overlay can track them.
     callbacks: Option<CallbacksHandle>,
+    /// Shared delegation state — pause flag, caps, active
+    /// registry. When set, every spawn honours the registry's
+    /// pause / cap checks and surfaces a real interrupt flag the
+    /// inner agent loop polls.
+    registry: Option<DelegationRegistry>,
 }
 
 impl DelegateTool {
@@ -39,6 +45,7 @@ impl DelegateTool {
             memory,
             available_tools,
             callbacks: None,
+            registry: None,
         }
     }
 
@@ -46,6 +53,14 @@ impl DelegateTool {
     /// lifecycle events flow up to the spawn-tree overlay.
     pub fn with_callbacks(mut self, callbacks: CallbacksHandle) -> Self {
         self.callbacks = Some(callbacks);
+        self
+    }
+
+    /// Wire the shared delegation registry so every spawn passes
+    /// through the pause / cap gate and registers itself in the
+    /// active map.
+    pub fn with_registry(mut self, registry: DelegationRegistry) -> Self {
+        self.registry = Some(registry);
         self
     }
 }
@@ -135,6 +150,9 @@ impl Tool for DelegateTool {
         );
         if let Some(ref cb) = self.callbacks {
             manager = manager.with_callbacks(Arc::clone(cb));
+        }
+        if let Some(ref reg) = self.registry {
+            manager = manager.with_registry(reg.clone());
         }
 
         let result = manager.spawn(task, tools, 10).await?;
