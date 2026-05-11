@@ -80,6 +80,34 @@ pub struct SecretRequest {
     pub label: String,
 }
 
+/// A delegated sub-agent has been spawned. `id` is locally
+/// unique within a session; `parent_id` is `None` for roots
+/// spawned by the main agent and `Some(id)` for nested
+/// delegations. `goal` is the task description the parent
+/// passed via the `delegate` tool.
+#[derive(Debug, Clone)]
+pub struct SubagentSpawn {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub goal: String,
+}
+
+/// A delegated sub-agent has finished. Carries enough metadata
+/// for the TUI to roll up subtree metrics and surface the
+/// outcome in the spawn-tree overlay.
+#[derive(Debug, Clone)]
+pub struct SubagentComplete {
+    pub id: String,
+    /// Final assistant text the subagent returned.
+    pub output: String,
+    /// `true` when the subagent's turn returned Ok and the
+    /// agent didn't bail (max iterations, provider error, etc.).
+    pub success: bool,
+    pub duration_ms: u64,
+    /// Names of tools the subagent invoked.
+    pub tools_used: Vec<String>,
+}
+
 /// Lifecycle hooks an agent run fires for each event of interest
 /// to a real-time frontend.
 ///
@@ -145,6 +173,34 @@ pub trait AgentCallbacks: Send + Sync {
     fn on_secret_request(&self, _request: SecretRequest) -> Option<String> {
         None
     }
+
+    /// A new sub-agent was spawned (via the `delegate` tool).
+    /// Fires once per spawn, before any sub-agent text /
+    /// tool-call events arrive.
+    fn on_subagent_spawn(&self, _spawn: SubagentSpawn) {}
+
+    /// The sub-agent's main loop began executing.
+    fn on_subagent_start(&self, _id: &str) {}
+
+    /// Streaming text delta from a sub-agent. Routes the
+    /// equivalent of [`Self::on_text_delta`] but tagged with
+    /// the subagent_id so the frontend can attribute it.
+    fn on_subagent_text(&self, _id: &str, _delta: &str) {}
+
+    /// Streaming reasoning delta from a sub-agent. Counterpart
+    /// to [`Self::on_reasoning_delta`].
+    fn on_subagent_thinking(&self, _id: &str, _delta: &str) {}
+
+    /// A tool started executing inside a sub-agent.
+    fn on_subagent_tool(&self, _id: &str, _start: ToolStart) {}
+
+    /// Free-text progress note from a sub-agent (the agent's
+    /// own status messages, e.g. "compressing context").
+    fn on_subagent_progress(&self, _id: &str, _note: &str) {}
+
+    /// A sub-agent finished — terminal event for that subtree
+    /// branch.
+    fn on_subagent_complete(&self, _complete: SubagentComplete) {}
 }
 
 /// No-op implementation. Used in code paths that don't have a

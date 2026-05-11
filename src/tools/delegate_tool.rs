@@ -4,6 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::agent::callbacks::CallbacksHandle;
 use crate::agent::subagent::SubagentManager;
 use crate::memory::traits::Memory;
 use crate::providers::traits::Provider;
@@ -16,6 +17,10 @@ pub struct DelegateTool {
     provider: Arc<dyn Provider>,
     memory: Arc<dyn Memory>,
     available_tools: Vec<Arc<dyn Tool>>,
+    /// Optional handle to the parent agent's callbacks. When set,
+    /// each spawned sub-agent's lifecycle events fire on this
+    /// handle so the TUI's spawn-tree overlay can track them.
+    callbacks: Option<CallbacksHandle>,
 }
 
 impl DelegateTool {
@@ -33,7 +38,15 @@ impl DelegateTool {
             provider,
             memory,
             available_tools,
+            callbacks: None,
         }
+    }
+
+    /// Wire the parent agent's callback bridge so sub-agent
+    /// lifecycle events flow up to the spawn-tree overlay.
+    pub fn with_callbacks(mut self, callbacks: CallbacksHandle) -> Self {
+        self.callbacks = Some(callbacks);
+        self
     }
 }
 
@@ -116,10 +129,13 @@ impl Tool for DelegateTool {
             });
         }
 
-        let manager = SubagentManager::new(
+        let mut manager = SubagentManager::new(
             Arc::clone(&self.provider),
             Arc::clone(&self.memory),
         );
+        if let Some(ref cb) = self.callbacks {
+            manager = manager.with_callbacks(Arc::clone(cb));
+        }
 
         let result = manager.spawn(task, tools, 10).await?;
 

@@ -15,6 +15,20 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
+use super::spawn_tree::SpawnTree;
+
+/// Walk a subtree depth-first appending ids in render order.
+/// Used by `App::agents_flat_node_ids` for the overlay's
+/// keyboard navigation.
+fn collect_subtree_ids(tree: &SpawnTree, id: &str, out: &mut Vec<String>) {
+    out.push(id.to_string());
+    if let Some(node) = tree.nodes.get(id) {
+        for child in &node.children {
+            collect_subtree_ids(tree, child, out);
+        }
+    }
+}
+
 /// One row in the sessions panel.
 #[derive(Debug, Clone)]
 pub struct SessionRow {
@@ -569,6 +583,21 @@ pub struct App {
     /// `/skills` reads this lazily via SkillsLoader so the user
     /// sees a fresh list every time without a config reload.
     pub skills_dir: Option<std::path::PathBuf>,
+    /// Live spawn tree of delegated sub-agents. Updated as
+    /// `TuiEvent::Subagent*` events flow in from the agent
+    /// callback bridge. Read by the `/agents` overlay renderer.
+    pub spawn_tree: super::spawn_tree::SpawnTree,
+    /// FIFO history of completed spawn trees (cap 10). Pushed
+    /// when the live tree is_settled — `/agents` then auto-pins
+    /// the most recent snapshot when the live tree empties.
+    pub spawn_history: super::spawn_tree::SpawnHistory,
+    /// Whether the `/agents` fullscreen overlay is open.
+    /// Toggled by the `/agents` slash command. When true, the
+    /// keyboard router sends ↑↓/jk/g/G/Enter/q/Esc to the
+    /// overlay handler instead of focus-dependent panes.
+    pub show_agents_overlay: bool,
+    /// Selected node id within the overlay's tree pane.
+    pub agents_cursor: Option<String>,
 }
 
 impl App {
@@ -595,6 +624,10 @@ impl App {
             current_session_id: None,
             current_session_title: None,
             skills_dir: None,
+            spawn_tree: super::spawn_tree::SpawnTree::new(),
+            spawn_history: super::spawn_tree::SpawnHistory::new(),
+            show_agents_overlay: false,
+            agents_cursor: None,
         }
     }
 
@@ -630,6 +663,13 @@ impl App {
     /// are global (Tab cycles focus, Ctrl-C/D exits — handled in
     /// the event loop).
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        // Overlays consume input first — Tab does NOT cycle focus
+        // when the spawn-tree dashboard is up so the user can't
+        // accidentally rotate panes behind the overlay.
+        if self.show_agents_overlay {
+            self.handle_key_agents_overlay(code, modifiers);
+            return;
+        }
         // Global hotkeys.
         if matches!(code, KeyCode::Tab) {
             self.cycle_focus();
@@ -641,6 +681,83 @@ impl App {
             Focus::Chat => self.handle_key_chat(code),
             Focus::Input => self.handle_key_input(code, modifiers),
         }
+    }
+
+    /// Keyboard handler active while the `/agents` overlay is
+    /// open. `↑↓/jk` move the cursor through the flattened tree;
+    /// `g`/`G` jump to top/bottom; `q`/`Esc` close; `x`/`X` mark
+    /// the selected node (or its subtree) interrupted.
+    fn handle_key_agents_overlay(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) {
+        let ctrl_c = matches!(code, KeyCode::Char('c'))
+            && modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl_c
+            || matches!(
+                code,
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc
+            )
+        {
+            self.show_agents_overlay = false;
+            return;
+        }
+        let flat = self.agents_flat_node_ids();
+        if flat.is_empty() {
+            return;
+        }
+        let cur_idx = self
+            .agents_cursor
+            .as_ref()
+            .and_then(|id| flat.iter().position(|x| x == id))
+            .unwrap_or(0);
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                let next = cur_idx.saturating_sub(1);
+                self.agents_cursor = Some(flat[next].clone());
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let next = (cur_idx + 1).min(flat.len() - 1);
+                self.agents_cursor = Some(flat[next].clone());
+            }
+            KeyCode::Char('g') => {
+                self.agents_cursor = flat.first().cloned();
+            }
+            KeyCode::Char('G') => {
+                self.agents_cursor = flat.last().cloned();
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref id) = self.agents_cursor.clone() {
+                    self.spawn_tree.interrupt(id, false);
+                }
+            }
+            KeyCode::Char('X') => {
+                if let Some(ref id) = self.agents_cursor.clone() {
+                    self.spawn_tree.interrupt(id, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Flattened list of every node id in the active spawn tree
+    /// (live or most-recent history snapshot), in render order.
+    /// Used by the overlay's keyboard navigation to map ↑/↓ to
+    /// neighbouring rows.
+    fn agents_flat_node_ids(&self) -> Vec<String> {
+        let tree = if !self.spawn_tree.is_empty() {
+            &self.spawn_tree
+        } else if let Some(snap) = self.spawn_history.get(0) {
+            &snap.tree
+        } else {
+            &self.spawn_tree
+        };
+        let mut out = Vec::new();
+        for root in &tree.root_ids {
+            collect_subtree_ids(tree, root, &mut out);
+        }
+        out
     }
 
     fn handle_key_sessions(&mut self, code: KeyCode) {
@@ -1065,5 +1182,103 @@ mod tests {
         s.backspace();
         assert_eq!(s.text(), "hél");
         assert_eq!(s.col, 3);
+    }
+
+    fn spawn(id: &str, parent: Option<&str>) -> crate::agent::callbacks::SubagentSpawn {
+        crate::agent::callbacks::SubagentSpawn {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            goal: format!("goal {id}"),
+        }
+    }
+
+    #[test]
+    fn agents_overlay_arrow_keys_walk_flat_tree() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        app.spawn_tree.on_spawn(spawn("root", None));
+        app.spawn_tree.on_spawn(spawn("child", Some("root")));
+        app.spawn_tree.on_spawn(spawn("leaf", Some("child")));
+        app.agents_cursor = Some("root".into());
+
+        app.handle_key_agents_overlay(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("child"));
+        app.handle_key_agents_overlay(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("leaf"));
+        // Already at the bottom — clamps, does not wrap.
+        app.handle_key_agents_overlay(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("leaf"));
+        app.handle_key_agents_overlay(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("child"));
+        app.handle_key_agents_overlay(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("root"));
+        // Already at the top — clamps.
+        app.handle_key_agents_overlay(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn agents_overlay_gG_jump_to_top_and_bottom() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        app.spawn_tree.on_spawn(spawn("root", None));
+        app.spawn_tree.on_spawn(spawn("child", Some("root")));
+        app.spawn_tree.on_spawn(spawn("leaf", Some("child")));
+        app.agents_cursor = Some("child".into());
+
+        app.handle_key_agents_overlay(KeyCode::Char('G'), KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("leaf"));
+        app.handle_key_agents_overlay(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn agents_overlay_q_and_esc_close_overlay() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        app.handle_key_agents_overlay(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.show_agents_overlay);
+
+        app.show_agents_overlay = true;
+        app.handle_key_agents_overlay(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.show_agents_overlay);
+
+        app.show_agents_overlay = true;
+        app.handle_key_agents_overlay(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!app.show_agents_overlay);
+    }
+
+    #[test]
+    fn agents_overlay_x_interrupts_single_node_capital_x_interrupts_subtree() {
+        use crate::tui::spawn_tree::SubagentStatus;
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        app.spawn_tree.on_spawn(spawn("root", None));
+        app.spawn_tree.on_spawn(spawn("child", Some("root")));
+        app.spawn_tree.on_spawn(spawn("leaf", Some("child")));
+
+        // `x` on `child` interrupts only that node.
+        app.agents_cursor = Some("child".into());
+        app.handle_key_agents_overlay(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            app.spawn_tree.nodes.get("child").map(|n| n.status),
+            Some(SubagentStatus::Interrupted)
+        );
+        assert_ne!(
+            app.spawn_tree.nodes.get("leaf").map(|n| n.status),
+            Some(SubagentStatus::Interrupted)
+        );
+
+        // `X` on `root` interrupts the whole subtree (including leaf).
+        app.agents_cursor = Some("root".into());
+        app.handle_key_agents_overlay(KeyCode::Char('X'), KeyModifiers::NONE);
+        assert_eq!(
+            app.spawn_tree.nodes.get("root").map(|n| n.status),
+            Some(SubagentStatus::Interrupted)
+        );
+        assert_eq!(
+            app.spawn_tree.nodes.get("leaf").map(|n| n.status),
+            Some(SubagentStatus::Interrupted)
+        );
     }
 }

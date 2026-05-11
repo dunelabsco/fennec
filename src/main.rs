@@ -693,11 +693,18 @@ async fn build_agent_with_callbacks(
         Arc::new(WebFetchTool::new()),
         Arc::new(WebSearchTool::new()),
     ];
-    builder = builder.tool(Box::new(DelegateTool::new(
+    let mut delegate_tool = DelegateTool::new(
         Arc::clone(&provider),
         memory.clone(),
         delegate_subagent_tools,
-    )));
+    );
+    if let Some(ref cb) = callbacks {
+        // Wire the parent's callback bridge so each spawned
+        // sub-agent's lifecycle events surface in the TUI's
+        // /agents overlay.
+        delegate_tool = delegate_tool.with_callbacks(Arc::clone(cb));
+    }
+    builder = builder.tool(Box::new(delegate_tool));
 
     let mut configured_builder = builder
         .identity_name(&config.identity.name)
@@ -2180,6 +2187,50 @@ fn apply_tui_event(
         }
         TuiEvent::Status(msg) => {
             guard.set_status(msg);
+        }
+        TuiEvent::SubagentSpawn(spawn) => {
+            // Default the overlay cursor to the first root we
+            // see so /agents has something selected when the
+            // user opens it. Subsequent spawns leave the cursor
+            // alone.
+            if guard.agents_cursor.is_none() {
+                guard.agents_cursor = Some(spawn.id.clone());
+            }
+            guard.spawn_tree.on_spawn(spawn);
+        }
+        TuiEvent::SubagentStart(id) => {
+            guard.spawn_tree.on_start(&id);
+        }
+        TuiEvent::SubagentText { id, delta: _ } => {
+            // Sub-agent text doesn't append to the main chat
+            // scrollback (avoids duplicate output); the spawn-tree
+            // node accumulates it as `output` on completion. For
+            // now we only track that the sub-agent emitted text
+            // (no per-token detail panel yet).
+            let _ = id;
+        }
+        TuiEvent::SubagentThinking { id, delta: _ } => {
+            // Reasoning during a sub-agent isn't surfaced in the
+            // overlay's detail pane today — node has `notes` for
+            // free-text progress. Wire later if needed.
+            let _ = id;
+        }
+        TuiEvent::SubagentTool { id, start } => {
+            guard.spawn_tree.on_tool(&id, start);
+        }
+        TuiEvent::SubagentProgress { id, note } => {
+            guard.spawn_tree.on_progress(&id, note);
+        }
+        TuiEvent::SubagentComplete(complete) => {
+            guard.spawn_tree.on_complete(complete);
+            // When every node has reached a terminal status, snapshot
+            // the live tree onto history and reset for the next spawn
+            // round. Mirrors Hermes' auto-promote-on-settle behavior.
+            if guard.spawn_tree.is_settled() {
+                let settled = std::mem::take(&mut guard.spawn_tree);
+                guard.spawn_history.push(settled);
+                guard.agents_cursor = None;
+            }
         }
     }
 }

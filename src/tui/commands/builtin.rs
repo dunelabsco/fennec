@@ -46,6 +46,7 @@ pub fn register_all(r: &mut CommandRegistry) {
     r.register(Box::new(Image));
     r.register(Box::new(Paste));
     r.register(Box::new(Copy));
+    r.register(Box::new(Agents));
 }
 
 // -- Lifecycle / focus -------------------------------------------
@@ -98,6 +99,7 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("image <path>", "attach an image to the next message"),
     ("paste", "paste clipboard text into the input"),
     ("copy [n]", "copy a past assistant message to clipboard"),
+    ("agents", "open the spawn-tree dashboard (/agents pause|resume|status)"),
 ];
 
 struct Quit;
@@ -840,6 +842,62 @@ impl CommandHandler for Copy {
     }
 }
 
+struct Agents;
+impl CommandHandler for Agents {
+    fn name(&self) -> &'static str {
+        "agents"
+    }
+    fn help(&self) -> &'static str {
+        "open spawn-tree dashboard (or /agents pause|resume|status)"
+    }
+    fn aliases(&self) -> &[&'static str] {
+        &["tasks"]
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let trimmed = args.trim().to_lowercase();
+        match trimmed.as_str() {
+            "" | "open" | "show" => {
+                app.show_agents_overlay = true;
+                // Default the cursor to the first root if empty.
+                if app.agents_cursor.is_none() {
+                    if let Some(first) = app.spawn_tree.root_ids.first() {
+                        app.agents_cursor = Some(first.clone());
+                    } else if let Some(snap) = app.spawn_history.get(0) {
+                        if let Some(first) = snap.tree.root_ids.first() {
+                            app.agents_cursor = Some(first.clone());
+                        }
+                    }
+                }
+                Ok(CommandOutcome::Status("agents overlay open".into()))
+            }
+            "close" | "hide" => {
+                app.show_agents_overlay = false;
+                Ok(CommandOutcome::Status("agents overlay closed".into()))
+            }
+            "pause" | "resume" | "status" => {
+                // Hermes pauses/resumes the delegation manager
+                // globally. Fennec doesn't currently expose a
+                // pause flag on the agent (DelegateTool runs
+                // synchronously and there's no scheduler to
+                // pause). Surface an honest "not yet wired"
+                // message; this hooks up alongside the
+                // background-tasks PR.
+                push_system(
+                    app,
+                    format!(
+                        "/agents {trimmed}: delegation pause/resume isn't wired into the agent yet — \
+                         lands alongside the /background + /stop scheduler work"
+                    ),
+                );
+                Ok(CommandOutcome::Status("noted".into()))
+            }
+            other => Ok(CommandOutcome::Status(format!(
+                "/agents: unknown subcommand '{other}' (expected pause/resume/status or no arg)"
+            ))),
+        }
+    }
+}
+
 // -- Helpers ----------------------------------------------------
 
 fn push_system(app: &mut App, body: String) {
@@ -985,6 +1043,49 @@ mod tests {
         // Untouched on parse failure.
         assert_eq!(app.details_mode, initial);
         assert_eq!(initial, DetailsMode::Expanded);
+    }
+
+    #[test]
+    fn agents_no_arg_opens_overlay() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        assert!(!app.show_agents_overlay);
+        r.dispatch("agents", "", &mut app).unwrap();
+        assert!(app.show_agents_overlay);
+    }
+
+    #[test]
+    fn agents_close_subcommand_closes_overlay() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        r.dispatch("agents", "close", &mut app).unwrap();
+        assert!(!app.show_agents_overlay);
+    }
+
+    #[test]
+    fn agents_pause_surfaces_not_yet_wired_message() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("agents", "pause", &mut app).unwrap();
+        let body = app
+            .chat
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                ChatLine::System { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(body.contains("isn't wired"), "got: {body}");
+    }
+
+    #[test]
+    fn agents_alias_tasks_also_works() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("tasks", "", &mut app).unwrap();
+        assert!(app.show_agents_overlay);
     }
 
     #[test]

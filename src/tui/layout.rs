@@ -67,6 +67,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_status(f, status_area, app, narrow);
     draw_shortcuts(f, shortcut_area, app);
+
+    // Fullscreen overlays render last so they paint over the
+    // three-pane layout below. Like the modal layer in F1-2-A,
+    // the underlying scrollback stays visible behind the
+    // overlay's centered Clear-widget block.
+    if app.show_agents_overlay {
+        super::agents_overlay::draw_agents_overlay(f, f.area(), app);
+    }
 }
 
 // -- Sessions panel ---------------------------------------------
