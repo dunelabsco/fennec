@@ -61,6 +61,8 @@ pub fn register_all(r: &mut CommandRegistry) {
     r.register(Box::new(Branch));
     r.register(Box::new(Replay));
     r.register(Box::new(ReplayDiff));
+    r.register(Box::new(Compress));
+    r.register(Box::new(Rollback));
 }
 
 // -- Lifecycle / focus -------------------------------------------
@@ -127,6 +129,8 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("branch / fork", "fork the current session into a new row"),
     ("replay", "open spawn-tree history (N|last|list|load)"),
     ("replay-diff", "diff two spawn-tree snapshots in the overlay"),
+    ("compress [topic]", "summarise older history into one message"),
+    ("rollback", "list checkpoints or restore one (rollback list|<hash>)"),
 ];
 
 struct Quit;
@@ -1462,6 +1466,45 @@ impl CommandHandler for ReplayDiff {
     }
 }
 
+struct Compress;
+impl CommandHandler for Compress {
+    fn name(&self) -> &'static str {
+        "compress"
+    }
+    fn help(&self) -> &'static str {
+        "summarise older history into a single system message"
+    }
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        let topic = args.trim();
+        let payload = if topic.is_empty() {
+            None
+        } else {
+            Some(topic.to_string())
+        };
+        Ok(CommandOutcome::Agent(AgentAction::CompressHistory(payload)))
+    }
+}
+
+struct Rollback;
+impl CommandHandler for Rollback {
+    fn name(&self) -> &'static str {
+        "rollback"
+    }
+    fn help(&self) -> &'static str {
+        "conversation rollback (list or <hash>)"
+    }
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        let trimmed = args.trim();
+        let lower = trimmed.to_lowercase();
+        if trimmed.is_empty() || lower == "list" || lower == "ls" {
+            return Ok(CommandOutcome::Agent(AgentAction::RollbackList));
+        }
+        Ok(CommandOutcome::Agent(AgentAction::RollbackTo(
+            trimmed.to_string(),
+        )))
+    }
+}
+
 // -- Helpers ----------------------------------------------------
 
 fn push_system(app: &mut App, body: String) {
@@ -1886,7 +1929,7 @@ mod tests {
             "reload", "reload-mcp", "image", "paste", "copy", "agents",
             "fortune", "queue", "statusbar", "logs", "indicator",
             "reload-skills", "verbose", "busy", "reasoning", "personality",
-            "branch", "replay", "replay-diff",
+            "branch", "replay", "replay-diff", "compress", "rollback",
         ] {
             assert!(
                 names.contains(required),
@@ -2096,6 +2139,55 @@ mod tests {
         match outcome {
             CommandOutcome::Status(s) => assert!(s.contains("usage")),
             other => panic!("expected usage status, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compress_no_arg_emits_compress_history_with_none() {
+        let (outcome, _app) = dispatch("compress", "");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::CompressHistory(None)) => {}
+            other => panic!("expected CompressHistory(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compress_with_arg_passes_focus_topic() {
+        let (outcome, _app) = dispatch("compress", "auth refactor");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::CompressHistory(Some(t))) => {
+                assert_eq!(t, "auth refactor");
+            }
+            other => panic!("expected CompressHistory(Some), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rollback_no_arg_emits_rollback_list() {
+        let (outcome, _app) = dispatch("rollback", "");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::RollbackList) => {}
+            other => panic!("expected RollbackList, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rollback_list_alias_dispatches_to_list() {
+        let (outcome, _app) = dispatch("rollback", "list");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::RollbackList) => {}
+            other => panic!("expected RollbackList, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rollback_hash_emits_rollback_to() {
+        let (outcome, _app) = dispatch("rollback", "deadbeef");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::RollbackTo(h)) => {
+                assert_eq!(h, "deadbeef");
+            }
+            other => panic!("expected RollbackTo, got {:?}", other),
         }
     }
 

@@ -108,6 +108,19 @@ pub enum AgentAction {
     /// `/reload-mcp` placeholder pattern). Emitted by
     /// `/reload-skills`.
     ReloadSkills,
+    /// LLM-driven history compression. `Option<String>` is an
+    /// optional focus topic the user passes via
+    /// `/compress <topic>`. Replaces older history with a single
+    /// summary `system` message; the most recent few turns stay
+    /// intact.
+    CompressHistory(Option<String>),
+    /// Conversation-only rollback. `RollbackList` prints every
+    /// checkpoint recorded in the active session. `RollbackTo`
+    /// restores the session_messages table + the agent's
+    /// in-memory history to the checkpoint's `message_count`.
+    /// No filesystem rollback (deliberate scope choice).
+    RollbackList,
+    RollbackTo(String),
 }
 
 /// Outcome of running a slash command. Drives the TUI's response

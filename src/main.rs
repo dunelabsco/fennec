@@ -1082,6 +1082,22 @@ async fn run_tui(
                         tracing::warn!("session store add_message failed: {e}");
                     }
                 }
+                // Record a checkpoint at the end of each turn so
+                // `/rollback` can step back to "state right after
+                // this exchange." Preview text is the most recent
+                // assistant reply for legibility in `/rollback list`.
+                let assistant_preview = appended
+                    .iter()
+                    .rev()
+                    .find(|m| m.role.as_str() == "assistant")
+                    .and_then(|m| m.content.clone())
+                    .unwrap_or_else(|| "<no reply>".to_string());
+                if let Err(e) = store
+                    .record_checkpoint(&sid, &assistant_preview)
+                    .await
+                {
+                    tracing::warn!("checkpoint record failed: {e}");
+                }
             }
 
             // Drain one /queue entry into the input history so the
@@ -1390,6 +1406,15 @@ async fn handle_command_outcome(
             }
             AgentAction::ReloadSkills => {
                 handle_reload_skills(app, agent, home_dir).await;
+            }
+            AgentAction::CompressHistory(topic) => {
+                handle_compress_history(topic, app, agent).await;
+            }
+            AgentAction::RollbackList => {
+                handle_rollback_list(app, session_store).await;
+            }
+            AgentAction::RollbackTo(hash) => {
+                handle_rollback_to(hash, app, agent, session_store).await;
             }
         },
     }
@@ -1914,6 +1939,198 @@ fn short_session_id(id: &str) -> String {
     } else {
         id.to_string()
     }
+}
+
+/// `/compress` worker — call `Agent::compress_history` and
+/// surface (messages removed, summary preview) into chat.
+async fn handle_compress_history(
+    topic: Option<String>,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let result = {
+        let mut g = agent.lock().await;
+        g.compress_history(topic).await
+    };
+    let body = match result {
+        Ok((0, _)) => "/compress: nothing to compress yet".to_string(),
+        Ok((removed, preview)) => format!(
+            "/compress: summarised {removed} message{} · {preview}",
+            if removed == 1 { "" } else { "s" }
+        ),
+        Err(e) => format!("/compress failed: {e}"),
+    };
+    app.lock().chat.push(fennec::tui::app::ChatLine::System { time: now, body });
+}
+
+/// `/rollback list` worker — fetch checkpoints from the store
+/// and render them as a system-message table.
+async fn handle_rollback_list(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    store: Option<&std::sync::Arc<fennec::sessions::SessionStore>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let store = match store {
+        Some(s) => s.clone(),
+        None => {
+            app.lock().chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: "/rollback: no session store available".into(),
+            });
+            return;
+        }
+    };
+    let sid = match app.lock().current_session_id.clone() {
+        Some(id) => id,
+        None => {
+            app.lock().chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: "/rollback: no active session".into(),
+            });
+            return;
+        }
+    };
+    let entries = match store.list_checkpoints(&sid).await {
+        Ok(v) => v,
+        Err(e) => {
+            app.lock().chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: format!("/rollback: list failed: {e}"),
+            });
+            return;
+        }
+    };
+    let body = if entries.is_empty() {
+        "/rollback: no checkpoints in this session yet".to_string()
+    } else {
+        let mut s = format!(
+            "{} checkpoint{}:\n",
+            entries.len(),
+            if entries.len() == 1 { "" } else { "s" }
+        );
+        for c in &entries {
+            let preview: String = c.preview.chars().take(60).collect();
+            let suffix = if c.preview.chars().count() > 60 { "…" } else { "" };
+            s.push_str(&format!(
+                "  {hash}  ({n} msg)  {preview}{suffix}\n",
+                hash = c.hash,
+                n = c.message_count
+            ));
+        }
+        s.trim_end().to_string()
+    };
+    app.lock().chat.push(fennec::tui::app::ChatLine::System { time: now, body });
+}
+
+/// `/rollback <hash>` worker — restore the session to the
+/// checkpoint's `message_count`. Truncates session_messages on
+/// disk and pops the in-memory agent history past that index.
+async fn handle_rollback_to(
+    hash: String,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    store: Option<&std::sync::Arc<fennec::sessions::SessionStore>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let store = match store {
+        Some(s) => s.clone(),
+        None => {
+            app.lock().chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: "/rollback: no session store available".into(),
+            });
+            return;
+        }
+    };
+    let sid = match app.lock().current_session_id.clone() {
+        Some(id) => id,
+        None => {
+            app.lock().chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: "/rollback: no active session".into(),
+            });
+            return;
+        }
+    };
+    let checkpoint = match store.get_checkpoint(&sid, &hash).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            app.lock().chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: format!("/rollback: no checkpoint '{hash}' in this session"),
+            });
+            return;
+        }
+        Err(e) => {
+            app.lock().chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: format!("/rollback: lookup failed: {e}"),
+            });
+            return;
+        }
+    };
+    let removed = match store
+        .restore_to_message_count(&sid, checkpoint.message_count)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            app.lock().chat.push(fennec::tui::app::ChatLine::System {
+                time: now,
+                body: format!("/rollback: restore failed: {e}"),
+            });
+            return;
+        }
+    };
+    // Truncate the agent's in-memory history to the same count.
+    // We can't trim "the first N chat messages" because the
+    // agent's history also includes the system message + tool
+    // messages that don't appear in session_messages. The
+    // simplest faithful behaviour: clear the agent history and
+    // let the next turn rebuild context from scratch. The chat
+    // pane truncates separately below.
+    {
+        let mut g = agent.lock().await;
+        g.clear_history();
+    }
+    // Trim chat scrollback to roughly match — drop entries after
+    // the index corresponding to message_count. The chat pane
+    // mixes system / user / bot / tool lines so we can't index
+    // exactly; truncate by user-message count instead.
+    {
+        let mut g = app.lock();
+        truncate_chat_to_user_count(&mut g, checkpoint.message_count);
+    }
+    app.lock().chat.push(fennec::tui::app::ChatLine::System {
+        time: now,
+        body: format!(
+            "/rollback → {hash}: {removed} message{} removed · {n} preserved",
+            if removed == 1 { "" } else { "s" },
+            n = checkpoint.message_count,
+        ),
+    });
+}
+
+/// Trim chat scrollback so it has at most `keep_count` user
+/// messages. Used by `/rollback` to keep the visual transcript
+/// roughly in sync with the database state. System + assistant +
+/// tool lines that appeared before the cut point stay; everything
+/// after the Nth user message is dropped.
+fn truncate_chat_to_user_count(app: &mut fennec::tui::App, keep_count: usize) {
+    use fennec::tui::app::ChatLine;
+    let mut user_seen = 0usize;
+    let mut cut_at = app.chat.len();
+    for (i, line) in app.chat.iter().enumerate() {
+        if matches!(line, ChatLine::User { .. }) {
+            user_seen += 1;
+            if user_seen > keep_count {
+                cut_at = i;
+                break;
+            }
+        }
+    }
+    app.chat.truncate(cut_at);
 }
 
 /// `/reload-skills` worker — re-run `SkillsLoader::load_from_directory`

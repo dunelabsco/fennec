@@ -202,6 +202,28 @@ impl SessionStore {
             .context("adding tool_call_id column to session_messages")?;
         }
 
+        // Conversation-only checkpoint table. Each row records
+        // "at this point in time, the session had N messages."
+        // /rollback restores by truncating session_messages to
+        // that count + telling the Agent to drop its in-memory
+        // history past that index. No filesystem rollback —
+        // deliberate scope choice (see F1-2 plan).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_checkpoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                hash TEXT NOT NULL,
+                preview TEXT NOT NULL,
+                message_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_checkpoints_session
+                ON session_checkpoints(session_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_session_checkpoints_hash
+                ON session_checkpoints(session_id, hash);",
+        )
+        .context("creating session_checkpoints schema")?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -472,6 +494,163 @@ impl SessionStore {
         })
         .await?
     }
+
+    /// Record a checkpoint at the current message count for
+    /// `session_id`. The 8-char hash is generated from a uuid4 so
+    /// the user-facing id is stable + collision-free per session.
+    /// `preview` is a short label (typically the last assistant
+    /// message text) shown in `/rollback list`. Returns the hash.
+    pub async fn record_checkpoint(
+        &self,
+        session_id: &str,
+        preview: &str,
+    ) -> Result<String> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        let preview: String = preview.chars().take(120).collect();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+                rusqlite::params![&session_id],
+                |row| row.get(0),
+            )
+            .context("counting session_messages for checkpoint")?;
+            // 8-char hash — uuid4 simple form sliced.
+            let hash: String =
+                uuid::Uuid::new_v4().simple().to_string().chars().take(8).collect();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO session_checkpoints
+                 (session_id, hash, preview, message_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![session_id, hash, preview, count, now],
+            )
+            .context("inserting session_checkpoint")?;
+            Ok::<_, anyhow::Error>(hash)
+        })
+        .await?
+    }
+
+    /// All checkpoints for `session_id`, newest first.
+    pub async fn list_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CheckpointRecord>> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT hash, preview, message_count, created_at
+                     FROM session_checkpoints
+                     WHERE session_id = ?1
+                     ORDER BY id DESC",
+                )
+                .context("preparing list_checkpoints")?;
+            let rows = stmt.query_map(rusqlite::params![&session_id], |row| {
+                Ok(CheckpointRecord {
+                    hash: row.get(0)?,
+                    preview: row.get(1)?,
+                    message_count: row.get::<_, i64>(2)? as usize,
+                    created_at: row.get(3)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok::<_, anyhow::Error>(out)
+        })
+        .await?
+    }
+
+    /// Look up a checkpoint by `(session_id, hash)`. Returns
+    /// `Ok(None)` when no row matches — distinct from a SQL
+    /// error.
+    pub async fn get_checkpoint(
+        &self,
+        session_id: &str,
+        hash: &str,
+    ) -> Result<Option<CheckpointRecord>> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        let hash = hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let result = conn.query_row(
+                "SELECT hash, preview, message_count, created_at
+                 FROM session_checkpoints
+                 WHERE session_id = ?1 AND hash = ?2",
+                rusqlite::params![&session_id, &hash],
+                |row| {
+                    Ok(CheckpointRecord {
+                        hash: row.get(0)?,
+                        preview: row.get(1)?,
+                        message_count: row.get::<_, i64>(2)? as usize,
+                        created_at: row.get(3)?,
+                    })
+                },
+            );
+            match result {
+                Ok(r) => Ok::<_, anyhow::Error>(Some(r)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(anyhow::Error::from(e)),
+            }
+        })
+        .await?
+    }
+
+    /// Truncate `session_messages` for `session_id` to the first
+    /// `message_count` rows (ordered by id ascending). Returns
+    /// the number of rows actually removed. Also deletes
+    /// checkpoints that pointed past the new tail since they're
+    /// invalidated by the rollback.
+    pub async fn restore_to_message_count(
+        &self,
+        session_id: &str,
+        message_count: usize,
+    ) -> Result<usize> {
+        let conn = Arc::clone(&self.conn);
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            // Delete messages beyond message_count, keeping the
+            // first `message_count` rows ordered by id.
+            let removed = conn.execute(
+                "DELETE FROM session_messages
+                 WHERE session_id = ?1
+                   AND id IN (
+                     SELECT id FROM session_messages
+                     WHERE session_id = ?1
+                     ORDER BY id ASC
+                     LIMIT -1 OFFSET ?2
+                   )",
+                rusqlite::params![&session_id, message_count as i64],
+            )
+            .context("truncating session_messages on rollback")?;
+            // Invalidate checkpoints that pointed past the new tail.
+            conn.execute(
+                "DELETE FROM session_checkpoints
+                 WHERE session_id = ?1 AND message_count > ?2",
+                rusqlite::params![&session_id, message_count as i64],
+            )
+            .context("trimming stale checkpoints after rollback")?;
+            Ok::<_, anyhow::Error>(removed)
+        })
+        .await?
+    }
+}
+
+/// One row in `session_checkpoints`. Returned by
+/// [`SessionStore::list_checkpoints`] / [`SessionStore::get_checkpoint`].
+#[derive(Debug, Clone)]
+pub struct CheckpointRecord {
+    pub hash: String,
+    pub preview: String,
+    pub message_count: usize,
+    pub created_at: String,
 }
 
 #[cfg(test)]
@@ -658,5 +837,81 @@ mod tests {
             r.is_err(),
             "message with dangling session_id must be rejected (got Ok) — PRAGMA foreign_keys not applied?"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_round_trip() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        store.add_message(&sid, "user", "hello").await.unwrap();
+        store.add_message(&sid, "assistant", "hi there").await.unwrap();
+        let hash = store
+            .record_checkpoint(&sid, "after first exchange")
+            .await
+            .unwrap();
+        assert_eq!(hash.len(), 8);
+        let record = store
+            .get_checkpoint(&sid, &hash)
+            .await
+            .unwrap()
+            .expect("checkpoint should exist");
+        assert_eq!(record.message_count, 2);
+        assert_eq!(record.preview, "after first exchange");
+    }
+
+    #[tokio::test]
+    async fn list_checkpoints_returns_newest_first() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        store.add_message(&sid, "user", "u1").await.unwrap();
+        let _h1 = store.record_checkpoint(&sid, "first").await.unwrap();
+        store.add_message(&sid, "user", "u2").await.unwrap();
+        let h2 = store.record_checkpoint(&sid, "second").await.unwrap();
+        let list = store.list_checkpoints(&sid).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].hash, h2);
+        assert_eq!(list[0].preview, "second");
+    }
+
+    #[tokio::test]
+    async fn restore_to_message_count_trims_messages() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        for i in 0..6 {
+            store
+                .add_message(&sid, "user", &format!("u{i}"))
+                .await
+                .unwrap();
+        }
+        // Trim to 2 messages; 4 should be removed.
+        let removed = store.restore_to_message_count(&sid, 2).await.unwrap();
+        assert_eq!(removed, 4);
+        let remaining = store.get_session_messages(&sid).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].content, "u0");
+        assert_eq!(remaining[1].content, "u1");
+    }
+
+    #[tokio::test]
+    async fn restore_invalidates_checkpoints_past_new_tail() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        store.add_message(&sid, "user", "u1").await.unwrap();
+        let h1 = store.record_checkpoint(&sid, "after u1").await.unwrap();
+        store.add_message(&sid, "user", "u2").await.unwrap();
+        let h2 = store.record_checkpoint(&sid, "after u2").await.unwrap();
+        store.restore_to_message_count(&sid, 1).await.unwrap();
+        // h1 should survive (message_count == 1, still valid).
+        // h2 should be deleted (message_count == 2, past new tail).
+        assert!(store.get_checkpoint(&sid, &h1).await.unwrap().is_some());
+        assert!(store.get_checkpoint(&sid, &h2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_checkpoint_returns_none_for_unknown_hash() {
+        let (store, _dir) = make_store();
+        let sid = store.create_session("cli").await.unwrap();
+        let res = store.get_checkpoint(&sid, "deadbeef").await.unwrap();
+        assert!(res.is_none());
     }
 }

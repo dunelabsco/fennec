@@ -898,6 +898,82 @@ impl Agent {
         self.system_prompt = None;
     }
 
+    /// LLM-driven history compression. Asks the provider to
+    /// summarise everything except the last `keep_recent_turns`
+    /// turns and replaces the older history with a single
+    /// `system` message containing the summary. Returns
+    /// `(messages_removed, summary_preview)` for the caller to
+    /// surface to the user.
+    ///
+    /// `focus_topic` optionally biases the summarisation toward
+    /// a topic the user named — matches the upstream's
+    /// `/compress <topic>` argument.
+    ///
+    /// Conservative defaults: keeps the last 4 chat messages
+    /// (user + assistant pairs) intact so the immediate context
+    /// for the next turn is preserved.
+    pub async fn compress_history(
+        &mut self,
+        focus_topic: Option<String>,
+    ) -> Result<(usize, String)> {
+        const KEEP_RECENT: usize = 4;
+        let total = self.history.len();
+        if total <= KEEP_RECENT + 1 {
+            return Ok((0, String::new()));
+        }
+        let split_at = total - KEEP_RECENT;
+        let older: Vec<ChatMessage> = self.history[..split_at].to_vec();
+        let recent: Vec<ChatMessage> = self.history[split_at..].to_vec();
+
+        // Build the summarisation request. Use the provider
+        // directly with a fresh system prompt — we don't want
+        // the agent's tools / persona overriding this call.
+        let mut instr = String::from(
+            "Summarise the following conversation concisely. Preserve key facts, \
+             decisions made, open questions, and any in-flight tasks. Reply with \
+             the summary text only — no preamble, no markdown headers.",
+        );
+        if let Some(topic) = focus_topic.as_deref().filter(|t| !t.is_empty()) {
+            instr.push_str(&format!(
+                "\nFocus the summary on the following topic: {topic}"
+            ));
+        }
+
+        let mut summary_messages = older;
+        summary_messages.push(ChatMessage::user(&instr));
+        let request = ChatRequest {
+            system: Some("You are a summarisation assistant. Produce a single concise summary."),
+            messages: &summary_messages,
+            tools: None,
+            max_tokens: 2048,
+            temperature: 0.3,
+            thinking_level: super::thinking::ThinkingLevel::Off,
+        };
+        let response = self.provider.chat(request).await?;
+        let summary = response
+            .content
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if summary.is_empty() {
+            anyhow::bail!("provider returned empty summary");
+        }
+
+        // Replace older history with a single system message.
+        let summary_marker = format!("[/compress summary] {summary}");
+        let mut new_history = Vec::with_capacity(recent.len() + 1);
+        new_history.push(ChatMessage::system(&summary_marker));
+        new_history.extend(recent);
+        let removed = self.history.len() - new_history.len();
+        self.history = new_history;
+        self.system_prompt = None;
+
+        let preview: String = summary.chars().take(160).collect();
+        let suffix = if summary.chars().count() > 160 { "…" } else { "" };
+        Ok((removed, format!("{preview}{suffix}")))
+    }
+
     /// Enumerate every registered tool's name, regardless of
     /// enabled state. Used by `/tools` (no arg) to show the user
     /// what's installed.
