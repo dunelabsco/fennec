@@ -268,7 +268,7 @@ pub struct ModelObject {
     pub owned_by: String,
 }
 
-// -- /v1/capabilities (Hermes-style advertisement) -----------------
+// -- /v1/capabilities (server capability advertisement) -----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilitiesResponse {

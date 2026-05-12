@@ -18,7 +18,7 @@
 //!                              (non-streaming + streaming SSE)
 //!   GET  /v1/models            list a single model named
 //!                              `[channels.openai_compat] model_name`
-//!   GET  /v1/capabilities      Hermes-style advertise endpoint
+//!   GET  /v1/capabilities      server capability advertisement
 //!   GET  /health               liveness probe
 //!   GET  /health/detailed      includes provider name + flags
 //!
