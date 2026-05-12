@@ -327,6 +327,19 @@ impl HookRegistry {
             + self.on_session_start.len()
             + self.on_session_end.len()
     }
+
+    /// True if at least one `pre_llm_call` hook is registered.
+    /// Callers gate JSON serialisation of the message history on
+    /// this so the default-no-hooks path pays nothing.
+    pub fn has_pre_llm(&self) -> bool {
+        !self.pre_llm.is_empty()
+    }
+
+    /// True if at least one `post_llm_call` hook is registered.
+    /// Same purpose as [`Self::has_pre_llm`].
+    pub fn has_post_llm(&self) -> bool {
+        !self.post_llm.is_empty()
+    }
 }
 
 /// Outcome of `fire_pre_tool`. The agent dispatches on this:

@@ -379,27 +379,26 @@ impl Agent {
             thinking_level: self.thinking_level,
         };
 
-        // pre_llm_call observers — serialize the message list once
-        // and reuse the JSON across hooks. The serialisation cost
-        // is paid only when at least one hook is registered (the
-        // empty-iter branch in `fire_pre_llm` would still incur it
-        // here, so we early-skip when there are no hooks via the
-        // registry's intrinsic empty check).
-        let messages_json = serde_json::to_string(&self.history)
-            .unwrap_or_else(|_| "[]".to_string());
-        self.hooks.fire_pre_llm(&messages_json);
+        // pre_llm_call observers — serialise the message list only
+        // when at least one hook is registered. The default path
+        // (no plugins) has an empty `pre_llm` Vec and pays nothing.
+        if self.hooks.has_pre_llm() {
+            let messages_json = serde_json::to_string(&self.history)
+                .unwrap_or_else(|_| "[]".to_string());
+            self.hooks.fire_pre_llm(&messages_json);
+        }
 
         let response = self.provider.chat(request).await;
 
-        // post_llm_call observers — serialize the response (or the
-        // error string) so plugins can observe both. We don't fire
-        // post_llm_call on error today; observers see only successful
-        // responses. If a use case for "observe failures" emerges we
-        // can add a separate hook kind later.
+        // post_llm_call observers — same gating. Errors are not
+        // surfaced to observers today; if a use case for "observe
+        // failures" emerges we can add a separate hook kind later.
         if let Ok(ref resp) = response {
-            let response_json =
-                serde_json::to_string(resp).unwrap_or_else(|_| "{}".to_string());
-            self.hooks.fire_post_llm(&response_json);
+            if self.hooks.has_post_llm() {
+                let response_json =
+                    serde_json::to_string(resp).unwrap_or_else(|_| "{}".to_string());
+                self.hooks.fire_post_llm(&response_json);
+            }
         }
 
         response
