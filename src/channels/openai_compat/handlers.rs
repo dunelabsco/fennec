@@ -187,7 +187,7 @@ pub async fn capabilities(
             streaming: state.backend.supports_streaming(),
             tool_calling: state.backend.supports_tool_calling(),
             // Multimodal handling lands later; session-id-based
-            // continuity is a Hermes-extension that ships in E-2-3.
+            // continuity ships in E-2-3.
             multimodal: false,
             session_continuity: false,
         },
