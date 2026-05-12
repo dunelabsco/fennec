@@ -277,6 +277,22 @@ mod tests {
         r
     }
 
+    /// Mirror of `with_override` for tests that READ env state but
+    /// don't want to set it. Acquires `ENV_MUTEX` (so this test
+    /// can't race with a `with_override` caller) and defensively
+    /// clears `OVERRIDE_ENV` before running the body — guarding
+    /// against the case where a sibling test panicked while
+    /// holding the lock, leaving the var set and the mutex
+    /// poisoned (the `unwrap_or_else(e.into_inner)` above recovers
+    /// the mutex but a stale var would still flip the test result).
+    fn with_default_env<F: FnOnce() -> R, R>(f: F) -> R {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(OVERRIDE_ENV);
+        }
+        f()
+    }
+
     #[test]
     fn accepts_public_https() {
         validate_url_str("https://example.com/path?q=1").unwrap();
@@ -297,88 +313,115 @@ mod tests {
 
     #[test]
     fn rejects_loopback_ipv4() {
-        assert!(validate_url_str("http://127.0.0.1/").is_err());
-        assert!(validate_url_str("http://127.0.0.1:8080/admin").is_err());
+        with_default_env(|| {
+            assert!(validate_url_str("http://127.0.0.1/").is_err());
+            assert!(validate_url_str("http://127.0.0.1:8080/admin").is_err());
+        });
     }
 
     #[test]
     fn rejects_imds_literal() {
-        assert!(validate_url_str("http://169.254.169.254/latest/meta-data/").is_err());
+        with_default_env(|| {
+            assert!(validate_url_str("http://169.254.169.254/latest/meta-data/").is_err());
+        });
     }
 
     #[test]
     fn rejects_private_rfc1918() {
-        assert!(validate_url_str("http://10.0.0.1/").is_err());
-        assert!(validate_url_str("http://192.168.1.1/").is_err());
-        assert!(validate_url_str("http://172.16.0.1/").is_err());
-        // Boundary: 172.32.0.1 is NOT private.
-        validate_url_str("http://172.32.0.1/").unwrap();
+        with_default_env(|| {
+            assert!(validate_url_str("http://10.0.0.1/").is_err());
+            assert!(validate_url_str("http://192.168.1.1/").is_err());
+            assert!(validate_url_str("http://172.16.0.1/").is_err());
+            // Boundary: 172.32.0.1 is NOT private.
+            validate_url_str("http://172.32.0.1/").unwrap();
+        });
     }
 
     #[test]
     fn rejects_cgnat() {
-        assert!(validate_url_str("http://100.64.0.1/").is_err());
-        assert!(validate_url_str("http://100.127.255.254/").is_err());
-        // 100.63.x and 100.128.x are NOT CGNAT.
-        validate_url_str("http://100.63.0.1/").unwrap();
-        validate_url_str("http://100.128.0.1/").unwrap();
+        with_default_env(|| {
+            assert!(validate_url_str("http://100.64.0.1/").is_err());
+            assert!(validate_url_str("http://100.127.255.254/").is_err());
+            // 100.63.x and 100.128.x are NOT CGNAT.
+            validate_url_str("http://100.63.0.1/").unwrap();
+            validate_url_str("http://100.128.0.1/").unwrap();
+        });
     }
 
     #[test]
     fn rejects_link_local() {
-        assert!(validate_url_str("http://169.254.0.1/").is_err());
+        with_default_env(|| {
+            assert!(validate_url_str("http://169.254.0.1/").is_err());
+        });
     }
 
     #[test]
     fn rejects_broadcast_and_unspec() {
-        assert!(validate_url_str("http://255.255.255.255/").is_err());
-        assert!(validate_url_str("http://0.0.0.0/").is_err());
+        with_default_env(|| {
+            assert!(validate_url_str("http://255.255.255.255/").is_err());
+            assert!(validate_url_str("http://0.0.0.0/").is_err());
+        });
     }
 
     #[test]
     fn rejects_ipv6_loopback_and_ula() {
-        assert!(validate_url_str("http://[::1]/").is_err());
-        assert!(validate_url_str("http://[fc00::1]/").is_err());
-        assert!(validate_url_str("http://[fe80::1]/").is_err());
+        with_default_env(|| {
+            assert!(validate_url_str("http://[::1]/").is_err());
+            assert!(validate_url_str("http://[fc00::1]/").is_err());
+            assert!(validate_url_str("http://[fe80::1]/").is_err());
+        });
     }
 
     #[test]
     fn rejects_ipv4_mapped_ipv6_loopback() {
-        // ::ffff:127.0.0.1
-        assert!(validate_url_str("http://[::ffff:7f00:1]/").is_err());
+        with_default_env(|| {
+            // ::ffff:127.0.0.1
+            assert!(validate_url_str("http://[::ffff:7f00:1]/").is_err());
+        });
     }
 
     #[test]
     fn rejects_literal_localhost_and_metadata() {
-        assert!(validate_url_str("http://localhost/").is_err());
-        assert!(validate_url_str("http://localhost:8080/").is_err());
-        assert!(validate_url_str("http://metadata.google.internal/").is_err());
-        assert!(validate_url_str("http://foo.internal/").is_err());
-        assert!(validate_url_str("http://api.localhost/").is_err());
+        with_default_env(|| {
+            assert!(validate_url_str("http://localhost/").is_err());
+            assert!(validate_url_str("http://localhost:8080/").is_err());
+            assert!(validate_url_str("http://metadata.google.internal/").is_err());
+            assert!(validate_url_str("http://foo.internal/").is_err());
+            assert!(validate_url_str("http://api.localhost/").is_err());
+        });
     }
 
     /// Reject errors must mention the override env var so an agent (or a
     /// human reading the agent's tool output) can learn how to opt in.
     /// Without the hint, a user pointing the agent at e.g. their local
     /// Ollama or Pi-hole sees a flat error and the agent stalls.
+    ///
+    /// Acquires `ENV_MUTEX` even though it doesn't write to the env —
+    /// it READS `FENNEC_ALLOW_PRIVATE_URLS` transitively through
+    /// `validate_url_str`. Without the mutex this test races with
+    /// any `with_override` caller: if the sibling test has just set
+    /// the var to `"1"`, validate_url_str returns `Ok` for the
+    /// loopback / RFC1918 cases below and the `unwrap_err()` panics.
     #[test]
     fn rejection_messages_mention_override_env() {
-        let cases = [
-            "http://127.0.0.1/",
-            "http://192.168.1.1/",
-            "http://localhost/",
-            "http://[fc00::1]/",
-            "http://169.254.169.254/",
-        ];
-        for url in cases {
-            let err = validate_url_str(url).unwrap_err().to_string();
-            assert!(
-                err.contains("FENNEC_ALLOW_PRIVATE_URLS"),
-                "{} → error missing override hint: {}",
-                url,
-                err
-            );
-        }
+        with_default_env(|| {
+            let cases = [
+                "http://127.0.0.1/",
+                "http://192.168.1.1/",
+                "http://localhost/",
+                "http://[fc00::1]/",
+                "http://169.254.169.254/",
+            ];
+            for url in cases {
+                let err = validate_url_str(url).unwrap_err().to_string();
+                assert!(
+                    err.contains("FENNEC_ALLOW_PRIVATE_URLS"),
+                    "{} → error missing override hint: {}",
+                    url,
+                    err
+                );
+            }
+        });
     }
 
     #[test]
