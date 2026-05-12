@@ -16,12 +16,13 @@ const PREFIX: &str = "enc2:";
 /// generated on first use.
 ///
 /// The key field uses `Zeroizing<[u8; 32]>` so the bytes are wiped from
-/// memory when the `SecretStore` is dropped or replaced. We pair this
-/// with the `zeroize` feature on `chacha20poly1305` so the `Key`
-/// `GenericArray` produced by `generate_key` also zeroes on drop. The
-/// intermediate hex string and decoded byte buffers used during load
-/// are also wrapped in `Zeroizing` so a process core dump or swap
-/// snapshot doesn't preserve the master key in plain bytes.
+/// memory when the `SecretStore` is dropped or replaced. The intermediate
+/// hex string and decoded byte buffers used during load are also wrapped
+/// in `Zeroizing` so a process core dump or swap snapshot doesn't
+/// preserve the master key in plain bytes. `chacha20poly1305` 0.10
+/// already requires `zeroize` as a direct (non-optional) dependency, so
+/// the cipher's internal copies of the key are zeroed when the cipher is
+/// dropped — no feature flag needed.
 pub struct SecretStore {
     /// The 32-byte key material, kept in a Zeroizing wrapper so it gets
     /// wiped on drop. We hold our own owned bytes (rather than a
