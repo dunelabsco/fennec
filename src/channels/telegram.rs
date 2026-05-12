@@ -658,11 +658,16 @@ mod tests {
 
     #[test]
     fn test_floor_char_boundary_helper() {
-        let s = "a\u{1F600}b"; // a(1) + emoji(4) + b(1) = 6 bytes
-        // Index 3 is mid-emoji; floor walks down to 1 (after 'a').
+        let s = "a\u{1F600}b"; // a(1) + emoji(4) + b(1) = 6 bytes.
+        // Boundaries at 0, 1 (after 'a'), 5 (after emoji), 6 (after 'b').
+        // Index 3 is mid-emoji (inside the 4-byte UTF-8 sequence);
+        // floor walks down to 1, the boundary after 'a'.
         assert_eq!(floor_char_boundary(s, 3), 1);
-        // Index 5 is mid-emoji; floor walks down to 1.
-        assert_eq!(floor_char_boundary(s, 5), 1);
+        // Index 4 is also mid-emoji; floor walks down to 1.
+        assert_eq!(floor_char_boundary(s, 4), 1);
+        // Index 5 is at the boundary BETWEEN the emoji and 'b'
+        // (start of 'b'), so floor returns it unchanged.
+        assert_eq!(floor_char_boundary(s, 5), 5);
         // Index 6 is at end (boundary).
         assert_eq!(floor_char_boundary(s, 6), 6);
         // Index past end clamps.
