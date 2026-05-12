@@ -30,8 +30,8 @@ pub trait Plugin: Send + Sync + 'static {
     /// Called exactly once per session, before the agent starts. Any
     /// error returned here aborts plugin activation but does NOT abort
     /// agent startup — the registry logs the error and proceeds with
-    /// the rest of the plugins. This matches the Hermes policy of
-    /// "one broken plugin should not bring down the agent."
+    /// the rest of the plugins. The policy is "one broken plugin should
+    /// not bring down the agent."
     fn register(&self, ctx: &mut PluginContext) -> Result<()>;
 }
 

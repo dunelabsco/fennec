@@ -7,10 +7,9 @@
 //! builder.
 //!
 //! A plugin that fails validation or panics in `register` is dropped
-//! with an error log; the registry continues. This matches the
-//! "one bad plugin should not bring down the agent" policy used by
-//! Hermes (see `hermes_cli/plugins.py` — failed plugins log a warning
-//! and the loader proceeds).
+//! with an error log; the registry continues. The policy is "one bad
+//! plugin should not bring down the agent" — failed plugins log a
+//! warning and the loader proceeds.
 
 use std::collections::HashSet;
 

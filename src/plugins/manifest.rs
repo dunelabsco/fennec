@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 /// What kind of role a plugin fills.
 ///
-/// Matches Hermes' three categories so that the same conceptual model
-/// works for both bundled and (later) WASM plugins.
+/// Three categories so that the same conceptual model works for both
+/// bundled and (later) WASM plugins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginKind {

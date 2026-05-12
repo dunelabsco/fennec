@@ -49,7 +49,7 @@ impl Default for FennecConfig {
 /// warning (likely a typo) but does not abort startup.
 ///
 /// In a future phase this struct will gain `wasm_dir` and a
-/// `disabled` deny-list to mirror Hermes' two-axis allow/deny model.
+/// `disabled` deny-list for a two-axis allow/deny model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginsConfig {
