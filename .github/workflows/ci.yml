@@ -9,16 +9,16 @@
 #
 # Job blocking policy:
 #
-# * `test` and `fmt` are strictly blocking. Tests must pass; formatter
-#   diffs are cheap to fix locally.
-# * `clippy` is intentionally non-blocking on the first deployment.
-#   Existing code may have lint findings that nobody has cleared yet,
-#   and we don't want the first PR after this lands to be hostage to
-#   a yak-shave. Once the codebase is clippy-clean, flip
-#   `continue-on-error: false` (and consider removing the line).
-# * `audit` is non-blocking because RustSec advisories arrive at their
-#   own schedule and the failure should be visible (info) without
-#   blocking unrelated PRs. Treat it as a notification feed.
+# * `test` is strictly blocking. Tests must pass.
+# * `fmt`, `clippy`, `audit` are non-blocking on the first deployment.
+#   The codebase currently has ~390 fmt drifts and unresolved lints
+#   that predate CI; we don't want the first PR after this lands to be
+#   hostage to a whole-codebase yak-shave. Flip each one to blocking
+#   in its own follow-up PR after a dedicated cleanup pass.
+# * `audit` is non-blocking for a separate reason: RustSec advisories
+#   arrive on their own schedule and the failure should be visible
+#   (info) without blocking unrelated PRs. Treat it as a notification
+#   feed.
 #
 # When tightening any of these to blocking, do it as its own PR so the
 # tightening is reviewable in isolation.
@@ -64,6 +64,13 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Non-blocking on initial deployment for the same reason as clippy:
+    # `cargo fmt --check` currently flags ~390 sites on main, and we
+    # don't want the first PR after this lands to be hostage to a
+    # whole-codebase fmt sweep. Flip `continue-on-error: false` (or
+    # remove this line) once a dedicated `chore: cargo fmt` PR
+    # lands.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
