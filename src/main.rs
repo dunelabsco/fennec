@@ -702,6 +702,9 @@ async fn build_agent(
     }
     builder = builder.hooks(Arc::new(runtime.hooks));
     builder = builder.memory_manager(Arc::new(runtime.memory_manager));
+    // Pass the resolved profile-aware home directory so the memory
+    // provider's `initialize` sees the right path under `--profile`.
+    builder = builder.home_dir(home_dir.to_path_buf());
 
     let agent = builder
         .identity_name(&config.identity.name)

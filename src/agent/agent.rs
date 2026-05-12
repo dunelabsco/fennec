@@ -50,6 +50,12 @@ pub struct Agent {
     /// when one is configured via `[memory] provider = "<name>"`.
     /// Empty manager (no external) preserves current behavior.
     memory_manager: Arc<crate::plugins::MemoryManager>,
+    /// Resolved Fennec home directory. Used to populate
+    /// `MemoryProviderContext::fennec_home` so providers see the
+    /// active profile's path (e.g. `~/.fennec/profiles/work`) rather
+    /// than a hardcoded `~/.fennec` — otherwise `--profile` would
+    /// silently break for any provider that reads the field.
+    home_dir: std::path::PathBuf,
     /// Stable session identifier for the current session. A UUID
     /// generated at Agent build time and re-generated on
     /// `clear_history`. Used as the payload for `on_session_start` /
@@ -143,17 +149,15 @@ impl Agent {
             self.hooks.fire_on_session_start(&self.session_id);
 
             // Memory provider per-session initialize. Runs once per
-            // session, after `clear_history` resets the flag. The
-            // ctx's `fennec_home` is best-effort `~/.fennec` here;
-            // when the agent is constructed via the gateway/CLI
-            // path, that path is already the resolved profile dir.
-            // Failures are logged inside the manager and do not
-            // abort the turn.
+            // session, after `clear_history` resets the flag.
+            // `fennec_home` is the resolved profile-aware path the
+            // agent was built with — providers reading this field
+            // get `~/.fennec/profiles/<name>/` when `--profile` is
+            // active, not a hardcoded `~/.fennec`. Failures are
+            // logged inside the manager and do not abort the turn.
             let init_ctx = crate::plugins::MemoryProviderContext {
                 session_id: self.session_id.clone(),
-                fennec_home: dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".fennec"),
+                fennec_home: self.home_dir.clone(),
                 platform: "agent".to_string(),
             };
             if let Err(e) = self.memory_manager.initialize(&init_ctx).await {
@@ -471,6 +475,36 @@ impl Agent {
     /// tool itself (`true` only when the tool reported success — tool output
     /// containing the substring "error" must not be confused with failure).
     async fn execute_tool(&self, name: &str, args: &serde_json::Value) -> (String, bool) {
+        // Route memory-provider-contributed tools to the manager
+        // first. The manager-handled set is determined at agent
+        // build time by `MemoryProvider::get_tool_schemas`; when no
+        // external provider is wired, `handles_tool` is `false` for
+        // every name and we fall straight through to the regular
+        // tools list.
+        if self.memory_manager.handles_tool(name) {
+            let (raw, success) = match self
+                .memory_manager
+                .handle_tool_call(name, args.clone())
+                .await
+            {
+                Ok(result) => {
+                    if result.success {
+                        (result.output, true)
+                    } else {
+                        (
+                            format!(
+                                "Error: {}",
+                                result.error.unwrap_or_else(|| "unknown error".to_string())
+                            ),
+                            false,
+                        )
+                    }
+                }
+                Err(e) => (format!("Memory provider tool failed: {e}"), false),
+            };
+            return (scrub::scrub_credentials(&raw), success);
+        }
+
         let (raw, success) = match self.tools.iter().find(|t| t.name() == name) {
             Some(t) => match t.execute(args.clone()).await {
                 Ok(result) => {
@@ -638,6 +672,7 @@ pub struct AgentBuilder {
     skills_prompt: Option<String>,
     hooks: Option<Arc<crate::plugins::HookRegistry>>,
     memory_manager: Option<Arc<crate::plugins::MemoryManager>>,
+    home_dir: Option<std::path::PathBuf>,
 }
 
 impl AgentBuilder {
@@ -658,7 +693,17 @@ impl AgentBuilder {
             skills_prompt: None,
             hooks: None,
             memory_manager: None,
+            home_dir: None,
         }
+    }
+
+    /// Wire the resolved Fennec home directory. Used to populate
+    /// `MemoryProviderContext::fennec_home` so providers see the
+    /// active profile's state path. Unset → fall back to
+    /// `~/.fennec` (matches the pre-`--profile` behaviour).
+    pub fn home_dir(mut self, path: std::path::PathBuf) -> Self {
+        self.home_dir = Some(path);
+        self
     }
 
     /// Wire in a plugin lifecycle [`HookRegistry`]. The agent fires
@@ -771,7 +816,19 @@ impl AgentBuilder {
         });
         let prompt_builder = SystemPromptBuilder::new(name, persona);
 
-        let tool_specs: Vec<ToolSpec> = self.tools.iter().map(|t| t.spec()).collect();
+        // Resolve the memory manager once (default = empty) so we
+        // can merge its tool schemas into the LLM-visible tool list
+        // AND store it on the Agent without rebuilding.
+        let memory_manager = self
+            .memory_manager
+            .unwrap_or_else(|| Arc::new(crate::plugins::MemoryManager::empty()));
+
+        // Built-in tools first, then any tool schemas contributed
+        // by the active memory provider. When no provider is wired,
+        // `tool_schemas()` returns an empty Vec and the merge is a
+        // no-op (default path stays byte-identical).
+        let mut tool_specs: Vec<ToolSpec> = self.tools.iter().map(|t| t.spec()).collect();
+        tool_specs.extend(memory_manager.tool_schemas());
 
         Ok(Agent {
             provider,
@@ -804,9 +861,12 @@ impl AgentBuilder {
             // `prefetch` / `sync_turn` calls return immediately
             // without doing work. Existing behavior unchanged when
             // unwired.
-            memory_manager: self
-                .memory_manager
-                .unwrap_or_else(|| Arc::new(crate::plugins::MemoryManager::empty())),
+            memory_manager,
+            home_dir: self.home_dir.unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".fennec")
+            }),
             session_id: uuid::Uuid::new_v4().to_string(),
             session_started: false,
         })
