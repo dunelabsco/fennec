@@ -232,3 +232,39 @@ impl CollectiveSearch {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_goal_lowercases_and_trims() {
+        assert_eq!(normalize_goal("Hello"), "hello");
+        assert_eq!(normalize_goal("  HELLO  "), "hello");
+        assert_eq!(normalize_goal("\t Hello World \n"), "hello world");
+        assert_eq!(normalize_goal(""), "");
+        assert_eq!(normalize_goal("   "), "");
+    }
+
+    #[test]
+    fn normalize_goal_collapses_case_only_variants() {
+        // Whitespace + case-only variants should normalize to the same
+        // key so dedup drops duplicates that look identical to a human.
+        let a = normalize_goal("Reset Plurum Trust Score");
+        let b = normalize_goal("reset plurum trust score");
+        let c = normalize_goal("  RESET PLURUM TRUST SCORE  ");
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn normalize_goal_preserves_internal_whitespace() {
+        // Inner whitespace stays (only leading/trailing are stripped),
+        // so "foo bar" and "foo  bar" still dedup as distinct goals —
+        // matches the upstream's whitespace-sensitive comparison.
+        assert_ne!(
+            normalize_goal("foo bar"),
+            normalize_goal("foo  bar"),
+        );
+    }
+}

@@ -876,3 +876,98 @@ impl SqliteMemory {
         .await?
     }
 }
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::memory::embedding::EmbeddingProvider;
+    use crate::memory::traits::{Memory, MemoryEntry};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    /// Test embedder whose `name()` is NOT "noop" so the cache path
+    /// in `SqliteMemory::store` actually runs. Each text gets a fresh
+    /// fixed-length vector — the embedding values don't matter, only
+    /// the content_hash key (derived from the text) does.
+    struct CountingEmbedder {
+        dims: usize,
+        calls: AtomicUsize,
+    }
+
+    impl CountingEmbedder {
+        fn new(dims: usize) -> Self {
+            Self {
+                dims,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for CountingEmbedder {
+        fn name(&self) -> &str {
+            "counting-test"
+        }
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0.0; self.dims])
+        }
+    }
+
+    fn cache_row_count(mem: &SqliteMemory) -> usize {
+        let conn = mem.conn.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embedding_cache", [], |r| r.get(0))
+            .unwrap();
+        count as usize
+    }
+
+    #[tokio::test]
+    async fn cache_max_evicts_oldest_when_capacity_exceeded() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let embedder = Arc::new(CountingEmbedder::new(8));
+        // cache_max=3 — after 4 distinct stores, one row should be
+        // evicted (the least-recently-accessed).
+        let mem = SqliteMemory::new(db, 0.7, 0.3, 3, embedder).unwrap();
+
+        for i in 0..4 {
+            let mut e = MemoryEntry::default();
+            e.key = format!("k{i}");
+            e.content = format!("unique-content-{i}");
+            mem.store(e).await.unwrap();
+        }
+
+        assert_eq!(
+            cache_row_count(&mem),
+            3,
+            "embedding_cache must shed rows past cache_max"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_max_zero_keeps_all_rows() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("test.db");
+        let embedder = Arc::new(CountingEmbedder::new(8));
+        // cache_max=0 means "unlimited" per the doc comment on the field.
+        let mem = SqliteMemory::new(db, 0.7, 0.3, 0, embedder).unwrap();
+
+        for i in 0..5 {
+            let mut e = MemoryEntry::default();
+            e.key = format!("k{i}");
+            e.content = format!("unique-content-{i}");
+            mem.store(e).await.unwrap();
+        }
+
+        assert_eq!(
+            cache_row_count(&mem),
+            5,
+            "cache_max=0 must keep every row"
+        );
+    }
+}
