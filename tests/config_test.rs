@@ -15,7 +15,10 @@ fn test_default_identity() {
 fn test_default_provider() {
     let cfg = FennecConfig::default();
     assert_eq!(cfg.provider.name, "anthropic");
-    assert_eq!(cfg.provider.model, "claude-sonnet-4-20250514");
+    // Default tracks the current Anthropic flagship — was
+    // `claude-sonnet-4-20250514`, bumped to `claude-sonnet-4-6` when
+    // the new generation landed. This assertion lagged the bump.
+    assert_eq!(cfg.provider.model, "claude-sonnet-4-6");
     assert_eq!(cfg.provider.api_key, "");
     assert!((cfg.provider.temperature - 0.7).abs() < f64::EPSILON);
     assert_eq!(cfg.provider.max_tokens, 8192);
