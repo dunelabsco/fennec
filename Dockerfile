@@ -68,12 +68,20 @@ RUN cargo build --release --locked --bin fennec \
 # ----------------------------------------------------------------------------
 # Stage 2: runtime
 # ----------------------------------------------------------------------------
+# Runtime deps:
+#   - ca-certificates: needed for TLS to provider / channel endpoints.
+#   - libssl3: defence in depth for any transitive dep that links OpenSSL
+#     instead of rustls.
+#   - wget: used by the compose-level healthcheck against /health. Slim
+#     debian images don't ship a fetcher by default, so we add the smallest
+#     one available.
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
+        wget \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 fennec \
     && useradd --system --uid 10001 --gid fennec --create-home --home-dir /home/fennec fennec
