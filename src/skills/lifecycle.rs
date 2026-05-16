@@ -54,7 +54,7 @@ impl Default for LifecycleConfig {
 }
 
 /// Outcome of one scheduler run.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TransitionCounts {
     /// Number of skills the scheduler considered (agent-created,
     /// non-pinned). Bundled/hub-installed/pinned skills are not counted.
