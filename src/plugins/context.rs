@@ -6,12 +6,15 @@
 //! and CLI subcommands. After `register` returns, the registry drains
 //! the context and folds the contributions into the agent.
 
+use std::sync::Arc;
+
 use crate::tools::traits::Tool;
 
 use super::hooks::{
     OnSessionEndHook, OnSessionStartHook, PostLlmCallHook, PostToolCallHook,
     PreLlmCallHook, PreToolCallHook,
 };
+use super::memory_provider::MemoryProvider;
 
 /// Mutable handle passed to a plugin's `register` method.
 pub struct PluginContext {
@@ -22,6 +25,7 @@ pub struct PluginContext {
     post_llm_hooks: Vec<PostLlmCallHook>,
     on_session_start_hooks: Vec<OnSessionStartHook>,
     on_session_end_hooks: Vec<OnSessionEndHook>,
+    memory_providers: Vec<Arc<dyn MemoryProvider>>,
 }
 
 impl PluginContext {
@@ -34,6 +38,7 @@ impl PluginContext {
             post_llm_hooks: Vec::new(),
             on_session_start_hooks: Vec::new(),
             on_session_end_hooks: Vec::new(),
+            memory_providers: Vec::new(),
         }
     }
 
@@ -79,6 +84,16 @@ impl PluginContext {
         self.on_session_end_hooks.push(hook);
     }
 
+    /// Register a memory provider. Plugins of `PluginKind::Exclusive`
+    /// can contribute one of these. The registry collects every
+    /// registered provider; the agent picks AT MOST ONE based on
+    /// the `[memory] provider = "<name>"` config (default `"builtin"`
+    /// = no external provider). Names that don't resolve produce a
+    /// startup warning.
+    pub fn register_memory_provider(&mut self, provider: Arc<dyn MemoryProvider>) {
+        self.memory_providers.push(provider);
+    }
+
     /// Drain everything the plugin contributed. Used by the registry.
     pub(super) fn into_parts(self) -> PluginContextParts {
         PluginContextParts {
@@ -89,6 +104,7 @@ impl PluginContext {
             post_llm_hooks: self.post_llm_hooks,
             on_session_start_hooks: self.on_session_start_hooks,
             on_session_end_hooks: self.on_session_end_hooks,
+            memory_providers: self.memory_providers,
         }
     }
 }
@@ -102,6 +118,7 @@ pub(super) struct PluginContextParts {
     pub post_llm_hooks: Vec<PostLlmCallHook>,
     pub on_session_start_hooks: Vec<OnSessionStartHook>,
     pub on_session_end_hooks: Vec<OnSessionEndHook>,
+    pub memory_providers: Vec<Arc<dyn MemoryProvider>>,
 }
 
 impl Default for PluginContext {

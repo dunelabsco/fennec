@@ -44,6 +44,18 @@ pub struct Agent {
     /// plugin-system hooks through. Hooks fire for every tool call
     /// regardless of plugin source (built-in or plugin-provided).
     hooks: Arc<crate::plugins::HookRegistry>,
+    /// Pluggable memory augmentation layer. Built-in
+    /// [`Memory`] above is always-on; the manager additionally runs
+    /// a single optional external [`MemoryProvider`](crate::plugins::MemoryProvider)
+    /// when one is configured via `[memory] provider = "<name>"`.
+    /// Empty manager (no external) preserves current behavior.
+    memory_manager: Arc<crate::plugins::MemoryManager>,
+    /// Resolved Fennec home directory. Used to populate
+    /// `MemoryProviderContext::fennec_home` so providers see the
+    /// active profile's path (e.g. `~/.fennec/profiles/work`) rather
+    /// than a hardcoded `~/.fennec` — otherwise `--profile` would
+    /// silently break for any provider that reads the field.
+    home_dir: std::path::PathBuf,
     /// Stable session identifier for the current session. A UUID
     /// generated at Agent build time and re-generated on
     /// `clear_history`. Used as the payload for `on_session_start` /
@@ -69,6 +81,11 @@ impl Agent {
             tracing::info!(?level, "Thinking level set via /think directive");
         }
         let user_message: &str = &user_message;
+
+        // Memory provider observer hook: turn-start. Logged
+        // failures are absorbed inside the manager so a misbehaving
+        // provider can't abort the turn.
+        self.memory_manager.on_turn_start(user_message).await;
 
         // Prompt guard scan.
         if let Some(ref guard) = self.prompt_guard {
@@ -130,14 +147,50 @@ impl Agent {
         // a fresh conversation re-fires the hook.
         if !self.session_started {
             self.hooks.fire_on_session_start(&self.session_id);
+
+            // Memory provider per-session initialize. Runs once per
+            // session, after `clear_history` resets the flag.
+            // `fennec_home` is the resolved profile-aware path the
+            // agent was built with — providers reading this field
+            // get `~/.fennec/profiles/<name>/` when `--profile` is
+            // active, not a hardcoded `~/.fennec`. Failures are
+            // logged inside the manager and do not abort the turn.
+            let init_ctx = crate::plugins::MemoryProviderContext {
+                session_id: self.session_id.clone(),
+                fennec_home: self.home_dir.clone(),
+                platform: "agent".to_string(),
+            };
+            if let Err(e) = self.memory_manager.initialize(&init_ctx).await {
+                tracing::warn!(
+                    "MemoryProvider initialize failed: {e}; continuing without it"
+                );
+            }
             self.session_started = true;
         }
 
-        // Inject collective context into user message if available.
-        let effective_message = if let Some(ref ctx) = collective_context {
-            format!("[Collective matches]\n{ctx}\n[User message]\n{user_message}")
-        } else {
-            user_message.to_string()
+        // Memory provider prefetch — additional context the
+        // external provider contributes for THIS turn. Returned as a
+        // formatted string the agent embeds in the user message.
+        // Empty when no external provider is wired.
+        let provider_prefetch = self.memory_manager.prefetch_for_turn(user_message).await;
+
+        // Inject collective + provider context into the user message.
+        // Both layers are optional; when both are absent the
+        // effective_message is identical to the original user
+        // message (current behavior).
+        let effective_message = match (collective_context, provider_prefetch.is_empty()) {
+            (Some(ctx), false) => format!(
+                "[Collective matches]\n{ctx}\n[Memory provider]\n{}\n[User message]\n{}",
+                provider_prefetch, user_message
+            ),
+            (Some(ctx), true) => {
+                format!("[Collective matches]\n{ctx}\n[User message]\n{user_message}")
+            }
+            (None, false) => format!(
+                "[Memory provider]\n{}\n[User message]\n{}",
+                provider_prefetch, user_message
+            ),
+            (None, true) => user_message.to_string(),
         };
 
         // Push user message to history.
@@ -182,6 +235,13 @@ impl Agent {
                     session_cache_read = self.total_cache_read_tokens,
                     "Turn complete"
                 );
+
+                // Memory provider observer: completed turn. Pass
+                // both messages so the provider can update its
+                // model. Failures are absorbed inside the manager.
+                self.memory_manager
+                    .sync_turn(user_message, &text)
+                    .await;
 
                 return Ok(text);
             }
@@ -261,6 +321,11 @@ impl Agent {
             tracing::info!(?level, "Thinking level set via /think directive (stream)");
         }
         let user_message: &str = &user_message;
+
+        // Memory provider observer hook: turn-start. Logged
+        // failures are absorbed inside the manager so a misbehaving
+        // provider can't abort the turn.
+        self.memory_manager.on_turn_start(user_message).await;
 
         // Prompt guard scan.
         if let Some(ref guard) = self.prompt_guard {
@@ -409,6 +474,36 @@ impl Agent {
     /// tool itself (`true` only when the tool reported success — tool output
     /// containing the substring "error" must not be confused with failure).
     async fn execute_tool(&self, name: &str, args: &serde_json::Value) -> (String, bool) {
+        // Route memory-provider-contributed tools to the manager
+        // first. The manager-handled set is determined at agent
+        // build time by `MemoryProvider::get_tool_schemas`; when no
+        // external provider is wired, `handles_tool` is `false` for
+        // every name and we fall straight through to the regular
+        // tools list.
+        if self.memory_manager.handles_tool(name) {
+            let (raw, success) = match self
+                .memory_manager
+                .handle_tool_call(name, args.clone())
+                .await
+            {
+                Ok(result) => {
+                    if result.success {
+                        (result.output, true)
+                    } else {
+                        (
+                            format!(
+                                "Error: {}",
+                                result.error.unwrap_or_else(|| "unknown error".to_string())
+                            ),
+                            false,
+                        )
+                    }
+                }
+                Err(e) => (format!("Memory provider tool failed: {e}"), false),
+            };
+            return (scrub::scrub_credentials(&raw), success);
+        }
+
         let (raw, success) = match self.tools.iter().find(|t| t.name() == name) {
             Some(t) => match t.execute(args.clone()).await {
                 Ok(result) => {
@@ -506,12 +601,27 @@ impl Agent {
     /// Clear conversation history and system prompt, resetting for a new session.
     ///
     /// Fires `on_session_end` for the outgoing session (if it had
-    /// reached `on_session_start`), generates a fresh `session_id`,
-    /// and resets the start flag so the next turn re-fires
+    /// reached `on_session_start`), tells the active memory provider
+    /// (if any) to shut down, generates a fresh `session_id`, and
+    /// resets the start flag so the next turn re-fires
     /// `on_session_start`.
+    ///
+    /// Synchronous (matches the existing public API) — the provider
+    /// shutdown is best-effort: we spawn it onto the current Tokio
+    /// runtime so the future runs but `clear_history` returns
+    /// immediately. A misbehaving provider can't make `/new` block.
     pub fn clear_history(&mut self) {
         if self.session_started {
             self.hooks.fire_on_session_end(&self.session_id);
+            // Best-effort provider shutdown — only fire if a Tokio
+            // runtime is currently available (gateway / agent paths
+            // always have one). The spawn detaches; we don't await.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let manager = Arc::clone(&self.memory_manager);
+                handle.spawn(async move {
+                    manager.shutdown().await;
+                });
+            }
         }
         self.history.clear();
         self.system_prompt = None;
@@ -560,6 +670,8 @@ pub struct AgentBuilder {
     collective: Option<Arc<CollectiveSearch>>,
     skills_prompt: Option<String>,
     hooks: Option<Arc<crate::plugins::HookRegistry>>,
+    memory_manager: Option<Arc<crate::plugins::MemoryManager>>,
+    home_dir: Option<std::path::PathBuf>,
 }
 
 impl AgentBuilder {
@@ -579,7 +691,18 @@ impl AgentBuilder {
             collective: None,
             skills_prompt: None,
             hooks: None,
+            memory_manager: None,
+            home_dir: None,
         }
+    }
+
+    /// Wire the resolved Fennec home directory. Used to populate
+    /// `MemoryProviderContext::fennec_home` so providers see the
+    /// active profile's state path. Unset → fall back to
+    /// `~/.fennec` (matches the pre-`--profile` behaviour).
+    pub fn home_dir(mut self, path: std::path::PathBuf) -> Self {
+        self.home_dir = Some(path);
+        self
     }
 
     /// Wire in a plugin lifecycle [`HookRegistry`]. The agent fires
@@ -589,6 +712,18 @@ impl AgentBuilder {
     /// hot loop).
     pub fn hooks(mut self, hooks: Arc<crate::plugins::HookRegistry>) -> Self {
         self.hooks = Some(hooks);
+        self
+    }
+
+    /// Wire in the plugin [`MemoryManager`]. If unset, `Agent::build`
+    /// substitutes an empty manager (built-in memory only — current
+    /// behavior). When wired with an active provider, the agent calls
+    /// `prefetch` before each LLM turn and `sync_turn` after.
+    pub fn memory_manager(
+        mut self,
+        manager: Arc<crate::plugins::MemoryManager>,
+    ) -> Self {
+        self.memory_manager = Some(manager);
         self
     }
 
@@ -680,7 +815,19 @@ impl AgentBuilder {
         });
         let prompt_builder = SystemPromptBuilder::new(name, persona);
 
-        let tool_specs: Vec<ToolSpec> = self.tools.iter().map(|t| t.spec()).collect();
+        // Resolve the memory manager once (default = empty) so we
+        // can merge its tool schemas into the LLM-visible tool list
+        // AND store it on the Agent without rebuilding.
+        let memory_manager = self
+            .memory_manager
+            .unwrap_or_else(|| Arc::new(crate::plugins::MemoryManager::empty()));
+
+        // Built-in tools first, then any tool schemas contributed
+        // by the active memory provider. When no provider is wired,
+        // `tool_schemas()` returns an empty Vec and the merge is a
+        // no-op (default path stays byte-identical).
+        let mut tool_specs: Vec<ToolSpec> = self.tools.iter().map(|t| t.spec()).collect();
+        tool_specs.extend(memory_manager.tool_schemas());
 
         Ok(Agent {
             provider,
@@ -709,6 +856,16 @@ impl AgentBuilder {
             hooks: self
                 .hooks
                 .unwrap_or_else(|| Arc::new(crate::plugins::HookRegistry::new())),
+            // Empty manager → no external provider → all the
+            // `prefetch` / `sync_turn` calls return immediately
+            // without doing work. Existing behavior unchanged when
+            // unwired.
+            memory_manager,
+            home_dir: self.home_dir.unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".fennec")
+            }),
             session_id: uuid::Uuid::new_v4().to_string(),
             session_started: false,
         })

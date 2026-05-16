@@ -241,6 +241,240 @@ impl WasmPluginInstance {
             })?;
         Ok(())
     }
+
+    // ---- Memory provider exports -----------------------------------
+
+    pub async fn call_memory_is_available(&self) -> Result<bool> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let v = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_is_available(&mut inner.store)
+            .with_context(|| {
+                format!("plugin '{}' memory-is-available trapped", self.plugin_name)
+            })?;
+        Ok(v)
+    }
+
+    pub async fn call_memory_initialize(
+        &self,
+        session_id: &str,
+        fennec_home: &str,
+        platform: &str,
+    ) -> Result<Result<(), String>> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let ctx = exports::fennec::plugin::plugin::MemoryInitContext {
+            session_id: session_id.to_string(),
+            fennec_home: fennec_home.to_string(),
+            platform: platform.to_string(),
+        };
+        let res = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_initialize(&mut inner.store, &ctx)
+            .with_context(|| {
+                format!("plugin '{}' memory-initialize trapped", self.plugin_name)
+            })?;
+        Ok(res)
+    }
+
+    pub async fn call_memory_system_prompt_block(&self) -> Result<String> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let s = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_system_prompt_block(&mut inner.store)
+            .with_context(|| {
+                format!(
+                    "plugin '{}' memory-system-prompt-block trapped",
+                    self.plugin_name
+                )
+            })?;
+        Ok(s)
+    }
+
+    pub async fn call_memory_prefetch(
+        &self,
+        query: &str,
+    ) -> Result<Result<String, String>> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let res = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_prefetch(&mut inner.store, query)
+            .with_context(|| {
+                format!("plugin '{}' memory-prefetch trapped", self.plugin_name)
+            })?;
+        Ok(res)
+    }
+
+    pub async fn call_memory_sync_turn(
+        &self,
+        user: &str,
+        assistant: &str,
+    ) -> Result<Result<(), String>> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let res = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_sync_turn(&mut inner.store, user, assistant)
+            .with_context(|| {
+                format!("plugin '{}' memory-sync-turn trapped", self.plugin_name)
+            })?;
+        Ok(res)
+    }
+
+    pub async fn call_memory_tool_schemas(
+        &self,
+    ) -> Result<Vec<MemoryToolSchemaOwned>> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let schemas = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_tool_schemas(&mut inner.store)
+            .with_context(|| {
+                format!(
+                    "plugin '{}' memory-tool-schemas trapped",
+                    self.plugin_name
+                )
+            })?;
+        Ok(schemas
+            .into_iter()
+            .map(|s| MemoryToolSchemaOwned {
+                name: s.name,
+                description: s.description,
+                parameters_schema_json: s.parameters_schema_json,
+            })
+            .collect())
+    }
+
+    pub async fn call_memory_handle_tool_call(
+        &self,
+        name: &str,
+        args_json: &str,
+    ) -> Result<Result<MemoryToolResultOwned, String>> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let res = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_handle_tool_call(&mut inner.store, name, args_json)
+            .with_context(|| {
+                format!(
+                    "plugin '{}' memory-handle-tool-call trapped",
+                    self.plugin_name
+                )
+            })?;
+        Ok(res.map(|r| MemoryToolResultOwned {
+            success: r.success,
+            output: r.output,
+            error: r.error,
+        }))
+    }
+
+    pub async fn call_memory_shutdown(&self) -> Result<Result<(), String>> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let res = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_shutdown(&mut inner.store)
+            .with_context(|| {
+                format!("plugin '{}' memory-shutdown trapped", self.plugin_name)
+            })?;
+        Ok(res)
+    }
+
+    pub async fn call_memory_on_turn_start(
+        &self,
+        user_message: &str,
+    ) -> Result<Result<(), String>> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let res = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_on_turn_start(&mut inner.store, user_message)
+            .with_context(|| {
+                format!(
+                    "plugin '{}' memory-on-turn-start trapped",
+                    self.plugin_name
+                )
+            })?;
+        Ok(res)
+    }
+
+    pub async fn call_memory_on_pre_compress(
+        &self,
+        messages_json: &str,
+    ) -> Result<Result<String, String>> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let res = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_on_pre_compress(&mut inner.store, messages_json)
+            .with_context(|| {
+                format!(
+                    "plugin '{}' memory-on-pre-compress trapped",
+                    self.plugin_name
+                )
+            })?;
+        Ok(res)
+    }
+
+    pub async fn call_memory_on_memory_write(
+        &self,
+        action: crate::plugins::MemoryWriteAction,
+        key: &str,
+        content: &str,
+    ) -> Result<Result<(), String>> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let wit_action = match action {
+            crate::plugins::MemoryWriteAction::Store => {
+                exports::fennec::plugin::plugin::MemoryWriteAction::Store
+            }
+            crate::plugins::MemoryWriteAction::Forget => {
+                exports::fennec::plugin::plugin::MemoryWriteAction::Forget
+            }
+        };
+        let res = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_memory_on_memory_write(&mut inner.store, wit_action, key, content)
+            .with_context(|| {
+                format!(
+                    "plugin '{}' memory-on-memory-write trapped",
+                    self.plugin_name
+                )
+            })?;
+        Ok(res)
+    }
+}
+
+/// Owned copy of a WIT `memory-tool-schema`. Parallels
+/// [`ToolSpecOwned`] for plugin-provided tools that are scoped to
+/// the memory provider rather than the regular tool list.
+#[derive(Debug, Clone)]
+pub struct MemoryToolSchemaOwned {
+    pub name: String,
+    pub description: String,
+    pub parameters_schema_json: String,
+}
+
+/// Owned copy of a WIT `memory-tool-result`.
+#[derive(Debug, Clone)]
+pub struct MemoryToolResultOwned {
+    pub success: bool,
+    pub output: String,
+    pub error: Option<String>,
 }
 
 /// Map the bindgen-generated `PreToolCallAction` into our public

@@ -28,10 +28,12 @@
 
 pub mod host;
 pub mod loader;
+pub mod memory_provider;
 pub mod runtime;
 pub mod tool;
 
 pub use host::PluginHostState;
 pub use loader::{discover_wasm_plugins, DiscoveredWasmPlugin};
+pub use memory_provider::WasmMemoryProvider;
 pub use runtime::{WasmEngine, WasmPluginInstance};
 pub use tool::WasmTool;
