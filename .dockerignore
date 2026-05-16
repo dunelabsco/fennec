@@ -1,0 +1,47 @@
+# Files / directories that should NOT be in the Docker build context.
+#
+# Smaller context = faster `COPY` and `docker build`, plus less chance of
+# leaking local state (target/ caches, .env files, audit-snapshot worktrees)
+# into the final image.
+
+# Build artifacts — Cargo will rebuild inside the image.
+target/
+**/*.rs.bk
+
+# Git metadata — not needed at runtime.
+.git/
+.gitignore
+.gitattributes
+
+# CI / GitHub UI files — runtime image doesn't need these.
+.github/
+
+# Top-level docs — Dockerfile pulls only what the binary needs.
+README.md
+ARCHITECTURE.md
+*.md
+LICENSE
+
+# Tests — they run in CI, not in the production image.
+tests/
+
+# Scripts that are for hosts, not containers.
+scripts/install.sh
+scripts/update.sh
+
+# Local environment — never bake secrets into the image. Operators inject
+# them via env_file / docker-compose.yml at run time.
+.env
+.env.local
+.env.*.local
+
+# Editor / OS noise.
+.idea/
+.vscode/
+.DS_Store
+
+# The Dockerfile and compose file themselves don't need to land in the
+# build context they describe.
+Dockerfile
+docker-compose.yml
+.dockerignore

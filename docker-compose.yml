@@ -1,0 +1,77 @@
+# ----------------------------------------------------------------------------
+# Fennec docker-compose
+# ----------------------------------------------------------------------------
+#
+# Single-service stack that runs the gateway path (multi-channel server).
+#
+# Quick start:
+#
+#   1. Copy `.env.example` to `.env` and fill in the API keys / channel
+#      tokens you actually use.
+#   2. `docker compose build`
+#   3. `docker compose run --rm fennec onboard --force`   # interactive setup
+#      (this drops you into the wizard against the mounted /data volume)
+#   4. `docker compose up -d`
+#
+# Logs:    docker compose logs -f fennec
+# Status:  curl http://localhost:3000/health
+# Stop:    docker compose down
+#
+# Data persists in the named volume `fennec-data`. To reset everything:
+#   docker compose down --volumes
+#
+# To use a host bind-mount instead of the named volume (handy for editing
+# config.toml from outside the container), replace the volumes block with:
+#
+#   volumes:
+#     - ./fennec-home:/data
+#
+# and run once:  `mkdir -p ./fennec-home && chown 10001:10001 ./fennec-home`
+# (10001 is the in-image fennec uid).
+
+services:
+  fennec:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fennec:latest
+    container_name: fennec
+    restart: unless-stopped
+
+    # Gateway listens on 3000. Tighten the host-side bind to 127.0.0.1 if
+    # you only want local access; remove the host part if you don't expose
+    # the gateway at all (channel listeners still work).
+    ports:
+      - "127.0.0.1:3000:3000"
+
+    # Pull provider keys and channel tokens from .env so we don't bake
+    # secrets into the image. See .env.example for the full list. The
+    # binary also accepts these via `config.toml` decrypted at startup —
+    # env-var path is the easier first-run shape.
+    env_file:
+      - .env
+
+    environment:
+      # Tracing verbosity. Override per-component via comma list, e.g.:
+      #   RUST_LOG=fennec=info,fennec::collective=debug
+      RUST_LOG: ${RUST_LOG:-info}
+
+    volumes:
+      - fennec-data:/data
+
+    # Wait for ctrl-c / SIGTERM to drain (G9 lifecycle work). 30s lines
+    # up with the gateway's drain cap.
+    stop_grace_period: 30s
+
+    # Non-default healthcheck: hit the gateway's public /health endpoint
+    # so docker / orchestrators can tell when the agent is actually ready
+    # to serve, not just process-up.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  fennec-data:
