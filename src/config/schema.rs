@@ -533,6 +533,18 @@ pub struct MatrixChannelEntry {
     /// emits one message per turn so this is mostly future-proofing
     /// for streaming-style integrations.
     pub text_batch_delay_ms: u64,
+    /// Optional directory for the SqliteCryptoStore (matrix-e2ee
+    /// feature only). When set and the feature is enabled, the
+    /// channel reads / writes encrypted-room messages and persists
+    /// Olm + Megolm sessions across restarts. Empty disables E2EE
+    /// even when the feature is built; the channel falls back to
+    /// the unencrypted path.
+    pub crypto_store_dir: String,
+    /// Optional passphrase encrypting the SQLite crypto store at
+    /// rest. Empty leaves the store unencrypted (file-system
+    /// permissions become the only protection on the key
+    /// material).
+    pub crypto_store_passphrase: String,
     /// Default destination for `send_message` calls without a chat
     /// id. Empty falls back to most-recent inbound.
     pub home_chat_id: String,
@@ -558,6 +570,8 @@ impl Default for MatrixChannelEntry {
             media_cache_dir: String::new(),
             state_file: String::new(),
             text_batch_delay_ms: 0,
+            crypto_store_dir: String::new(),
+            crypto_store_passphrase: String::new(),
             home_chat_id: String::new(),
         }
     }

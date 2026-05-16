@@ -2,9 +2,29 @@
 name = "fennec"
 version = "0.1.0"
 edition = "2024"
+# Default builds compile on Rust 1.87. Enabling the optional
+# `matrix-e2ee` feature pulls matrix-sdk-crypto into the dep graph,
+# which wants Rust 1.88+. Without the feature the floor is 1.87.
 rust-version = "1.87"
 description = "The fastest personal AI agent with collective intelligence"
 license = "MIT"
+
+[features]
+default = []
+# End-to-end encryption support for the Matrix channel. Layers
+# matrix-sdk-crypto's OlmMachine (pure-Rust Olm/Megolm via
+# vodozemac, audited) and matrix-sdk-sqlite's SqliteCryptoStore
+# on top of the existing E-4-1 channel. Without this feature the
+# Matrix channel works fine in unencrypted rooms; with it on,
+# Fennec reads and writes Megolm-encrypted messages, manages
+# device + cross-signing keys via a local SQLite store, and runs
+# the standard Matrix outgoing-request loop (keys/upload,
+# keys/query, keys/claim, sendToDevice, signatures/upload).
+matrix-e2ee = [
+    "dep:matrix-sdk-crypto",
+    "dep:matrix-sdk-sqlite",
+    "dep:ruma",
+]
 
 [[bin]]
 name = "fennec"
@@ -66,6 +86,18 @@ wasmtime = "27"
 wasmtime-wasi = "27"
 # Embed bundled skills/ at compile time.
 include_dir = "0.7"
+
+# E2EE stack for the Matrix channel. All three are optional and
+# pulled in only when the `matrix-e2ee` feature is on — base
+# builds stay slim. matrix-sdk-crypto is the OlmMachine equivalent
+# (pure Rust Olm/Megolm via vodozemac, audited). matrix-sdk-sqlite
+# ships SqliteCryptoStore which persists Olm sessions, Megolm
+# sessions, tracked-user state, and cross-signing keys across
+# restarts. ruma supplies the typed Matrix protocol structs the
+# OlmMachine API consumes.
+matrix-sdk-crypto = { version = "0.16", optional = true, default-features = false }
+matrix-sdk-sqlite = { version = "0.16", optional = true, default-features = false, features = ["crypto-store"] }
+ruma = { version = "0.14", optional = true, default-features = false, features = ["client-api-c"] }
 
 [dev-dependencies]
 tempfile = "3.15"

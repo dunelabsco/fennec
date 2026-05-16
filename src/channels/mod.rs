@@ -10,6 +10,8 @@ pub mod webhook;
 pub mod openai_compat;
 pub mod signal;
 pub mod matrix;
+#[cfg(feature = "matrix-e2ee")]
+pub mod matrix_e2ee;
 
 pub use traits::{Channel, ChannelMessage, SendMessage};
 pub use cli::CliChannel;

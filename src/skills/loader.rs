@@ -768,7 +768,7 @@ After
         // cap via a helper-scoped test.
         let huge = skills_dir.join("huge.md");
         // 1 MB + 1 byte — exceeds the 1 MiB cap by 1025 bytes.
-        let content = "---\nname: x\n---\n".to_string() + &"a".repeat(1_048_600);
+        let content = format!("---\nname: x\n---\n{}", "a".repeat(1_048_600));
         std::fs::write(&huge, content).unwrap();
 
         // Also add a normal skill to confirm the non-oversized one is loaded.
