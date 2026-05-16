@@ -361,8 +361,14 @@ mod tests {
     /// human reading the agent's tool output) can learn how to opt in.
     /// Without the hint, a user pointing the agent at e.g. their local
     /// Ollama or Pi-hole sees a flat error and the agent stalls.
+    ///
+    /// Takes ENV_MUTEX even though this test doesn't mutate OVERRIDE_ENV:
+    /// if it races a concurrent `with_override("1", ...)` test, the env
+    /// var is set during validation and `unwrap_err()` panics. Serialize
+    /// with the rest of the env-touching suite.
     #[test]
     fn rejection_messages_mention_override_env() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let cases = [
             "http://127.0.0.1/",
             "http://192.168.1.1/",
