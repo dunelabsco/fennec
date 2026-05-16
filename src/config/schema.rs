@@ -17,6 +17,7 @@ pub struct FennecConfig {
     pub collective: CollectiveConfig,
     pub plugins: PluginsConfig,
     pub auxiliary: AuxiliaryConfigToml,
+    pub skills: SkillsConfigToml,
 }
 
 impl Default for FennecConfig {
@@ -33,45 +34,18 @@ impl Default for FennecConfig {
             collective: CollectiveConfig::default(),
             plugins: PluginsConfig::default(),
             auxiliary: AuxiliaryConfigToml::default(),
+            skills: SkillsConfigToml::default(),
         }
     }
 }
 
 /// Plugin-system configuration.
-///
-/// Bundled plugins ship in the binary but stay dormant until they
-/// appear in `enabled`. The default empty list preserves the
-/// pre-plugin behaviour byte-for-byte: no plugins activate, no tool
-/// list changes, no startup overhead beyond a single
-/// `inventory::iter` walk that finds nothing to do.
-///
-/// Names in `enabled` are matched against the `name` field returned
-/// by each plugin's `Plugin::manifest()`. A name in this list that
-/// doesn't correspond to any installed plugin produces a startup
-/// warning (likely a typo) but does not abort startup.
-///
-/// In a future phase this struct will gain a `disabled` deny-list
-/// (currently `enabled` is the single allowlist axis).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginsConfig {
     /// Names of plugins that should be activated at startup.
-    /// Default: empty (no plugins active).
     pub enabled: Vec<String>,
-    /// Per-plugin string settings. Top-level key is plugin name;
-    /// inner map is the plugin's own key/value space. A plugin
-    /// reads its own settings via the `config-get-string` host
-    /// import, which scopes reads to the current plugin — plugins
-    /// cannot read each other's settings.
-    ///
-    /// Example `config.toml` shape:
-    /// ```toml
-    /// [plugins.settings.spotify]
-    /// market = "US"
-    /// default_device = "kitchen"
-    /// ```
-    /// Inside the spotify plugin, `config-get-string("market")`
-    /// returns `Some("US")`.
+    /// Per-plugin string settings.
     pub settings: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 }
 
@@ -82,6 +56,22 @@ impl Default for PluginsConfig {
             settings: std::collections::HashMap::new(),
         }
     }
+}
+
+/// Configuration for the skills subsystem.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SkillsConfigToml {
+    pub guard: SkillsGuardConfigToml,
+}
+
+/// Static safety scanner configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SkillsGuardConfigToml {
+    pub guard_agent_created: bool,
+    pub disabled_categories: Vec<String>,
+    pub disabled_rules: Vec<String>,
 }
 
 /// Per-task auxiliary client config. One subsection per built-in
