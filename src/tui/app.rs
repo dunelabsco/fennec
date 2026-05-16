@@ -569,6 +569,11 @@ pub struct App {
     /// `/skills` reads this lazily via SkillsLoader so the user
     /// sees a fresh list every time without a config reload.
     pub skills_dir: Option<std::path::PathBuf>,
+    /// Active modal overlay, if any. When `Some`, [`Self::is_blocked`]
+    /// returns true and the keyboard handler routes input to the
+    /// modal instead of the focused pane. Mirrors Hermes'
+    /// `$overlayState` / `$isBlocked` (`overlayStore.ts`).
+    pub modal: Option<super::modal::Modal>,
 }
 
 impl App {
@@ -595,7 +600,52 @@ impl App {
             current_session_id: None,
             current_session_title: None,
             skills_dir: None,
+            modal: None,
         }
+    }
+
+    /// Whether a modal overlay is currently consuming input.
+    /// Mirrors Hermes' `$isBlocked` computed atom: when `true`,
+    /// the global key router sends input to the modal handler
+    /// instead of focus-dependent panes.
+    pub fn is_blocked(&self) -> bool {
+        self.modal.is_some()
+    }
+
+    /// Open a local confirmation prompt. Used by destructive
+    /// slash commands that want a "are you sure?" gate before
+    /// running. `on_confirm` runs only on `Yes`; `No` / Esc /
+    /// Ctrl-C drop the closure unrun.
+    ///
+    /// `danger=true` switches the modal's icon (⚠) and border
+    /// color (terracotta) to flag risk; safe confirmations use
+    /// `?` and amber.
+    pub fn show_confirm(
+        &mut self,
+        title: impl Into<String>,
+        detail: Option<String>,
+        danger: bool,
+        on_confirm: Box<dyn FnOnce() + Send>,
+    ) {
+        self.modal = Some(super::modal::Modal::Confirm {
+            title: title.into(),
+            detail,
+            danger,
+            cursor: super::modal::ConfirmChoice::No,
+            on_confirm: Some(on_confirm),
+        });
+    }
+
+    /// Open a fullscreen text pager. Lines wrap inside the
+    /// pager's body; `j/k`, `PgUp/PgDn`, `g/G`, `q/Esc` for
+    /// navigation. Used by future `/logs` and long `/help`
+    /// output.
+    pub fn show_pager(&mut self, title: Option<String>, lines: Vec<String>) {
+        self.modal = Some(super::modal::Modal::Pager {
+            title,
+            lines,
+            offset: 0,
+        });
     }
 
     /// Append a streaming text delta to the in-flight assistant
@@ -629,7 +679,16 @@ impl App {
     /// Handle a key press. Routes to the focused pane; some keys
     /// are global (Tab cycles focus, Ctrl-C/D exits — handled in
     /// the event loop).
+    ///
+    /// When [`Self::is_blocked`] returns true (a modal is active)
+    /// keys go to the modal handler instead — Tab does NOT cycle
+    /// focus, so the user can't accidentally rotate panes while
+    /// a prompt is open.
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        if self.is_blocked() {
+            self.handle_key_modal(code, modifiers);
+            return;
+        }
         // Global hotkeys.
         if matches!(code, KeyCode::Tab) {
             self.cycle_focus();
@@ -640,6 +699,337 @@ impl App {
             Focus::Sessions => self.handle_key_sessions(code),
             Focus::Chat => self.handle_key_chat(code),
             Focus::Input => self.handle_key_input(code, modifiers),
+        }
+    }
+
+    /// Modal-active key handler. Each variant has a distinct key
+    /// map matching Hermes' per-modal `useInput` handlers in
+    /// `prompts.tsx`. On resolve the modal is removed from
+    /// `self.modal` and (for callback-driven modals) the user's
+    /// choice is sent through the oneshot.
+    fn handle_key_modal(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        use super::modal::{ApprovalChoice, ConfirmChoice, Modal};
+        let ctrl_c =
+            matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL);
+        let esc = matches!(code, KeyCode::Esc);
+        // Take the modal out so we can reason about it without
+        // borrowing self mutably twice. Re-insert if not resolved.
+        let Some(modal) = self.modal.take() else { return };
+        match modal {
+            Modal::Approval { request, mut cursor, resp_tx } => {
+                if ctrl_c {
+                    let _ = resp_tx.send(ApprovalChoice::Deny);
+                    return;
+                }
+                match code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        cursor = cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        cursor = (cursor + 1).min(3);
+                    }
+                    KeyCode::Char(c @ '1'..='4') => {
+                        let n = (c as u8) - b'0';
+                        if let Some(choice) = ApprovalChoice::from_quick_pick(n) {
+                            let _ = resp_tx.send(choice);
+                            return;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(choice) = Modal::approval_choice_at(cursor) {
+                            let _ = resp_tx.send(choice);
+                        } else {
+                            let _ = resp_tx.send(ApprovalChoice::Deny);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::Approval {
+                    request,
+                    cursor,
+                    resp_tx,
+                });
+            }
+            Modal::Clarify {
+                request,
+                mut cursor,
+                mut text,
+                mut text_col,
+                resp_tx,
+            } => {
+                if ctrl_c {
+                    let _ = resp_tx.send(None);
+                    return;
+                }
+                let in_text_mode = cursor.is_none() || request.options.is_empty();
+                if in_text_mode {
+                    match code {
+                        KeyCode::Esc => {
+                            // Back to choice list if we have one;
+                            // otherwise cancel.
+                            if request.options.is_empty() {
+                                let _ = resp_tx.send(None);
+                                return;
+                            }
+                            cursor = Some(0);
+                            text.clear();
+                            text_col = 0;
+                        }
+                        KeyCode::Enter => {
+                            if text.trim().is_empty() {
+                                let _ = resp_tx.send(None);
+                            } else {
+                                let _ = resp_tx.send(Some(text));
+                            }
+                            return;
+                        }
+                        KeyCode::Backspace => {
+                            if text_col > 0 {
+                                let prev = char_index_to_byte(&text, text_col - 1);
+                                let cur = char_index_to_byte(&text, text_col);
+                                text.replace_range(prev..cur, "");
+                                text_col -= 1;
+                            }
+                        }
+                        KeyCode::Left => {
+                            text_col = text_col.saturating_sub(1);
+                        }
+                        KeyCode::Right => {
+                            let len = text.chars().count();
+                            text_col = (text_col + 1).min(len);
+                        }
+                        KeyCode::Char(c)
+                            if !modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let byte_idx = char_index_to_byte(&text, text_col);
+                            text.insert(byte_idx, c);
+                            text_col += 1;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    let total = Modal::clarify_total_rows(&request);
+                    match code {
+                        KeyCode::Esc => {
+                            let _ = resp_tx.send(None);
+                            return;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            cursor = Some(cursor.unwrap_or(0).saturating_sub(1));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            cursor =
+                                Some((cursor.unwrap_or(0) + 1).min(total - 1));
+                        }
+                        KeyCode::Char(c @ '1'..='9') => {
+                            // ASCII digit → 0-indexed slot. `c as
+                            // usize` is the codepoint (49 for '1'),
+                            // so subtract `b'1'` to get the offset.
+                            let n = (c as u8 - b'1') as usize;
+                            if n < total {
+                                if n == request.options.len() {
+                                    // "Other" → enter free-text mode.
+                                    cursor = None;
+                                    text.clear();
+                                    text_col = 0;
+                                } else {
+                                    let chosen = request.options[n].clone();
+                                    let _ = resp_tx.send(Some(chosen));
+                                    return;
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let idx = cursor.unwrap_or(0);
+                            if idx == request.options.len() {
+                                cursor = None;
+                                text.clear();
+                                text_col = 0;
+                            } else if let Some(opt) = request.options.get(idx) {
+                                let _ = resp_tx.send(Some(opt.clone()));
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.modal = Some(Modal::Clarify {
+                    request,
+                    cursor,
+                    text,
+                    text_col,
+                    resp_tx,
+                });
+            }
+            Modal::Confirm {
+                title,
+                detail,
+                danger,
+                mut cursor,
+                mut on_confirm,
+            } => {
+                if ctrl_c || esc {
+                    // Cancel — drop the action.
+                    return;
+                }
+                match code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if let Some(action) = on_confirm.take() {
+                            action();
+                        }
+                        return;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
+                        cursor = match cursor {
+                            ConfirmChoice::No => ConfirmChoice::Yes,
+                            ConfirmChoice::Yes => ConfirmChoice::No,
+                        };
+                    }
+                    KeyCode::Enter => {
+                        if cursor == ConfirmChoice::Yes {
+                            if let Some(action) = on_confirm.take() {
+                                action();
+                            }
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::Confirm {
+                    title,
+                    detail,
+                    danger,
+                    cursor,
+                    on_confirm,
+                });
+            }
+            Modal::Secret {
+                request,
+                mut text,
+                mut text_col,
+                resp_tx,
+            } => {
+                if ctrl_c || esc {
+                    let _ = resp_tx.send(None);
+                    return;
+                }
+                match code {
+                    KeyCode::Enter => {
+                        if text.is_empty() {
+                            let _ = resp_tx.send(None);
+                        } else {
+                            let _ = resp_tx.send(Some(text));
+                        }
+                        return;
+                    }
+                    KeyCode::Backspace => {
+                        if text_col > 0 {
+                            let prev = char_index_to_byte(&text, text_col - 1);
+                            let cur = char_index_to_byte(&text, text_col);
+                            text.replace_range(prev..cur, "");
+                            text_col -= 1;
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        let byte_idx = char_index_to_byte(&text, text_col);
+                        text.insert(byte_idx, c);
+                        text_col += 1;
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::Secret {
+                    request,
+                    text,
+                    text_col,
+                    resp_tx,
+                });
+            }
+            Modal::Sudo {
+                prompt,
+                mut text,
+                mut text_col,
+                resp_tx,
+            } => {
+                if ctrl_c || esc {
+                    let _ = resp_tx.send(None);
+                    return;
+                }
+                match code {
+                    KeyCode::Enter => {
+                        if text.is_empty() {
+                            let _ = resp_tx.send(None);
+                        } else {
+                            let _ = resp_tx.send(Some(text));
+                        }
+                        return;
+                    }
+                    KeyCode::Backspace => {
+                        if text_col > 0 {
+                            let prev = char_index_to_byte(&text, text_col - 1);
+                            let cur = char_index_to_byte(&text, text_col);
+                            text.replace_range(prev..cur, "");
+                            text_col -= 1;
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        let byte_idx = char_index_to_byte(&text, text_col);
+                        text.insert(byte_idx, c);
+                        text_col += 1;
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::Sudo {
+                    prompt,
+                    text,
+                    text_col,
+                    resp_tx,
+                });
+            }
+            Modal::Pager {
+                title,
+                lines,
+                mut offset,
+            } => {
+                if ctrl_c || esc {
+                    return;
+                }
+                let page = 10usize;
+                match code {
+                    KeyCode::Char('q') | KeyCode::Char('Q') => return,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        offset = offset.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        offset = (offset + 1).min(lines.len().saturating_sub(1));
+                    }
+                    KeyCode::PageUp | KeyCode::Char('b') => {
+                        offset = offset.saturating_sub(page);
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Enter => {
+                        offset = (offset + page).min(lines.len().saturating_sub(1));
+                    }
+                    KeyCode::Char('g') => {
+                        offset = 0;
+                    }
+                    KeyCode::Char('G') => {
+                        offset = lines.len().saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::Pager {
+                    title,
+                    lines,
+                    offset,
+                });
+            }
         }
     }
 
@@ -797,6 +1187,104 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn install_pager(app: &mut App, lines: Vec<&str>) {
+        app.show_pager(
+            Some("test pager".into()),
+            lines.into_iter().map(String::from).collect(),
+        );
+    }
+
+    #[test]
+    fn pager_arrow_keys_scroll_within_bounds() {
+        use super::super::modal::Modal;
+        let mut app = App::new();
+        let lines: Vec<&str> = (0..30).map(|_| "line").collect();
+        install_pager(&mut app, lines);
+        assert!(app.is_blocked());
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        if let Some(Modal::Pager { offset, .. }) = &app.modal {
+            assert_eq!(*offset, 1);
+        } else {
+            panic!("pager not present");
+        }
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        if let Some(Modal::Pager { offset, .. }) = &app.modal {
+            assert_eq!(*offset, 0);
+        } else {
+            panic!("pager not present");
+        }
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.is_blocked());
+    }
+
+    #[test]
+    fn show_confirm_marks_blocked_and_runs_action_on_yes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_closure = fired.clone();
+        let mut app = App::new();
+        app.show_confirm(
+            "delete?",
+            Some("this will delete X".into()),
+            true,
+            Box::new(move || fired_for_closure.store(true, Ordering::SeqCst)),
+        );
+        assert!(app.is_blocked());
+        // 'y' confirms.
+        app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(!app.is_blocked());
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn show_confirm_does_not_run_action_on_no() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_closure = fired.clone();
+        let mut app = App::new();
+        app.show_confirm(
+            "delete?",
+            None,
+            true,
+            Box::new(move || fired_for_closure.store(true, Ordering::SeqCst)),
+        );
+        // 'n' rejects.
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.is_blocked());
+        assert!(!fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn show_confirm_esc_drops_action_unrun() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_closure = fired.clone();
+        let mut app = App::new();
+        app.show_confirm(
+            "delete?",
+            None,
+            true,
+            Box::new(move || fired_for_closure.store(true, Ordering::SeqCst)),
+        );
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.is_blocked());
+        assert!(!fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn modal_blocks_focus_cycle() {
+        let mut app = App::new();
+        let initial_focus = app.focus;
+        app.show_pager(None, vec!["a".into(), "b".into()]);
+        // Tab would normally cycle focus; with modal active it shouldn't.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.focus, initial_focus);
+        assert!(app.is_blocked());
+    }
 
     #[test]
     fn details_mode_parses_known_aliases() {

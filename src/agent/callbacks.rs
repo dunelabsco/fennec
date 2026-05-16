@@ -19,6 +19,8 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 /// A live tool execution in progress.
 #[derive(Debug, Clone)]
 pub struct ToolStart {
@@ -96,6 +98,7 @@ pub struct SecretRequest {
 /// modal, and returning the response. A return of `None` means
 /// "user cancelled / declined" and the agent should treat that
 /// as a deny.
+#[async_trait]
 pub trait AgentCallbacks: Send + Sync {
     /// Streaming text delta from the assistant. Called many times
     /// per turn; concatenating all deltas in order yields the
@@ -127,22 +130,24 @@ pub trait AgentCallbacks: Send + Sync {
     /// Turn ended. `summary` is the final assistant message.
     fn on_turn_complete(&self, _summary: &str) {}
 
-    /// Blocking: ask the user to approve a privileged action.
+    /// Async: ask the user to approve a privileged action.
     /// Default impl auto-approves so callbacks-less code paths
     /// behave exactly as they did before this trait existed.
-    fn on_approval_request(&self, _request: ApprovalRequest) -> bool {
+    /// Frontends that present a modal `await` until the user
+    /// resolves it.
+    async fn on_approval_request(&self, _request: ApprovalRequest) -> bool {
         true
     }
 
-    /// Blocking: ask the user a clarifying question. Default
+    /// Async: ask the user a clarifying question. Default
     /// returns `None` so callers fall back to whatever they did
     /// before.
-    fn on_clarify_request(&self, _request: ClarifyRequest) -> Option<String> {
+    async fn on_clarify_request(&self, _request: ClarifyRequest) -> Option<String> {
         None
     }
 
-    /// Blocking: ask the user for a secret (e.g. an API token).
-    fn on_secret_request(&self, _request: SecretRequest) -> Option<String> {
+    /// Async: ask the user for a secret (e.g. an API token).
+    async fn on_secret_request(&self, _request: SecretRequest) -> Option<String> {
         None
     }
 }
@@ -153,6 +158,7 @@ pub trait AgentCallbacks: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoCallbacks;
 
+#[async_trait]
 impl AgentCallbacks for NoCallbacks {}
 
 /// Owned, type-erased handle so an `Agent` can hold a callbacks

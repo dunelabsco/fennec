@@ -67,6 +67,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_status(f, status_area, app, narrow);
     draw_shortcuts(f, shortcut_area, app);
+
+    // Modal overlay always renders LAST so it paints over the
+    // panes below. Mirrors Hermes' `FloatingOverlays` order.
+    if app.modal.is_some() {
+        draw_modal_overlay(f, f.area(), app);
+    }
 }
 
 // -- Sessions panel ---------------------------------------------
@@ -715,6 +721,543 @@ fn draw_shortcuts(f: &mut Frame, area: Rect, _app: &App) {
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(SHORTCUT_BG)),
         area,
+    );
+}
+
+// -- Modal overlay ----------------------------------------------
+
+/// Render the active modal centered over the underlying layout.
+/// Dispatches to a per-variant renderer; sizing is variant-
+/// specific (approval is small, pager is near-full-screen).
+///
+/// Mirrors Hermes' `appOverlays.tsx` + per-modal components in
+/// `prompts.tsx:14-217`.
+fn draw_modal_overlay(f: &mut Frame, area: Rect, app: &App) {
+    use super::modal::Modal;
+    let Some(ref modal) = app.modal else { return };
+    match modal {
+        Modal::Approval { request, cursor, .. } => {
+            draw_approval_modal(f, area, request, *cursor);
+        }
+        Modal::Clarify {
+            request,
+            cursor,
+            text,
+            text_col,
+            ..
+        } => {
+            draw_clarify_modal(f, area, request, *cursor, text, *text_col, app);
+        }
+        Modal::Confirm {
+            title,
+            detail,
+            danger,
+            cursor,
+            ..
+        } => {
+            draw_confirm_modal(f, area, title, detail.as_deref(), *danger, *cursor);
+        }
+        Modal::Secret {
+            request,
+            text,
+            text_col,
+            ..
+        } => {
+            draw_secret_modal(f, area, &request.label, None, text, *text_col, app);
+        }
+        Modal::Sudo {
+            prompt,
+            text,
+            text_col,
+            ..
+        } => {
+            draw_secret_modal(f, area, prompt, Some("sudo"), text, *text_col, app);
+        }
+        Modal::Pager {
+            title,
+            lines,
+            offset,
+        } => {
+            draw_pager_modal(f, area, title.as_deref(), lines, *offset);
+        }
+    }
+}
+
+/// Center an inner rect of the requested width × height inside
+/// `area`. Clamped to the available space so the modal never
+/// renders past the screen edge.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
+}
+
+fn draw_approval_modal(
+    f: &mut Frame,
+    screen: Rect,
+    request: &crate::agent::callbacks::ApprovalRequest,
+    cursor: usize,
+) {
+    use super::modal::ApprovalChoice;
+    let width = 70u16.min(screen.width.saturating_sub(4));
+    // 1 (header) + 1 (description) + 1 (gap) + 4 (choices) +
+    // 1 (gap) + 1 (hint) + 2 (border) = 11 baseline.
+    let body_height = 4 + 4 + 2;
+    let height = body_height.min(screen.height.saturating_sub(2));
+    let area = centered_rect(screen, width, height);
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(AMBER))
+        .style(Style::default().bg(BG_DUSK))
+        .title(Line::from(vec![
+            Span::styled(
+                " ⚠ approval required ",
+                Style::default()
+                    .fg(AMBER)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(BG_DUSK),
+            ),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),    // command
+            Constraint::Length(1),    // description
+            Constraint::Length(1),    // gap
+            Constraint::Length(4),    // 4 choices
+            Constraint::Length(1),    // gap
+            Constraint::Length(1),    // hint
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("$ ", Style::default().fg(SUBDUED)),
+            Span::styled(
+                truncate(&request.command, inner.width as usize - 2),
+                Style::default().fg(TEXT_CREAM).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        layout[0],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate(&request.description, inner.width as usize),
+            Style::default().fg(SUBDUED),
+        ))),
+        layout[1],
+    );
+
+    let choices: Vec<Line> = (0..4)
+        .map(|i| {
+            let choice = ApprovalChoice::from_quick_pick((i + 1) as u8).unwrap();
+            let selected = i == cursor;
+            let style = if selected {
+                Style::default()
+                    .bg(HIGHLIGHT_BG)
+                    .fg(AMBER)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT_CREAM)
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!(" {}. ", i + 1),
+                    Style::default().fg(SAND_GOLD),
+                ),
+                Span::styled(choice.label().to_string(), style),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(choices), layout[3]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑↓ select · 1-4 quick pick · enter confirm · ctrl-c deny ",
+            Style::default().fg(SUBDUED),
+        ))),
+        layout[5],
+    );
+}
+
+fn draw_clarify_modal(
+    f: &mut Frame,
+    screen: Rect,
+    request: &crate::agent::callbacks::ClarifyRequest,
+    cursor: Option<usize>,
+    text: &str,
+    text_col: usize,
+    app: &App,
+) {
+    use super::modal::Modal;
+    let width = 72u16.min(screen.width.saturating_sub(4));
+    // header + question + gap + N rows + gap + (input row if free-text)
+    // + gap + hint + border
+    let total_rows = Modal::clarify_total_rows(request) as u16;
+    let needs_input = cursor.is_none() || request.options.is_empty();
+    let body_height = 1 + 1 + total_rows + (if needs_input { 2 } else { 0 }) + 2;
+    let height = body_height.min(screen.height.saturating_sub(2));
+    let area = centered_rect(screen, width, height);
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(SAND_GOLD))
+        .style(Style::default().bg(BG_DUSK))
+        .title(Line::from(vec![Span::styled(
+            " clarify ",
+            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
+        )]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut constraints = vec![
+        Constraint::Length(1), // question
+        Constraint::Length(1), // gap
+        Constraint::Length(total_rows),
+    ];
+    if needs_input {
+        constraints.push(Constraint::Length(1)); // gap
+        constraints.push(Constraint::Length(1)); // input row
+    }
+    constraints.push(Constraint::Length(1)); // hint
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("ask ", Style::default().fg(SAND_GOLD)),
+            Span::styled(
+                truncate(&request.question, inner.width as usize - 4),
+                Style::default().fg(TEXT_CREAM),
+            ),
+        ])),
+        layout[0],
+    );
+
+    let mut rows: Vec<Line> = request
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, opt)| {
+            let selected = cursor == Some(i);
+            row_for_option(i + 1, opt, selected)
+        })
+        .collect();
+    rows.push(row_for_option(
+        request.options.len() + 1,
+        "Other (type your answer)",
+        cursor == Some(request.options.len()),
+    ));
+    f.render_widget(Paragraph::new(rows), layout[2]);
+
+    let mut next_idx = 3;
+    if needs_input {
+        next_idx += 1;
+        let cur = if app.cursor_visible { "█" } else { " " };
+        let prefix = "> ";
+        let max_text_width = (inner.width as usize).saturating_sub(prefix.len() + 1);
+        let display_text = truncate(text, max_text_width);
+        let line = Line::from(vec![
+            Span::styled(prefix, Style::default().fg(SAND_GOLD)),
+            Span::styled(display_text, Style::default().fg(TEXT_CREAM)),
+            Span::styled(cur, Style::default().fg(SAND_GOLD)),
+        ]);
+        f.render_widget(Paragraph::new(line), layout[next_idx]);
+        next_idx += 1;
+    }
+    let _ = text_col; // tracked for future cursor positioning
+
+    let hint = if needs_input && cursor.is_none() {
+        " ↵ submit · esc back · ctrl-c cancel "
+    } else {
+        " ↑↓ select · 1-N quick pick · ↵ confirm · esc / ctrl-c cancel "
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(SUBDUED),
+        ))),
+        layout[next_idx],
+    );
+}
+
+fn row_for_option(num: usize, label: &str, selected: bool) -> Line<'static> {
+    let style = if selected {
+        Style::default()
+            .bg(HIGHLIGHT_BG)
+            .fg(SAND_GOLD)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT_CREAM)
+    };
+    Line::from(vec![
+        Span::styled(format!(" {num}. "), Style::default().fg(SAND_GOLD)),
+        Span::styled(label.to_string(), style),
+    ])
+}
+
+fn draw_confirm_modal(
+    f: &mut Frame,
+    screen: Rect,
+    title: &str,
+    detail: Option<&str>,
+    danger: bool,
+    cursor: super::modal::ConfirmChoice,
+) {
+    use super::modal::ConfirmChoice;
+    let width = 64u16.min(screen.width.saturating_sub(4));
+    let detail_rows: u16 = if detail.is_some() { 1 } else { 0 };
+    let height = 1 + detail_rows + 1 + 2 + 1 + 2; // title + detail + gap + 2 buttons + hint + border
+    let height = height.min(screen.height.saturating_sub(2));
+    let area = centered_rect(screen, width, height);
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    let border_color = if danger { TERRACOTTA } else { AMBER };
+    let icon = if danger { "⚠" } else { "?" };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(BG_DUSK));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut constraints = vec![Constraint::Length(1)]; // title
+    if detail.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // gap
+    constraints.push(Constraint::Length(2)); // 2 buttons
+    constraints.push(Constraint::Length(1)); // hint
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {icon} "), Style::default().fg(border_color)),
+            Span::styled(
+                truncate(title, inner.width as usize - 4),
+                Style::default()
+                    .fg(border_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        layout[0],
+    );
+    let mut next = 1;
+    if let Some(d) = detail {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate(d, inner.width as usize),
+                Style::default().fg(SUBDUED),
+            ))),
+            layout[next],
+        );
+        next += 1;
+    }
+    next += 1; // skip gap
+    let no_selected = cursor == ConfirmChoice::No;
+    let yes_selected = cursor == ConfirmChoice::Yes;
+    let buttons = vec![
+        Line::from(vec![
+            Span::styled(
+                if no_selected { " ▸ No  " } else { "   No  " },
+                if no_selected {
+                    Style::default()
+                        .bg(HIGHLIGHT_BG)
+                        .fg(TEXT_CREAM)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT_CREAM)
+                },
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                if yes_selected { " ▸ Yes " } else { "   Yes " },
+                if yes_selected {
+                    Style::default()
+                        .bg(HIGHLIGHT_BG)
+                        .fg(border_color)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(border_color)
+                },
+            ),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(buttons), layout[next]);
+    next += 1;
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " y/n quick pick · ↑↓ select · ↵ confirm · esc / ctrl-c cancel ",
+            Style::default().fg(SUBDUED),
+        ))),
+        layout[next],
+    );
+}
+
+fn draw_secret_modal(
+    f: &mut Frame,
+    screen: Rect,
+    label: &str,
+    sub_label: Option<&str>,
+    text: &str,
+    text_col: usize,
+    app: &App,
+) {
+    let _ = text_col; // reserved for future cursor positioning inside masked text
+    let width = 64u16.min(screen.width.saturating_sub(4));
+    let height = 5 + (if sub_label.is_some() { 1 } else { 0 });
+    let height = height.min(screen.height.saturating_sub(2));
+    let area = centered_rect(screen, width, height);
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(AMBER))
+        .style(Style::default().bg(BG_DUSK))
+        .title(Line::from(Span::styled(
+            " 🔑 secret ",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut constraints = vec![Constraint::Length(1)]; // label
+    if sub_label.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // gap
+    constraints.push(Constraint::Length(1)); // input
+    constraints.push(Constraint::Length(1)); // hint
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate(label, inner.width as usize),
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ))),
+        layout[0],
+    );
+    let mut next = 1;
+    if let Some(sub) = sub_label {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("[{sub}]"),
+                Style::default().fg(SUBDUED),
+            ))),
+            layout[next],
+        );
+        next += 1;
+    }
+    next += 1; // skip gap
+
+    // Mask all input chars; render `*` per char so the user sees
+    // length but not content. Hardware-cursor blink piggybacks
+    // off the existing app.cursor_visible toggle.
+    let masked: String = text.chars().map(|_| '*').collect();
+    let cur = if app.cursor_visible { "█" } else { " " };
+    let line = Line::from(vec![
+        Span::styled("> ", Style::default().fg(SAND_GOLD)),
+        Span::styled(masked, Style::default().fg(TEXT_CREAM)),
+        Span::styled(cur, Style::default().fg(SAND_GOLD)),
+    ]);
+    f.render_widget(Paragraph::new(line), layout[next]);
+    next += 1;
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↵ submit · esc / ctrl-c cancel ",
+            Style::default().fg(SUBDUED),
+        ))),
+        layout[next],
+    );
+}
+
+fn draw_pager_modal(
+    f: &mut Frame,
+    screen: Rect,
+    title: Option<&str>,
+    lines: &[String],
+    offset: usize,
+) {
+    // Pager wants near-fullscreen. Leave a 4-cell margin so the
+    // underlying status bar stays visible.
+    let width = screen.width.saturating_sub(4);
+    let height = screen.height.saturating_sub(2);
+    let area = centered_rect(screen, width, height);
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    let title_str = title.unwrap_or(" pager ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(SAND_GOLD))
+        .style(Style::default().bg(BG_DUSK))
+        .title(Line::from(Span::styled(
+            format!(" {} ", title_str.trim()),
+            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let body_height = layout[0].height as usize;
+    let total = lines.len();
+    let end = (offset + body_height).min(total);
+    let body: Vec<Line> = lines[offset..end]
+        .iter()
+        .map(|s| Line::from(Span::styled(s.clone(), Style::default().fg(TEXT_CREAM))))
+        .collect();
+    f.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }),
+        layout[0],
+    );
+
+    let at_end = end >= total;
+    let footer = if at_end {
+        format!(
+            " end · ↑↓/jk · b/PgUp back · g top · esc/q close ({total} lines) "
+        )
+    } else {
+        format!(
+            " ↑↓/jk line · ↵/space/PgDn page · b/PgUp back · g/G top/bottom · esc/q close ({end}/{total}) "
+        )
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(SUBDUED),
+        ))),
+        layout[1],
     );
 }
 
