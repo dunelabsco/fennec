@@ -464,10 +464,7 @@ impl McpServerHandler {
             )
         })?;
 
-        let sm = SendMessage {
-            content: body.to_string(),
-            recipient: recipient.clone(),
-        };
+        let sm = SendMessage::new(body, recipient.clone());
         channel
             .send(&sm)
             .await

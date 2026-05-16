@@ -407,6 +407,7 @@ pub fn host_channel_send(
         chat_id: chat_id.to_string(),
         reply_to: None,
         metadata: std::collections::HashMap::new(),
+        attachments: Vec::new(),
     };
     // block_in_place tells the tokio multi-threaded runtime that
     // this worker is about to block on a future; another worker
