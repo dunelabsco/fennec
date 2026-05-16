@@ -95,11 +95,37 @@ impl OpenAIProvider {
                     }));
                 }
                 _ => {
-                    // "system", "user", etc.
-                    api_messages.push(json!({
-                        "role": msg.role,
-                        "content": msg.content.as_deref().unwrap_or("")
-                    }));
+                    // "system", "user", etc. If image attachments
+                    // are queued for this turn, serialise as the
+                    // multi-part content form: array of
+                    // {type: text, text} + {type: image_url,
+                    // image_url: {url: data:<mime>;base64,<data>}}.
+                    let text = msg.content.as_deref().unwrap_or("");
+                    if let Some(ref atts) = msg.attachments {
+                        let mut parts = Vec::with_capacity(atts.len() + 1);
+                        if !text.is_empty() {
+                            parts.push(json!({"type": "text", "text": text}));
+                        }
+                        for a in atts {
+                            let url = format!(
+                                "data:{};base64,{}",
+                                a.mime_type, a.base64_data
+                            );
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": {"url": url},
+                            }));
+                        }
+                        api_messages.push(json!({
+                            "role": msg.role,
+                            "content": parts,
+                        }));
+                    } else {
+                        api_messages.push(json!({
+                            "role": msg.role,
+                            "content": text,
+                        }));
+                    }
                 }
             }
         }
@@ -166,6 +192,13 @@ impl OpenAIProvider {
 
         if stream {
             body["stream"] = json!(true);
+            // Request a usage payload in the final streaming chunk
+            // (per OpenAI's stream_options spec). Without this the
+            // streamed response doesn't carry token counts at all
+            // and `/usage` would silently report zero for every
+            // streaming turn. Servers that don't recognise the field
+            // ignore it.
+            body["stream_options"] = json!({"include_usage": true});
         }
 
         if let Some(tools) = request.tools {
@@ -244,6 +277,9 @@ impl OpenAIProvider {
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64()),
+            // OpenAI doesn't return a cache-write counter — Anthropic
+            // is the only provider exposing it today.
+            cache_write_tokens: None,
         });
 
         Ok(ChatResponse {
@@ -303,7 +339,28 @@ pub(crate) fn is_reasoning_model(model: &str) -> bool {
 async fn dispatch_openai_chunk(
     data: &Value,
     tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    usage_acc: &mut UsageInfo,
 ) -> bool {
+    // OpenAI's final streaming chunk (when `stream_options.include_usage`
+    // is set) carries an empty `choices` array and a populated `usage`
+    // object. Capture it into the accumulator so the stream loop can
+    // emit `StreamEvent::Usage` once the terminator arrives.
+    if let Some(u) = data.get("usage") {
+        if let Some(v) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
+            usage_acc.input_tokens = v;
+        }
+        if let Some(v) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
+            usage_acc.output_tokens = v;
+        }
+        if let Some(v) = u
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+        {
+            usage_acc.cache_read_tokens = Some(v);
+        }
+    }
+
     let Some(choice) = data
         .get("choices")
         .and_then(|c| c.as_array())
@@ -363,6 +420,10 @@ async fn dispatch_openai_chunk(
 impl Provider for OpenAIProvider {
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 
     async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatResponse> {
@@ -477,6 +538,31 @@ impl Provider for OpenAIProvider {
 
         tokio::spawn(async move {
             let mut sse = SseBuffer::new();
+            let mut usage_acc = UsageInfo::default();
+            let mut usage_seen = false;
+            // Emit `StreamEvent::Usage` exactly once when we have data
+            // for it. The accumulator may be populated either by an
+            // intermediate chunk that already carried `usage` or by
+            // the final chunk that arrives with empty `choices`.
+            let emit_usage = |usage: &UsageInfo,
+                              tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+                              seen: &mut bool|
+             -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                let usage = usage.clone();
+                let tx = tx.clone();
+                let seen_now = !*seen
+                    && (usage.input_tokens > 0
+                        || usage.output_tokens > 0
+                        || usage.cache_read_tokens.is_some());
+                if seen_now {
+                    *seen = true;
+                }
+                Box::pin(async move {
+                    if seen_now {
+                        let _ = tx.send(StreamEvent::Usage(usage)).await;
+                    }
+                })
+            };
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -500,6 +586,7 @@ impl Provider for OpenAIProvider {
                     };
 
                     if data_str == "[DONE]" {
+                        emit_usage(&usage_acc, &tx, &mut usage_seen).await;
                         let _ = tx.send(StreamEvent::Done).await;
                         return;
                     }
@@ -509,17 +596,19 @@ impl Provider for OpenAIProvider {
                         Err(_) => continue,
                     };
 
-                    if dispatch_openai_chunk(&data, &tx).await {
+                    if dispatch_openai_chunk(&data, &tx, &mut usage_acc).await {
                         // finish_reason observed — still prefer [DONE] as
                         // the authoritative terminator when the server
                         // sends it, but close now so we don't hang if it
                         // doesn't.
+                        emit_usage(&usage_acc, &tx, &mut usage_seen).await;
                         let _ = tx.send(StreamEvent::Done).await;
                         return;
                     }
                 }
             }
 
+            emit_usage(&usage_acc, &tx, &mut usage_seen).await;
             let _ = tx.send(StreamEvent::Done).await;
         });
 
@@ -774,7 +863,8 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let terminate = dispatch_openai_chunk(&data, &tx).await;
+        let mut usage = UsageInfo::default();
+        let terminate = dispatch_openai_chunk(&data, &tx, &mut usage).await;
         let events = drain(&mut rx).await;
         assert!(terminate, "finish_reason=tool_calls should signal termination");
         // We must have seen both Start and Delta before termination.
@@ -796,7 +886,8 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let terminate = dispatch_openai_chunk(&data, &tx).await;
+        let mut usage = UsageInfo::default();
+        let terminate = dispatch_openai_chunk(&data, &tx, &mut usage).await;
         let events = drain(&mut rx).await;
         assert!(terminate);
         assert!(matches!(&events[0], StreamEvent::Delta(s) if s == "Hello!"));
@@ -810,7 +901,8 @@ mod tests {
                 "delta": { "content": "partial..." }
             }]
         });
-        let terminate = dispatch_openai_chunk(&data, &tx).await;
+        let mut usage = UsageInfo::default();
+        let terminate = dispatch_openai_chunk(&data, &tx, &mut usage).await;
         let events = drain(&mut rx).await;
         assert!(!terminate);
         assert!(matches!(&events[0], StreamEvent::Delta(s) if s == "partial..."));
@@ -823,7 +915,8 @@ mod tests {
         for reason in ["length", "content_filter"] {
             let (tx, mut _rx) = tokio::sync::mpsc::channel::<StreamEvent>(4);
             let data = json!({ "choices": [{ "delta": {}, "finish_reason": reason }] });
-            let terminate = dispatch_openai_chunk(&data, &tx).await;
+            let mut usage = UsageInfo::default();
+        let terminate = dispatch_openai_chunk(&data, &tx, &mut usage).await;
             assert!(terminate, "finish_reason={} should terminate", reason);
         }
     }

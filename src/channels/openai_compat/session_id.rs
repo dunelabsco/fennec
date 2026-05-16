@@ -78,6 +78,7 @@ pub async fn load_history(
             content: Some(m.content),
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
         })
         .collect();
     Ok(messages)

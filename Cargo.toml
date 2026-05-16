@@ -61,6 +61,9 @@ tower-http = { version = "0.6", features = ["cors", "timeout"] }
 dirs = "6.0"
 hex = "0.4"
 toml = "0.8"
+dotenvy = "0.15"
+arboard = "3.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 glob = "0.3"
 dialoguer = "0.12"
 console = "0.15"
@@ -87,17 +90,17 @@ wasmtime-wasi = "27"
 # Embed bundled skills/ at compile time.
 include_dir = "0.7"
 
-# E2EE stack for the Matrix channel. All three are optional and
-# pulled in only when the `matrix-e2ee` feature is on — base
-# builds stay slim. matrix-sdk-crypto is the OlmMachine equivalent
-# (pure Rust Olm/Megolm via vodozemac, audited). matrix-sdk-sqlite
-# ships SqliteCryptoStore which persists Olm sessions, Megolm
-# sessions, tracked-user state, and cross-signing keys across
-# restarts. ruma supplies the typed Matrix protocol structs the
-# OlmMachine API consumes.
+# Matrix E2EE — optional, behind `matrix-e2ee` feature.
 matrix-sdk-crypto = { version = "0.16", optional = true, default-features = false }
 matrix-sdk-sqlite = { version = "0.16", optional = true, default-features = false, features = ["crypto-store"] }
 ruma = { version = "0.14", optional = true, default-features = false, features = ["client-api-c"] }
+
+# TUI mode (F1).
+ratatui = "0.30"
+crossterm = "0.29"
+# Audio capture for TUI voice mode.
+cpal = "0.16"
+hound = "3.5"
 
 [dev-dependencies]
 tempfile = "3.15"

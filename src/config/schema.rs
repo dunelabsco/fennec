@@ -18,6 +18,8 @@ pub struct FennecConfig {
     pub plugins: PluginsConfig,
     pub auxiliary: AuxiliaryConfigToml,
     pub skills: SkillsConfigToml,
+    pub tools: ToolsConfig,
+    pub tui: TuiConfig,
 }
 
 impl Default for FennecConfig {
@@ -35,6 +37,8 @@ impl Default for FennecConfig {
             plugins: PluginsConfig::default(),
             auxiliary: AuxiliaryConfigToml::default(),
             skills: SkillsConfigToml::default(),
+            tools: ToolsConfig::default(),
+            tui: TuiConfig::default(),
         }
     }
 }
@@ -43,9 +47,7 @@ impl Default for FennecConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginsConfig {
-    /// Names of plugins that should be activated at startup.
     pub enabled: Vec<String>,
-    /// Per-plugin string settings.
     pub settings: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 }
 
@@ -74,12 +76,7 @@ pub struct SkillsGuardConfigToml {
     pub disabled_rules: Vec<String>,
 }
 
-/// Per-task auxiliary client config. One subsection per built-in
-/// background-task kind plus a free-form `custom` map for plugin
-/// task names. All fields default to empty/zero — meaning "auto"
-/// resolution (walk the fallback chain) and provider-default
-/// timeouts. Existing installs without an `[auxiliary]` section
-/// see no behavior change.
+/// Per-task auxiliary client config.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AuxiliaryConfigToml {
@@ -90,8 +87,6 @@ pub struct AuxiliaryConfigToml {
     pub session_search: AuxiliaryTaskToml,
     pub smart_approval: AuxiliaryTaskToml,
     pub title: AuxiliaryTaskToml,
-    /// Free-form per-task overrides keyed by task name. Plugin
-    /// background tasks register their custom name here.
     pub custom: std::collections::HashMap<String, AuxiliaryTaskToml>,
 }
 
@@ -99,16 +94,24 @@ pub struct AuxiliaryConfigToml {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AuxiliaryTaskToml {
-    /// Provider name (`"auto"` or a specific name like `"openai"`).
-    /// Empty/missing is treated as `"auto"`.
     pub provider: String,
-    /// Task-specific model override. Empty = use whatever the
-    /// resolved provider's default is.
     pub model: String,
-    /// Per-call timeout in seconds. `0` = use the provider's own
-    /// default. Useful for slow providers or large context windows
-    /// where the default is too short.
     pub timeout_secs: u64,
+}
+
+/// User-toggleable TUI display settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    pub compact: bool,
+    pub details: String,
+}
+
+/// Tool toggle configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub disabled: Vec<String>,
 }
 
 impl FennecConfig {
@@ -152,6 +155,19 @@ impl FennecConfig {
         let contents = std::fs::read_to_string(path)?;
         let config: FennecConfig = toml::from_str(&contents)?;
         Ok(config)
+    }
+
+    /// Persist configuration to `path` as TOML. Used by `/model`,
+    /// `/tools`, and other slash commands that mutate runtime
+    /// config and need the change to survive a restart. Creates
+    /// the parent directory if missing.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = toml::to_string_pretty(self)?;
+        std::fs::write(path, body)?;
+        Ok(())
     }
 }
 

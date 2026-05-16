@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod auth_env;
 pub mod config;
 pub mod memory;
 pub mod providers;
@@ -17,3 +18,4 @@ pub mod sessions;
 pub mod onboard;
 pub mod doctor;
 pub mod plugins;
+pub mod tui;

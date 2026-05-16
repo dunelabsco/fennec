@@ -679,6 +679,7 @@ pub async fn responses(
                 content: m.content.as_ref().map(flatten_content),
                 tool_calls: None,
                 tool_call_id: None,
+                attachments: None,
             })
             .collect()
     } else if let Some(prev_id) = &prev_id_for_chain {
@@ -1089,6 +1090,11 @@ async fn stream_response(
                     yield Ok(b"data: [DONE]\n\n".to_vec());
                     break;
                 }
+                StreamEvent::Usage(_) => {
+                    // Token usage is reported via the final usage_chunk
+                    // we synthesize at Done; the upstream Usage event
+                    // is informational and ignored here.
+                }
             }
         }
     };
@@ -1286,6 +1292,9 @@ async fn stream_response_via_agent(
                     yield Ok(b"data: [DONE]\n\n".to_vec());
                     break;
                 }
+                StreamEvent::Usage(_) => {
+                    // Token usage is informational here; ignored.
+                }
             }
         }
         // Drop guard at end of the stream — releases the agent
@@ -1346,6 +1355,7 @@ fn openai_message_to_internal(m: &ChatRequestMessage) -> ChatMessage {
                     .collect()
             }),
         tool_call_id: m.tool_call_id.clone(),
+        attachments: None,
     }
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -13,6 +14,46 @@ use super::context::SystemPromptBuilder;
 use super::scrub;
 use super::thinking::{self, ThinkingLevel};
 
+/// Cumulative session token usage + estimated cost. Returned by
+/// [`Agent::token_usage`] for the `/usage` slash command. All
+/// counters are u64; `cost_usd` is `None` when the active model
+/// isn't in the pricing snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub api_calls: u64,
+    /// Input + cache_read + cache_write from the most recent
+    /// provider response. Used to compute `last / context_max`
+    /// for the context-window utilisation row.
+    pub last_prompt_tokens: u64,
+    /// Configured context window of the active model.
+    pub context_max: usize,
+    pub cost_usd: Option<f64>,
+}
+
+impl TokenUsage {
+    /// Total tokens across all classes (input + cache_read +
+    /// cache_write + output).
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens + self.output_tokens
+    }
+
+    /// Context utilisation as a 0..=100 percentage based on the
+    /// most recent prompt size. Returns `None` when no provider
+    /// call has happened yet or the model has no context window.
+    pub fn context_percent(&self) -> Option<u8> {
+        if self.context_max == 0 || self.last_prompt_tokens == 0 {
+            return None;
+        }
+        let pct = (self.last_prompt_tokens as f64 * 100.0) / (self.context_max as f64);
+        Some(pct.clamp(0.0, 100.0) as u8)
+    }
+}
+
 /// The core agent that orchestrates provider calls, tool execution, and memory.
 pub struct Agent {
     provider: Arc<dyn Provider>,
@@ -25,6 +66,24 @@ pub struct Agent {
     /// time, so existing call sites don't change.
     tools: Vec<Arc<dyn Tool>>,
     tool_specs: Vec<ToolSpec>,
+    /// Tool names the user has disabled via `/tools disable`.
+    /// Disabled tools stay registered (so re-enabling is cheap)
+    /// but are filtered out of `tool_specs` shown to the model
+    /// and rejected at dispatch time.
+    disabled_tools: HashSet<String>,
+    /// Image attachments queued by `/image` and `/paste` for
+    /// the next user turn. Drained at the top of `turn` /
+    /// `turn_streaming` and attached to the outbound user
+    /// `ChatMessage`. Mirrors Hermes'
+    /// `session["attached_images"]` (`tui_gateway/server.py:3361-3401`).
+    pending_attachments: Vec<super::attachment::ImageAttachment>,
+    /// Steer text queued via `/steer` while a turn is running
+    /// (or pre-queued for the next turn). Drained after each
+    /// tool batch; appended as "User guidance: <text>" to the
+    /// last tool result so the model sees it before its next
+    /// reply. Multiple steer calls concatenate with newlines.
+    /// Mirrors `run_agent.py:4493-4527` + `:4545-4600`.
+    pending_steer: Option<String>,
     memory: Arc<dyn Memory>,
     prompt_builder: SystemPromptBuilder,
     max_tool_iterations: usize,
@@ -45,17 +104,16 @@ pub struct Agent {
     total_input_tokens: u64,
     total_output_tokens: u64,
     total_cache_read_tokens: u64,
+    total_cache_write_tokens: u64,
+    /// Number of provider HTTP calls made in this session.
+    total_api_calls: u64,
+    /// Input-token count from the most recent provider response.
+    /// Drives the context-window utilisation panel in `/usage`.
+    last_prompt_tokens: u64,
     turn_count: u64,
-    /// Plugin-registered lifecycle hooks. Empty by default; populated
-    /// by `AgentBuilder::hooks` when the gateway/CLI plumbs the
-    /// plugin-system hooks through. Hooks fire for every tool call
-    /// regardless of plugin source (built-in or plugin-provided).
+    /// Plugin-registered lifecycle hooks.
     hooks: Arc<crate::plugins::HookRegistry>,
-    /// Pluggable memory augmentation layer. Built-in
-    /// [`Memory`] above is always-on; the manager additionally runs
-    /// a single optional external [`MemoryProvider`](crate::plugins::MemoryProvider)
-    /// when one is configured via `[memory] provider = "<name>"`.
-    /// Empty manager (no external) preserves current behavior.
+    /// Pluggable memory augmentation layer.
     memory_manager: Arc<crate::plugins::MemoryManager>,
     /// Resolved Fennec home directory.
     home_dir: std::path::PathBuf,
@@ -63,28 +121,13 @@ pub struct Agent {
     session_id: String,
     /// Whether the current session's `on_session_start` has fired.
     session_started: bool,
-    /// Auxiliary client for background tasks (curator, future
-    /// title generation, smart-approval LLM, etc.). Not used in
-    /// the main turn loop — kept here so consumers (curator,
-    /// plugin context) can grab a handle. Empty client when no
-    /// auxiliary providers are available; call sites check
-    /// `is_available()` before dispatching.
+    /// Auxiliary client for background tasks (curator, etc.).
     auxiliary_client: Arc<crate::providers::AuxiliaryClient>,
+    /// Lifecycle hooks for real-time frontends (TUI, dashboard).
+    callbacks: super::callbacks::CallbacksHandle,
 }
 
 /// Result of a single `turn_with_history` call.
-///
-/// `response` is the assistant's final text reply (same shape as
-/// `Agent::turn`'s return). `new_messages` is the slice of
-/// `ChatMessage`s that the turn appended on top of the supplied
-/// history — typically two entries (the user's message and the
-/// assistant's response), more if the agent ran tool calls in
-/// between.
-///
-/// The OpenAI-compat channel uses these to:
-///   - return `response` to the HTTP caller,
-///   - persist `new_messages` into the per-session conversation
-///     store and the response chain.
 #[derive(Debug, Clone)]
 pub struct TurnWithHistoryResult {
     pub response: String,
@@ -145,6 +188,11 @@ impl Agent {
     /// On the first turn the system prompt is built (with memory context) and
     /// frozen for the remainder of the session. Subsequent turns reuse it.
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        // Notify any registered frontend that a turn is starting.
+        // This is the very first hook so a TUI / dashboard sees
+        // even the prompt-guard rejection path light up.
+        self.callbacks.on_turn_start(user_message);
+
         // Parse thinking directive before any other processing.
         let (thinking_override, user_message) = thinking::parse_thinking_directive(user_message);
         if let Some(level) = thinking_override {
@@ -264,8 +312,12 @@ impl Agent {
             (None, true) => user_message.to_string(),
         };
 
-        // Push user message to history.
-        self.history.push(ChatMessage::user(&effective_message));
+        // Push user message to history, attaching any images
+        // queued via /image or /paste so the provider can send
+        // them inline with this turn's prompt.
+        let mut user_msg = ChatMessage::user(&effective_message);
+        user_msg.attachments = self.take_pending_attachments_for_turn();
+        self.history.push(user_msg);
 
         self.turn_count += 1;
         let turn_start = std::time::Instant::now();
@@ -274,14 +326,22 @@ impl Agent {
 
         // Tool call loop.
         for _iteration in 0..self.max_tool_iterations {
+            self.callbacks.on_status("calling provider");
             let response = self.call_provider().await?;
+            self.total_api_calls += 1;
 
             // Track token usage from this API call.
             if let Some(ref usage) = response.usage {
                 self.total_input_tokens += usage.input_tokens;
                 self.total_output_tokens += usage.output_tokens;
+                self.last_prompt_tokens = usage.input_tokens
+                    + usage.cache_read_tokens.unwrap_or(0)
+                    + usage.cache_write_tokens.unwrap_or(0);
                 if let Some(cache) = usage.cache_read_tokens {
                     self.total_cache_read_tokens += cache;
+                }
+                if let Some(cache) = usage.cache_write_tokens {
+                    self.total_cache_write_tokens += cache;
                 }
             }
 
@@ -289,6 +349,7 @@ impl Agent {
                 // No tool calls — final assistant response.
                 let text = response.content.unwrap_or_default();
                 self.history.push(ChatMessage::assistant(&text));
+                self.callbacks.on_turn_complete(&text);
 
                 // Log token usage for this turn.
                 let turn_input = self.total_input_tokens - tokens_before_input;
@@ -324,21 +385,17 @@ impl Agent {
             assistant_msg.tool_calls = Some(response.tool_calls.clone());
             self.history.push(assistant_msg);
 
-            // Execute each tool call and push results. Plugin
-            // lifecycle hooks can influence flow:
-            //
-            //  - `pre_tool_call` returning `Skip` aborts the call;
-            //    the synthetic result tells the LLM the plugin refused.
-            //  - `pre_tool_call` returning `Rewrite` substitutes the
-            //    tool's arguments before execution. Subsequent pre-
-            //    hooks see the rewritten args (chain composition).
-            //  - `post_tool_call` returning `Rewrite` substitutes the
-            //    output and success flag before the LLM sees them.
-            //
-            // Any hook that panics is isolated by `HookRegistry`; the
-            // call falls through to the next hook or to the tool.
+            // Execute each tool call and push results. Combines:
+            //  - plugin lifecycle hooks (pre/post can skip or rewrite),
+            //  - frontend callbacks (start + complete for live UI).
             for tc in &response.tool_calls {
                 tracing::info!(tool = %tc.name, "Executing tool call");
+                self.callbacks.on_tool_start(super::callbacks::ToolStart {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    preview: preview_for_args(&tc.arguments),
+                });
+                let started = std::time::Instant::now();
                 let (final_output, final_success) =
                     match self.hooks.fire_pre_tool(&tc.name, &tc.arguments) {
                         crate::plugins::PreToolResolution::Skip { reason } => {
@@ -362,9 +419,23 @@ impl Agent {
                         }
                     };
                 tracing::info!(tool = %tc.name, success = %final_success, "Tool call complete");
+                self.callbacks.on_tool_complete(super::callbacks::ToolComplete {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    error: if final_success { None } else { Some(final_output.clone()) },
+                    summary: Some(truncate_summary(&final_output)),
+                });
                 self.history
                     .push(ChatMessage::tool_result(&tc.id, &final_output));
             }
+
+            // Drain any /steer text queued during the tool
+            // batch so the model sees it before its next
+            // response. If no tool ran (impossible at this
+            // point — the loop body ran), apply_pending_steer
+            // is a no-op.
+            self.apply_pending_steer_to_tool_results();
         }
 
         bail!("max tool iterations ({}) exceeded", self.max_tool_iterations)
@@ -464,15 +535,20 @@ impl Agent {
             user_message.to_string()
         };
 
-        // Push user message to history.
-        self.history.push(ChatMessage::user(&effective_message));
+        // Push user message to history, attaching any images
+        // queued via /image or /paste so the provider can send
+        // them inline with this turn's prompt.
+        let mut user_msg = ChatMessage::user(&effective_message);
+        user_msg.attachments = self.take_pending_attachments_for_turn();
+        self.history.push(user_msg);
 
         // Get streaming receiver from provider.
         let system = self.system_prompt.as_deref();
-        let tools = if self.tool_specs.is_empty() {
+        let enabled = self.enabled_tool_specs();
+        let tools = if enabled.is_empty() {
             None
         } else {
-            Some(self.tool_specs.as_slice())
+            Some(enabled.as_slice())
         };
 
         let request = ChatRequest {
@@ -488,6 +564,191 @@ impl Agent {
         Ok(rx)
     }
 
+    /// Streaming version of [`Self::turn`] that fans text deltas
+    /// through the registered callbacks as they arrive. Same
+    /// final-result contract as `turn()` (returns the assistant
+    /// text on success, errors on max-iterations exceeded /
+    /// guard rejection / provider failure), with the addition
+    /// that frontends see live updates throughout.
+    ///
+    /// The default no-op `AgentCallbacks` impl makes this safe
+    /// for callers that don't care about streaming — the deltas
+    /// fire into nothing. Channels (Telegram / etc.) keep using
+    /// `turn()` since they only consume final messages and don't
+    /// need the streaming overhead.
+    pub async fn turn_streaming(&mut self, user_message: &str) -> Result<String> {
+        use crate::providers::traits::{ChatRequest, StreamEvent, ToolCall};
+
+        self.callbacks.on_turn_start(user_message);
+
+        // Same setup as turn(): /think parsing, prompt guard,
+        // collective search, system prompt, history push.
+        let (thinking_override, user_message) = thinking::parse_thinking_directive(user_message);
+        if let Some(level) = thinking_override {
+            self.thinking_level = level;
+        }
+        let user_message: &str = &user_message;
+
+        if let Some(ref guard) = self.prompt_guard {
+            match guard.scan(user_message) {
+                ScanResult::Blocked(reason) => bail!("{reason}"),
+                ScanResult::Suspicious(_, _) | ScanResult::Safe => {}
+            }
+        }
+
+        let collective_context = if let Some(ref collective) = self.collective {
+            match collective.search(user_message, 3).await {
+                Ok(result) => match result.confidence {
+                    SearchConfidence::High => {
+                        Some(self.format_collective_results(&result.experiences, true))
+                    }
+                    SearchConfidence::Partial => {
+                        Some(self.format_collective_results(&result.experiences, false))
+                    }
+                    SearchConfidence::None => None,
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        if self.system_prompt.is_none() {
+            let memory_context = self.load_memory_context(user_message).await?;
+            let tool_names: Vec<String> = self.tools.iter().map(|t| t.name().to_string()).collect();
+            let prompt = self.prompt_builder.build(
+                &memory_context,
+                &tool_names,
+                &self.skills_prompt,
+            );
+            self.system_prompt = Some(prompt);
+        }
+
+        let effective_message = if let Some(ref ctx) = collective_context {
+            format!("[Collective matches]\n{ctx}\n[User message]\n{user_message}")
+        } else {
+            user_message.to_string()
+        };
+        self.history.push(ChatMessage::user(&effective_message));
+        self.turn_count += 1;
+
+        // Tool-iteration loop, streaming each LLM call.
+        for _iteration in 0..self.max_tool_iterations {
+            self.callbacks.on_status("calling provider");
+
+            let enabled = self.enabled_tool_specs();
+            let request = ChatRequest {
+                system: self.system_prompt.as_deref(),
+                messages: &self.history,
+                tools: if enabled.is_empty() {
+                    None
+                } else {
+                    Some(enabled.as_slice())
+                },
+                max_tokens: self.max_tokens,
+                temperature: self.temperature,
+                thinking_level: self.thinking_level,
+            };
+            let mut rx = self.provider.chat_stream(request).await?;
+            self.total_api_calls += 1;
+
+            let mut accumulated_text = String::new();
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            // (id, name, args_buffer) for the in-flight tool call.
+            let mut current_tool: Option<(String, String, String)> = None;
+
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    StreamEvent::Delta(text) => {
+                        accumulated_text.push_str(&text);
+                        self.callbacks.on_text_delta(&text);
+                    }
+                    StreamEvent::ToolCallStart { id, name } => {
+                        current_tool = Some((id, name, String::new()));
+                    }
+                    StreamEvent::ToolCallDelta {
+                        id: _,
+                        arguments_delta,
+                    } => {
+                        if let Some((_, _, ref mut buf)) = current_tool {
+                            buf.push_str(&arguments_delta);
+                        }
+                    }
+                    StreamEvent::ToolCallEnd { id: _ } => {
+                        if let Some((id, name, args)) = current_tool.take() {
+                            let arguments: serde_json::Value =
+                                serde_json::from_str(&args).unwrap_or_else(|_| {
+                                    serde_json::Value::Object(serde_json::Map::new())
+                                });
+                            tool_calls.push(ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            });
+                        }
+                    }
+                    StreamEvent::Usage(usage) => {
+                        self.total_input_tokens += usage.input_tokens;
+                        self.total_output_tokens += usage.output_tokens;
+                        self.last_prompt_tokens = usage.input_tokens
+                            + usage.cache_read_tokens.unwrap_or(0)
+                            + usage.cache_write_tokens.unwrap_or(0);
+                        if let Some(cache) = usage.cache_read_tokens {
+                            self.total_cache_read_tokens += cache;
+                        }
+                        if let Some(cache) = usage.cache_write_tokens {
+                            self.total_cache_write_tokens += cache;
+                        }
+                    }
+                    StreamEvent::Done => break,
+                    StreamEvent::Error(e) => bail!("provider stream error: {e}"),
+                }
+            }
+
+            if tool_calls.is_empty() {
+                // Final assistant response.
+                self.history.push(ChatMessage::assistant(&accumulated_text));
+                self.callbacks.on_turn_complete(&accumulated_text);
+                return Ok(accumulated_text);
+            }
+
+            // Has tool calls — push the assistant message + tool
+            // results, then loop for the next provider call.
+            let mut assistant_msg = ChatMessage::assistant(&accumulated_text);
+            assistant_msg.tool_calls = Some(tool_calls.clone());
+            self.history.push(assistant_msg);
+
+            for tc in &tool_calls {
+                self.callbacks.on_tool_start(super::callbacks::ToolStart {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    preview: preview_for_args(&tc.arguments),
+                });
+                let started = std::time::Instant::now();
+                let (output, success) = self.execute_tool(&tc.name, &tc.arguments).await;
+                self.callbacks.on_tool_complete(super::callbacks::ToolComplete {
+                    tool_id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    error: if success { None } else { Some(output.clone()) },
+                    summary: Some(truncate_summary(&output)),
+                });
+                self.history
+                    .push(ChatMessage::tool_result(&tc.id, &output));
+            }
+
+            // Drain any /steer text queued during the tool batch
+            // (streaming path). Same hook as turn(): inject after
+            // tool results before looping for the next provider call.
+            self.apply_pending_steer_to_tool_results();
+        }
+
+        bail!(
+            "max tool iterations ({}) exceeded",
+            self.max_tool_iterations
+        )
+    }
+
     /// Record the final assistant text after a [`Self::turn_streamed`]
     /// receiver has drained, so the next turn sees it in history. Callers
     /// that drive `turn_streamed` must invoke this once the stream's
@@ -500,10 +761,11 @@ impl Agent {
     /// Call the provider with the current history and system prompt.
     async fn call_provider(&self) -> Result<ChatResponse> {
         let system = self.system_prompt.as_deref();
-        let tools = if self.tool_specs.is_empty() {
+        let enabled = self.enabled_tool_specs();
+        let tools = if enabled.is_empty() {
             None
         } else {
-            Some(self.tool_specs.as_slice())
+            Some(enabled.as_slice())
         };
 
         let request = ChatRequest {
@@ -545,12 +807,15 @@ impl Agent {
     /// tool itself (`true` only when the tool reported success — tool output
     /// containing the substring "error" must not be confused with failure).
     async fn execute_tool(&self, name: &str, args: &serde_json::Value) -> (String, bool) {
-        // Route memory-provider-contributed tools to the manager
-        // first. The manager-handled set is determined at agent
-        // build time by `MemoryProvider::get_tool_schemas`; when no
-        // external provider is wired, `handles_tool` is `false` for
-        // every name and we fall straight through to the regular
-        // tools list.
+        // Disabled tools must not run.
+        if self.disabled_tools.contains(name) {
+            return (
+                format!("Error: tool '{name}' is currently disabled"),
+                false,
+            );
+        }
+
+        // Route memory-provider-contributed tools to the manager first.
         if self.memory_manager.handles_tool(name) {
             let (raw, success) = match self
                 .memory_manager
@@ -700,6 +965,94 @@ impl Agent {
         self.session_started = false;
     }
 
+    /// Replace the agent's working history with a prior session's
+    /// messages. Used by `/resume` to repopulate `history` from
+    /// the persisted [`crate::sessions::SessionStore`] so the
+    /// next turn sees the full conversation.
+    ///
+    /// Resets the cached system prompt so it's rebuilt with
+    /// memory context relevant to whatever the user types after
+    /// resuming, mirroring `clear_history`'s semantics.
+    pub fn replace_history(&mut self, messages: Vec<ChatMessage>) {
+        self.history = messages;
+        self.system_prompt = None;
+    }
+
+    /// Number of messages currently in `history`. Used by the
+    /// per-turn persistence hook in the TUI: snapshot the length
+    /// before a turn, persist the slice from that point after
+    /// the turn completes.
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Read-only view of `history[start..]`. Returns an empty
+    /// slice if `start` is out of bounds.
+    pub fn history_slice(&self, start: usize) -> &[ChatMessage] {
+        if start >= self.history.len() {
+            &[]
+        } else {
+            &self.history[start..]
+        }
+    }
+
+    /// Pop messages from the tail of `history` until (and
+    /// including) the most recent user-role message is removed.
+    /// Returns `(count_popped, user_text)` on success, `None`
+    /// when no user message exists (history is left untouched
+    /// in that case).
+    ///
+    /// Used by `/undo` (to drop the last exchange) and `/retry`
+    /// (to drop + re-submit the user message). Mirrors Hermes'
+    /// `session.undo` (`tui_gateway/server.py:2424-2449`) which
+    /// pops in reverse until a user-role row is found.
+    pub fn pop_last_turn(&mut self) -> Option<(usize, String)> {
+        // First locate the index of the most recent user
+        // message — only then do we mutate. Avoids corrupting
+        // history if the tail somehow has no user row (a
+        // pathological state, but we shouldn't panic on it).
+        let user_idx = self
+            .history
+            .iter()
+            .rposition(|m| m.role == "user")?;
+        let user_text = self.history[user_idx]
+            .content
+            .clone()
+            .unwrap_or_default();
+        let popped = self.history.len() - user_idx;
+        self.history.truncate(user_idx);
+        Some((popped, user_text))
+    }
+
+    /// Snapshot of cumulative session token usage + cost. Returned
+    /// by [`Self::token_usage`] for the `/usage` command.
+    ///
+    /// `cost_usd` is `None` when the active model isn't in the
+    /// pricing snapshot — callers render that as "—" or skip the
+    /// row, matching upstream's `cost_status: "unknown"` behavior.
+    pub fn token_usage(&self) -> TokenUsage {
+        let model = self.provider.model().to_string();
+        let context_max = self.provider.context_window();
+        let cost_usd = super::pricing::estimate_cost(
+            &model,
+            self.total_input_tokens,
+            self.total_output_tokens,
+            self.total_cache_read_tokens,
+            self.total_cache_write_tokens,
+        );
+        TokenUsage {
+            model,
+            input_tokens: self.total_input_tokens,
+            output_tokens: self.total_output_tokens,
+            cache_read_tokens: self.total_cache_read_tokens,
+            cache_write_tokens: self.total_cache_write_tokens,
+            api_calls: self.total_api_calls,
+            last_prompt_tokens: self.last_prompt_tokens,
+            context_max,
+            cost_usd,
+        }
+    }
+
     /// Get a reference to the shared provider.
     /// Handle to the auxiliary client. Curator + future background
     /// tasks call into this for non-prompt-cache-polluting LLM
@@ -711,6 +1064,192 @@ impl Agent {
 
     pub fn provider(&self) -> &Arc<dyn Provider> {
         &self.provider
+    }
+
+    /// Swap the live provider — used by `/model` to switch
+    /// models without restarting the process. Resets the cached
+    /// system prompt because the new provider may want
+    /// different prompt-injection conventions on its first
+    /// turn (and to keep parity with `clear_history`'s prompt
+    /// reset). Existing `history` is preserved.
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+        self.system_prompt = None;
+    }
+
+    /// Enumerate every registered tool's name, regardless of
+    /// enabled state. Used by `/tools` (no arg) to show the user
+    /// what's installed.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// Whether `name` is currently enabled (not in the disabled
+    /// set). Returns `true` if the tool isn't registered at all
+    /// — callers wanting "exists and enabled" should pair this
+    /// with `tool_names`.
+    pub fn is_tool_enabled(&self, name: &str) -> bool {
+        !self.disabled_tools.contains(name)
+    }
+
+    /// Toggle `name`'s enabled state. `enabled = false` adds it
+    /// to the disabled set; `enabled = true` removes it. Returns
+    /// `true` if the call changed anything (the tool exists and
+    /// the state actually flipped). Resets the cached system
+    /// prompt so the next turn rebuilds the tool-list section.
+    pub fn set_tool_enabled(&mut self, name: &str, enabled: bool) -> bool {
+        let exists = self.tools.iter().any(|t| t.name() == name);
+        if !exists {
+            return false;
+        }
+        let changed = if enabled {
+            self.disabled_tools.remove(name)
+        } else {
+            self.disabled_tools.insert(name.to_string())
+        };
+        if changed {
+            self.system_prompt = None;
+        }
+        changed
+    }
+
+    /// Replace the disabled set wholesale — used at agent
+    /// construction to seed from `FennecConfig.tools.disabled`.
+    pub fn set_disabled_tools<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.disabled_tools = names.into_iter().map(|s| s.into()).collect();
+        self.system_prompt = None;
+    }
+
+    /// Sorted list of currently-disabled tool names, suitable for
+    /// persistence into `FennecConfig.tools.disabled`.
+    pub fn disabled_tool_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.disabled_tools.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Queue an image for the next user turn. The bytes are
+    /// loaded + base64-encoded eagerly so the next provider
+    /// call doesn't pay disk I/O. Returns the attachment so
+    /// `/image` can echo dimensions + token estimate to the
+    /// user.
+    pub fn attach_image(
+        &mut self,
+        path: &std::path::Path,
+    ) -> anyhow::Result<super::attachment::ImageAttachment> {
+        let attached = super::attachment::ImageAttachment::from_path(path)?;
+        self.pending_attachments.push(attached.clone());
+        Ok(attached)
+    }
+
+    /// Number of attachments queued for the next turn. Powers
+    /// `/usage`-style "X images attached" hints in the UI.
+    pub fn pending_attachment_count(&self) -> usize {
+        self.pending_attachments.len()
+    }
+
+    /// Drop all queued attachments without consuming them. Used
+    /// by `/clear` and similar commands that reset turn state.
+    pub fn clear_pending_attachments(&mut self) {
+        self.pending_attachments.clear();
+    }
+
+    /// Append `text` to the pending-steer queue. Multiple calls
+    /// before the next tool batch concatenate with newlines, so
+    /// the model sees them as one block. Returns `true` if the
+    /// text was accepted (matches Hermes' `agent.steer` return
+    /// at `run_agent.py:4493-4527`).
+    pub fn steer(&mut self, text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        match &mut self.pending_steer {
+            Some(existing) => {
+                existing.push('\n');
+                existing.push_str(trimmed);
+            }
+            None => self.pending_steer = Some(trimmed.to_string()),
+        }
+        true
+    }
+
+    /// Whether a steer message is currently queued. Used by the
+    /// `/steer` worker to confirm acceptance.
+    pub fn has_pending_steer(&self) -> bool {
+        self.pending_steer.is_some()
+    }
+
+    /// Drain any pending steer text onto the most recent tool
+    /// result message in `history`, formatted with the
+    /// "User guidance:" marker that mirrors Hermes'
+    /// `_apply_pending_steer_to_tool_results`
+    /// (`run_agent.py:4545-4600`). Returns `true` if a steer
+    /// was applied — callers can use this to decide whether to
+    /// loop another tool iteration.
+    ///
+    /// If no tool result exists in history (i.e. the turn
+    /// produced no tool calls before terminating), the steer
+    /// stays queued for the next turn so it isn't lost.
+    fn apply_pending_steer_to_tool_results(&mut self) -> bool {
+        let Some(text) = self.pending_steer.clone() else {
+            return false;
+        };
+        // Walk back to find the most recent tool-result row.
+        let last_tool_idx = self
+            .history
+            .iter()
+            .rposition(|m| m.role == "tool");
+        let Some(idx) = last_tool_idx else {
+            // No tool result this turn — leave the queue as-is
+            // so the next turn picks it up.
+            return false;
+        };
+        let appended = format!("\n\nUser guidance: {text}");
+        if let Some(content) = self.history[idx].content.as_mut() {
+            content.push_str(&appended);
+        } else {
+            self.history[idx].content = Some(appended);
+        }
+        self.pending_steer = None;
+        true
+    }
+
+    /// Internal: drain queued attachments into the
+    /// provider-facing form, used at the top of `turn` /
+    /// `turn_streaming` to attach them to the outbound user
+    /// message.
+    fn take_pending_attachments_for_turn(
+        &mut self,
+    ) -> Option<Vec<crate::providers::traits::ImageAttachmentRef>> {
+        if self.pending_attachments.is_empty() {
+            return None;
+        }
+        let drained = std::mem::take(&mut self.pending_attachments);
+        let refs: Vec<_> = drained
+            .into_iter()
+            .map(|a| crate::providers::traits::ImageAttachmentRef {
+                mime_type: a.mime_type,
+                base64_data: a.base64_data,
+                display_name: Some(a.display_name),
+            })
+            .collect();
+        Some(refs)
+    }
+
+    /// Subset of `tool_specs` actually advertised to the model
+    /// — disabled entries are filtered out so the LLM doesn't
+    /// see them as available.
+    fn enabled_tool_specs(&self) -> Vec<ToolSpec> {
+        self.tool_specs
+            .iter()
+            .filter(|spec| !self.disabled_tools.contains(&spec.name))
+            .cloned()
+            .collect()
     }
 
     /// Get a reference to the shared memory.
@@ -763,6 +1302,7 @@ pub struct AgentBuilder {
     memory_manager: Option<Arc<crate::plugins::MemoryManager>>,
     home_dir: Option<std::path::PathBuf>,
     auxiliary_client: Option<Arc<crate::providers::AuxiliaryClient>>,
+    callbacks: Option<super::callbacks::CallbacksHandle>,
 }
 
 impl AgentBuilder {
@@ -785,6 +1325,7 @@ impl AgentBuilder {
             memory_manager: None,
             home_dir: None,
             auxiliary_client: None,
+            callbacks: None,
         }
     }
 
@@ -917,6 +1458,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Register a frontend callback handle. Used by the TUI and
+    /// (later) the dashboard to receive turn / tool / status
+    /// events as they happen. Callers that don't set this get a
+    /// no-op handle; existing code paths (channel sends, batch
+    /// runs) behave exactly as before.
+    pub fn callbacks(mut self, handle: super::callbacks::CallbacksHandle) -> Self {
+        self.callbacks = Some(handle);
+        self
+    }
+
     /// Build the [`Agent`], validating that required fields are set.
     pub fn build(self) -> Result<Agent> {
         let provider = self
@@ -950,6 +1501,9 @@ impl AgentBuilder {
             provider,
             tools: self.tools,
             tool_specs,
+            disabled_tools: HashSet::new(),
+            pending_attachments: Vec::new(),
+            pending_steer: None,
             memory,
             prompt_builder,
             max_tool_iterations: self.max_tool_iterations.unwrap_or(15),
@@ -966,6 +1520,9 @@ impl AgentBuilder {
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
+            total_cache_write_tokens: 0,
+            total_api_calls: 0,
+            last_prompt_tokens: 0,
             turn_count: 0,
             hooks: self
                 .hooks
@@ -985,6 +1542,39 @@ impl AgentBuilder {
                     Vec::new(),
                 ))
             }),
+            callbacks: self
+                .callbacks
+                .unwrap_or_else(super::callbacks::noop_callbacks),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Callback helpers
+// ---------------------------------------------------------------------------
+
+/// One-line preview of a tool call's args for the inline display
+/// and the TOOL LIVE panel header. We render JSON compactly and
+/// truncate aggressively — frontends show the full args in their
+/// own collapsed view.
+fn preview_for_args(args: &serde_json::Value) -> String {
+    let s = match args {
+        serde_json::Value::Object(map) if map.is_empty() => return String::from("()"),
+        serde_json::Value::Null => return String::from("()"),
+        _ => args.to_string(),
+    };
+    truncate_summary(&s)
+}
+
+/// Truncate any text to a single short line for inline display.
+fn truncate_summary(s: &str) -> String {
+    let single_line: String = s.lines().next().unwrap_or("").to_string();
+    const MAX: usize = 80;
+    if single_line.chars().count() <= MAX {
+        single_line
+    } else {
+        let mut out: String = single_line.chars().take(MAX - 1).collect();
+        out.push('…');
+        out
     }
 }

@@ -123,6 +123,7 @@ pub async fn run(
                 Some(response.tool_calls.clone())
             },
             tool_call_id: None,
+            attachments: None,
         };
         messages.push(assistant_msg);
 

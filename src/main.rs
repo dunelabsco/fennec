@@ -90,6 +90,12 @@ enum Commands {
         /// Override the LLM model
         #[arg(long)]
         model: Option<String>,
+
+        /// Open the terminal UI (sessions / chat / channels panels)
+        /// instead of the line-by-line CLI. Existing CLI mode is
+        /// the default.
+        #[arg(long)]
+        tui: bool,
     },
     /// Show agent status
     Status,
@@ -310,6 +316,31 @@ fn build_auxiliary_client(
     fennec::providers::AuxiliaryClient::new(aux_config, text_chain, vision_chain)
 }
 
+/// Resolve a provider Arc for the given config + new model name.
+fn resolve_provider_with_model(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+    model: &str,
+) -> Result<Arc<dyn Provider>> {
+    let secret_store =
+        SecretStore::new(home_dir.to_path_buf()).context("creating secret store")?;
+    let provider: Box<dyn Provider> = if config.provider.name == "anthropic" {
+        if let Ok(Some(oauth_token)) = auth::load_oauth_token(home_dir) {
+            Box::new(AnthropicProvider::new_with_oauth(
+                oauth_token,
+                Some(model.to_string()),
+            ))
+        } else {
+            let api_key = resolve_api_key(config, &secret_store)?;
+            build_provider(config, api_key, Some(model.to_string()))
+        }
+    } else {
+        let api_key = resolve_api_key(config, &secret_store)?;
+        build_provider(config, api_key, Some(model.to_string()))
+    };
+    Ok(Arc::from(provider))
+}
+
 /// Build the LLM provider based on config.
 fn build_provider(
     config: &FennecConfig,
@@ -417,6 +448,24 @@ async fn build_agent(
     home_dir: &std::path::Path,
     model_override: Option<String>,
     channel_map: Option<ChannelMapHandle>,
+    plugin_bus: Option<MessageBus>,
+) -> Result<(
+    fennec::agent::Agent,
+    Arc<dyn Memory>,
+    Arc<Mutex<Option<CronOrigin>>>,
+    fennec::bus::PendingReplies,
+    fennec::bus::ChatDirectory,
+    Arc<dyn Provider>,
+)> {
+    build_agent_with_callbacks(config, home_dir, model_override, channel_map, None, None).await
+}
+
+async fn build_agent_with_callbacks(
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+    model_override: Option<String>,
+    channel_map: Option<ChannelMapHandle>,
+    callbacks: Option<fennec::agent::callbacks::CallbacksHandle>,
     plugin_bus: Option<MessageBus>,
 ) -> Result<(
     fennec::agent::Agent,
@@ -920,26 +969,13 @@ async fn build_agent(
         delegate_subagent_tools,
     )));
 
-    // Plugin system. Bundled plugins (compiled into the binary via
-    // the `inventory` crate) are scanned here and any whose name
-    // appears in `[plugins].enabled` is activated. The default
-    // `enabled = []` skips the activation path entirely so installs
-    // that never opt in have zero behavioural change.
+    // Plugin system: bundled + WASM plugin discovery.
     let mut plugin_registry = fennec::plugins::PluginRegistry::new();
     if let Err(e) = plugin_registry.load_bundled(&config.plugins.enabled) {
-        // load_bundled() is "ok-even-if-some-fail" by design — this
-        // arm only fires on a structural failure. Don't abort agent
-        // startup; log and continue with no plugins.
         tracing::error!(
             "Plugin registry failed to load bundled: {e}; continuing without bundled plugins"
         );
     }
-
-    // WASM-loaded user plugins discovered under `<home>/plugins/`.
-    // Each plugin gets a clone of the host capability handles
-    // (path sandbox, memory, http client, runtime handle). Discovery
-    // and instantiation failures are non-fatal — one bad plugin
-    // never blocks startup.
     let wasm_resources = fennec::plugins::WasmHostResources {
         path_sandbox: Arc::clone(&path_sandbox),
         memory: memory.clone(),
@@ -958,23 +994,15 @@ async fn build_agent(
             "Plugin registry failed to load WASM plugins: {e}; continuing without WASM plugins"
         );
     }
-
-    // Resolve plugin runtime: tools, hooks, and the memory manager
-    // (built from `[memory] provider = "<name>"`). Default
-    // `provider = "builtin"` yields an empty manager — built-in
-    // SQLite memory remains the only memory layer, behavior
-    // unchanged.
     let runtime = plugin_registry.into_runtime(&config.memory.provider);
     for plugin_tool in runtime.tools {
         builder = builder.tool(plugin_tool);
     }
     builder = builder.hooks(Arc::new(runtime.hooks));
     builder = builder.memory_manager(Arc::new(runtime.memory_manager));
-    // Pass the resolved profile-aware home directory so the memory
-    // provider's `initialize` sees the right path under `--profile`.
     builder = builder.home_dir(home_dir.to_path_buf());
 
-    let agent = builder
+    let mut configured_builder = builder
         .identity_name(&config.identity.name)
         .identity_persona(&config.identity.persona)
         .max_tool_iterations(config.agent.max_tool_iterations as usize)
@@ -983,9 +1011,16 @@ async fn build_agent(
         .memory_context_limit(config.memory.context_limit)
         .half_life_days(config.memory.half_life_days)
         .prompt_guard(prompt_guard)
-        .auxiliary_client(Arc::clone(&aux_client))
-        .build()
-        .context("building agent")?;
+        .auxiliary_client(Arc::clone(&aux_client));
+    if let Some(handle) = callbacks {
+        configured_builder = configured_builder.callbacks(handle);
+    }
+    let mut agent = configured_builder.build().context("building agent")?;
+
+    // Apply any persisted /tools disable list from config.
+    if !config.tools.disabled.is_empty() {
+        agent.set_disabled_tools(config.tools.disabled.iter().cloned());
+    }
 
     Ok((agent, memory, cron_origin, pending_replies, chat_directory, provider))
 }
@@ -1067,6 +1102,1389 @@ async fn run_agent(
     }
 
     Ok(())
+}
+
+/// Launch the terminal UI (`fennec agent --tui`).
+///
+/// Builds a real agent with `TuiBridge` callbacks so streaming
+/// text deltas, tool starts/completes, status updates, and turn
+/// boundaries fan out into the TUI's app state. The renderer
+/// thread reads `App` for each frame; the agent loop runs on a
+/// tokio task and produces events into an mpsc channel; a drain
+/// task on the same runtime applies events to `App`.
+async fn run_tui(
+    config: FennecConfig,
+    home_dir: std::path::PathBuf,
+    model_override: Option<String>,
+) -> Result<()> {
+    use fennec::sessions::store::SessionStore;
+    use fennec::tui::app::{App, ChatLine, SessionRow};
+    use fennec::tui::callbacks::TuiBridge;
+
+    // Open (or create) the session store. Failure is non-fatal:
+    // the TUI keeps running, /resume just reports "no store".
+    let session_db = home_dir.join("sessions.db");
+    let session_store_handle = {
+        let path = session_db.clone();
+        match tokio::task::spawn_blocking(move || SessionStore::new(&path)).await {
+            Ok(Ok(s)) => Some(std::sync::Arc::new(s)),
+            Ok(Err(e)) => {
+                tracing::warn!("session store init failed: {e}; sessions list will be empty");
+                None
+            }
+            Err(_) => None,
+        }
+    };
+    let prior_sessions = if let Some(ref store) = session_store_handle {
+        store.list_sessions(20).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Provision a row for the current TUI session so /title and
+    // per-turn message persistence have somewhere to write. If
+    // the store isn't available we leave `current_session_id`
+    // unset and the persistence hook becomes a no-op.
+    let current_session_id = if let Some(ref store) = session_store_handle {
+        match store.create_session("cli").await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!("create session failed: {e}; persistence disabled this run");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut app = App::new();
+    app.current_session_id = current_session_id.clone();
+    app.skills_dir = Some(home_dir.join("skills"));
+    // Hydrate persisted TUI display toggles so user choices
+    // survive across runs.
+    app.compact_mode = config.tui.compact;
+    if let Some(mode) = fennec::tui::app::DetailsMode::parse(&config.tui.details) {
+        app.details_mode = mode;
+    }
+    // Current TUI session pinned to the top.
+    app.sessions.push(SessionRow {
+        code: "$ ".into(),
+        who: "local".into(),
+        subject: "current session".into(),
+        count: "0".into(),
+        has_unread: false,
+    });
+    // Historical sessions from the store, transformed into the
+    // sessions-panel row shape.
+    for rec in prior_sessions.iter().take(20) {
+        let (code, who) = channel_label(&rec.channel);
+        let subject = rec
+            .summary
+            .clone()
+            .unwrap_or_else(|| short_id(&rec.id));
+        app.sessions.push(SessionRow {
+            code,
+            who,
+            subject,
+            count: rec
+                .ended_at
+                .as_deref()
+                .map(|_| "—".to_string())
+                .unwrap_or_else(|| "·".to_string()),
+            has_unread: false,
+        });
+    }
+    app.selected_session = 0;
+
+    // Real channels list from config — every enabled channel is
+    // surfaced with a status reflecting whether the gateway is
+    // running it (in TUI mode the gateway isn't started, so all
+    // channels except cli show as 'not running').
+    app.channels = build_channels_panel(&config);
+
+    app.chat = vec![ChatLine::System {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body: format!(
+            "session resumed · model {} · {} prior sessions · ready",
+            if config.provider.model.is_empty() {
+                "default"
+            } else {
+                &config.provider.model
+            },
+            prior_sessions.len()
+        ),
+    }];
+    let app = std::sync::Arc::new(parking_lot::Mutex::new(app));
+
+    // Build the agent with the TUI bridge wired in as callbacks.
+    let (bridge, mut event_rx) = TuiBridge::new(app.clone());
+    let bridge_handle: fennec::agent::callbacks::CallbacksHandle =
+        std::sync::Arc::new(bridge);
+    let (agent, _memory, _cron_origin, _pending_replies, _chat_directory, _provider) =
+        build_agent_with_callbacks(
+            &config,
+            &home_dir,
+            model_override,
+            None,
+            Some(bridge_handle),
+            None,
+        )
+        .await?;
+    let agent = std::sync::Arc::new(tokio::sync::Mutex::new(agent));
+
+    // Drain task: consume agent events, mutate app state. Runs on
+    // the same runtime as the agent itself; the renderer reads
+    // app state under its own parking_lot mutex on the main
+    // thread.
+    let drain_app = app.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = event_rx.recv().await {
+            apply_tui_event(&drain_app, ev);
+        }
+    });
+
+    // Submit-handler task: watches the input editor for new
+    // history entries (each Enter records one) and routes them
+    // either to the slash-command registry or to a fresh agent
+    // turn. Polling is intentional — the TUI's render loop runs
+    // synchronously on the main thread so we can't share a
+    // tokio mpsc with it without extra plumbing.
+    let registry = std::sync::Arc::new(fennec::tui::commands::CommandRegistry::with_builtins());
+    let submit_app = app.clone();
+    let submit_agent = agent.clone();
+    let submit_store = session_store_handle.clone();
+    let submit_config = config.clone();
+    let submit_home = home_dir.clone();
+    let submit_handle = tokio::spawn(async move {
+        let mut last_submitted: Option<String> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let pending = {
+                let guard = submit_app.lock();
+                if guard.should_quit {
+                    return;
+                }
+                guard.input.history.front().cloned()
+            };
+            let prompt = match pending {
+                Some(p) if last_submitted.as_ref() != Some(&p) => p,
+                _ => continue,
+            };
+            last_submitted = Some(prompt.clone());
+
+            // Slash command? Run it through the registry under
+            // the app lock briefly, then handle any AgentAction
+            // outcome with the agent lock released.
+            if let Some((name, args)) = fennec::tui::commands::parse(&prompt) {
+                let outcome = {
+                    let mut guard = submit_app.lock();
+                    registry.dispatch(name, args, &mut guard).unwrap_or_else(|e| {
+                        fennec::tui::commands::CommandOutcome::Status(format!("error: {e}"))
+                    })
+                };
+                handle_command_outcome(
+                    outcome,
+                    &submit_app,
+                    &submit_agent,
+                    submit_store.as_ref(),
+                    &submit_config,
+                    &submit_home,
+                )
+                .await;
+                continue;
+            }
+
+            // Plain text — run as an agent turn (streaming, so
+            // text deltas + tool events surface live in the TUI).
+            // After the turn drains, replay the freshly-appended
+            // history slice into the SessionStore so /resume can
+            // restore it later.
+            let session_id = submit_app.lock().current_session_id.clone();
+            let mut agent_guard = submit_agent.lock().await;
+            let history_before = agent_guard.history_len();
+            let _ = agent_guard.turn_streaming(&prompt).await;
+            let appended: Vec<_> = agent_guard
+                .history_slice(history_before)
+                .iter()
+                .cloned()
+                .collect();
+            drop(agent_guard);
+            if let (Some(store), Some(sid)) = (submit_store.as_ref(), session_id) {
+                for msg in &appended {
+                    let role = msg.role.as_str();
+                    let content = msg.content.clone().unwrap_or_default();
+                    let tool_calls_json = msg.tool_calls.as_ref().and_then(|tcs| {
+                        // Persist as JSON so resume can reconstruct
+                        // the structured ToolCall list. Skip on
+                        // empty array — no point recording "this
+                        // assistant turn requested zero tools."
+                        if tcs.is_empty() {
+                            None
+                        } else {
+                            serde_json::to_string(tcs).ok()
+                        }
+                    });
+                    // Empty content is fine for assistant messages
+                    // that ONLY contain tool_calls (no preamble
+                    // text), and for tool-result rows that
+                    // genuinely return empty output. Skip only
+                    // when there's literally nothing to record:
+                    // no content AND no tool structure.
+                    if content.is_empty() && tool_calls_json.is_none() && msg.tool_call_id.is_none()
+                    {
+                        continue;
+                    }
+                    if let Err(e) = store
+                        .add_message_full(
+                            &sid,
+                            role,
+                            &content,
+                            tool_calls_json.as_deref(),
+                            msg.tool_call_id.as_deref(),
+                        )
+                        .await
+                    {
+                        tracing::warn!("session store add_message failed: {e}");
+                    }
+                }
+            }
+        }
+    });
+
+    // Voice transcription polling task: when /voice off has
+    // queued a WAV file, transcribe it via the user-configured
+    // OpenAI Whisper key (same key the agent's
+    // TranscribeAudioTool uses) and deliver the text back into
+    // the TUI's input box on the next tick.
+    let voice_app = app.clone();
+    let voice_config = config.clone();
+    let voice_home = home_dir.clone();
+    let voice_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let pending = {
+                let guard = voice_app.lock();
+                if guard.should_quit {
+                    return;
+                }
+                guard.voice.take_pending_wav()
+            };
+            let Some(path) = pending else { continue };
+            // Build a transcription tool on demand. The OpenAI
+            // key is resolved the same way the agent's tool does
+            // (config.api_key first, then OPENAI_API_KEY env).
+            let key = fennec::tools::voice_tool::resolve_openai_key(
+                &voice_config.provider.name,
+                &voice_config.provider.api_key,
+            );
+            if key.is_empty() {
+                voice_app.lock().voice.deliver_error(
+                    "OPENAI_API_KEY not set; cannot transcribe".into(),
+                );
+                continue;
+            }
+            let _ = voice_home.clone(); // reserved for future cache-dir use
+            let tool =
+                match fennec::tools::voice_tool::TranscribeAudioTool::new_with_key(
+                    key,
+                    None,
+                ) {
+                    Some(t) => t,
+                    None => {
+                        voice_app.lock().voice.deliver_error(
+                            "transcription tool init failed".into(),
+                        );
+                        continue;
+                    }
+                };
+            // The tool expects a JSON arg payload with `path`.
+            let args = serde_json::json!({ "path": path.to_string_lossy() });
+            use fennec::tools::traits::Tool;
+            match tool.execute(args).await {
+                Ok(result) => {
+                    if result.success {
+                        voice_app.lock().voice.deliver_transcription(result.output);
+                    } else {
+                        voice_app.lock().voice.deliver_error(format!(
+                            "transcribe: {}",
+                            result.error.unwrap_or(result.output)
+                        ));
+                    }
+                }
+                Err(e) => voice_app
+                    .lock()
+                    .voice
+                    .deliver_error(format!("transcribe: {e}")),
+            }
+        }
+    });
+
+    // Run the renderer (blocks until the user quits).
+    let result = fennec::tui::run(app.clone());
+
+    // Mark the active session ended (if persistence is on) so
+    // the sessions list shows a clean ended_at instead of a
+    // dangling "in progress" row. Failure here is non-fatal —
+    // the chat data is already on disk from the per-turn
+    // persistence loop above.
+    let exit_session_id = app.lock().current_session_id.clone();
+    if let (Some(store), Some(sid)) = (session_store_handle.as_ref(), exit_session_id) {
+        if let Err(e) = store.end_session(&sid, None).await {
+            tracing::warn!("end_session failed for {sid}: {e}");
+        }
+    }
+
+    // Cleanly stop background tasks.
+    {
+        let mut guard = app.lock();
+        guard.should_quit = true;
+    }
+    submit_handle.abort();
+    voice_handle.abort();
+
+    result
+}
+
+/// Build the TUI's CHANNELS panel from the running config.
+/// The gateway isn't started in `--tui` mode so non-CLI channels
+/// show as "not running" — when fennec gateway is active in a
+/// separate process the user would still see them as "available"
+/// rather than "connected" (live channel-manager wiring is out
+/// of scope for F1-1; that's a richer integration that needs
+/// a shared bus across the gateway and TUI processes, which
+/// belongs to F2's dashboard work).
+fn build_channels_panel(config: &FennecConfig) -> Vec<fennec::tui::app::ChannelState> {
+    use fennec::tui::app::{ChannelConnState, ChannelState};
+    let mut out = vec![ChannelState {
+        code: "$ ".into(),
+        name: "cli".into(),
+        state: ChannelConnState::Attached,
+        detail: "this session".into(),
+    }];
+    let cs = &config.channels;
+    if cs.telegram.enabled {
+        out.push(ChannelState {
+            code: "TG".into(),
+            name: "telegram".into(),
+            state: ChannelConnState::Idle,
+            detail: "configured".into(),
+        });
+    }
+    if cs.discord.enabled {
+        out.push(ChannelState {
+            code: "DC".into(),
+            name: "discord".into(),
+            state: ChannelConnState::Idle,
+            detail: "configured".into(),
+        });
+    }
+    if cs.slack.enabled {
+        out.push(ChannelState {
+            code: "SL".into(),
+            name: "slack".into(),
+            state: ChannelConnState::Idle,
+            detail: "configured".into(),
+        });
+    }
+    if cs.whatsapp.enabled {
+        out.push(ChannelState {
+            code: "WA".into(),
+            name: "whatsapp".into(),
+            state: ChannelConnState::Idle,
+            detail: "configured".into(),
+        });
+    }
+    if cs.email.enabled {
+        out.push(ChannelState {
+            code: "@ ".into(),
+            name: "email".into(),
+            state: ChannelConnState::Idle,
+            detail: format!("imap.{}", first_dot_segment(&cs.email.imap_host)),
+        });
+    }
+    out
+}
+
+/// Map a channel name (as stored in `SessionRecord.channel`) to
+/// the (code, who) pair the sessions panel renders.
+fn channel_label(channel: &str) -> (String, String) {
+    match channel {
+        "cli" | "" => ("$ ".into(), "local".into()),
+        "telegram" => ("TG".into(), "telegram".into()),
+        "discord" => ("DC".into(), "discord".into()),
+        "slack" => ("SL".into(), "slack".into()),
+        "signal" => ("SG".into(), "signal".into()),
+        "matrix" => ("MX".into(), "matrix".into()),
+        "whatsapp" => ("WA".into(), "whatsapp".into()),
+        "email" => ("@ ".into(), "email".into()),
+        other => ("? ".into(), other.to_string()),
+    }
+}
+
+fn short_id(s: &str) -> String {
+    s.chars().take(8).collect()
+}
+
+fn first_dot_segment(s: &str) -> String {
+    s.split('.').next().unwrap_or(s).to_string()
+}
+
+/// Apply a `CommandOutcome` to the app state and (if needed)
+/// dispatch the queued `AgentAction` against the agent. Lives
+/// here rather than inside the registry because executing
+/// agent operations needs both the parking_lot app mutex and
+/// the tokio agent mutex; the registry is sync.
+async fn handle_command_outcome(
+    outcome: fennec::tui::commands::CommandOutcome,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    session_store: Option<&std::sync::Arc<fennec::sessions::SessionStore>>,
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) {
+    use fennec::tui::commands::{AgentAction, CommandOutcome};
+    match outcome {
+        CommandOutcome::Quit => {
+            app.lock().should_quit = true;
+        }
+        CommandOutcome::Text(body) => {
+            let mut guard = app.lock();
+            guard.chat.push(fennec::tui::app::ChatLine::System {
+                time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                body,
+            });
+        }
+        CommandOutcome::Status(msg) => {
+            app.lock().set_status(msg);
+        }
+        CommandOutcome::Unknown(name) => {
+            app.lock().set_status(format!("unknown command: /{name}"));
+        }
+        CommandOutcome::NotImplemented(name) => {
+            app.lock()
+                .set_status(format!("/{name}: not yet implemented"));
+        }
+        CommandOutcome::Agent(action) => match action {
+            AgentAction::Clear => {
+                let mut guard = agent.lock().await;
+                guard.clear_history();
+            }
+            AgentAction::Undo => {
+                handle_undo(app, agent).await;
+            }
+            AgentAction::Retry => {
+                handle_retry(app, agent).await;
+            }
+            AgentAction::Steer(note) => {
+                handle_steer(note, app, agent).await;
+            }
+            AgentAction::Run(prompt) => {
+                let mut guard = agent.lock().await;
+                let _ = guard.turn(&prompt).await;
+            }
+            AgentAction::ShowUsage => {
+                let snapshot = {
+                    let guard = agent.lock().await;
+                    guard.token_usage()
+                };
+                let body = fennec::tui::usage_panel::render(&snapshot);
+                let mut guard = app.lock();
+                guard.chat.push(fennec::tui::app::ChatLine::System {
+                    time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                    body,
+                });
+            }
+            AgentAction::SessionTitle(payload) => {
+                handle_session_title(payload, app, session_store).await;
+            }
+            AgentAction::SessionResume(target) => {
+                handle_session_resume(target, app, agent, session_store).await;
+            }
+            AgentAction::SwitchModel(payload) => {
+                handle_switch_model(payload, app, agent, config, home_dir).await;
+            }
+            AgentAction::ToolsToggle(payload) => {
+                handle_tools_toggle(payload, app, agent, config, home_dir).await;
+            }
+            AgentAction::ReloadEnv => {
+                handle_reload_env(app, home_dir);
+            }
+            AgentAction::ReloadMcp => {
+                handle_reload_mcp(app);
+            }
+            AgentAction::AttachImage(path) => {
+                handle_attach_image(path, app, agent).await;
+            }
+            AgentAction::PasteClipboardImage => {
+                handle_paste_clipboard(app, agent, home_dir).await;
+            }
+            AgentAction::CopyAssistantMessage(n) => {
+                handle_copy_assistant(n, app);
+            }
+            AgentAction::PersistTuiSettings => {
+                handle_persist_tui_settings(app, config, home_dir);
+            }
+        },
+    }
+}
+
+/// `/title` worker — reads or writes the current session's
+/// title via the SessionStore. `payload = None` reads, `Some`
+/// writes. Mirrors Hermes' `session.title` RPC: read returns
+/// "title: <name>" or "no title set"; write returns "session
+/// title set: <name>" with an optional "(queued while session
+/// initializes)" suffix when the row hasn't been created yet.
+async fn handle_session_title(
+    payload: Option<String>,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    store: Option<&std::sync::Arc<fennec::sessions::SessionStore>>,
+) {
+    let (sid, current_title) = {
+        let guard = app.lock();
+        (
+            guard.current_session_id.clone(),
+            guard.current_session_title.clone(),
+        )
+    };
+    let body = match (sid.as_deref(), store, payload) {
+        (None, _, _) | (_, None, _) => "no active session".to_string(),
+        (Some(_), Some(_), None) => match current_title {
+            Some(t) if !t.is_empty() => format!("title: {t}"),
+            _ => "no title set".to_string(),
+        },
+        (Some(sid), Some(store), Some(new_title)) => {
+            match store.set_session_title(sid, &new_title).await {
+                Ok(0) => format!(
+                    "session title set: {new_title} (queued while session initializes)"
+                ),
+                Ok(_) => {
+                    app.lock().current_session_title = if new_title.trim().is_empty() {
+                        None
+                    } else {
+                        Some(new_title.trim().to_string())
+                    };
+                    format!("session title set: {}", new_title.trim())
+                }
+                Err(e) => format!("title write failed: {e}"),
+            }
+        }
+    };
+    let mut guard = app.lock();
+    guard.chat.push(fennec::tui::app::ChatLine::System {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body,
+    });
+}
+
+/// `/resume` worker — looks up the target session by id, then
+/// by exact title, fetches its message history, and replays
+/// it into the agent. Mirrors Hermes' `session.resume`
+/// (`tui_gateway/server.py:2180-2221`): reset agent, load
+/// messages as conversation, re-emit a system line so the
+/// chat shows what was loaded. Empty store / unknown id
+/// produce informative error lines.
+async fn handle_session_resume(
+    target: String,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    store: Option<&std::sync::Arc<fennec::sessions::SessionStore>>,
+) {
+    let Some(store) = store else {
+        let mut guard = app.lock();
+        guard.chat.push(fennec::tui::app::ChatLine::System {
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+            body: "session store unavailable — cannot resume".into(),
+        });
+        return;
+    };
+    let record = match store.get_session(&target).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            let mut guard = app.lock();
+            guard.chat.push(fennec::tui::app::ChatLine::System {
+                time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                body: format!("session not found: {target}"),
+            });
+            return;
+        }
+        Err(e) => {
+            let mut guard = app.lock();
+            guard.chat.push(fennec::tui::app::ChatLine::System {
+                time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                body: format!("session lookup failed: {e}"),
+            });
+            return;
+        }
+    };
+    let messages = match store.get_session_messages(&record.id).await {
+        Ok(m) => m,
+        Err(e) => {
+            let mut guard = app.lock();
+            guard.chat.push(fennec::tui::app::ChatLine::System {
+                time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                body: format!("loading messages failed: {e}"),
+            });
+            return;
+        }
+    };
+
+    // Translate stored messages back into full ChatMessage
+    // form, including the tool-call structure. Assistant rows
+    // with persisted tool_calls JSON re-attach the parsed
+    // Vec<ToolCall>; tool-result rows preserve their
+    // tool_call_id so the provider can match them back to the
+    // originating call. Rows that fail to deserialise (corrupt
+    // JSON from a hand-edited db) fall back to text-only
+    // replay rather than dropping the message entirely.
+    use fennec::providers::traits::{ChatMessage, ToolCall};
+    let chat_messages: Vec<ChatMessage> = messages
+        .iter()
+        .filter_map(|m| match m.role.as_str() {
+            "user" => Some(ChatMessage::user(&m.content)),
+            "assistant" => {
+                let mut msg = ChatMessage::assistant(&m.content);
+                if let Some(json) = m.tool_calls.as_deref() {
+                    match serde_json::from_str::<Vec<ToolCall>>(json) {
+                        Ok(tcs) if !tcs.is_empty() => msg.tool_calls = Some(tcs),
+                        Ok(_) => {} // empty array — leave as text-only
+                        Err(e) => tracing::warn!(
+                            "could not parse persisted tool_calls JSON for resumed assistant message: {e}"
+                        ),
+                    }
+                }
+                Some(msg)
+            }
+            "tool" => {
+                // Tool result rows. Preserve the tool_call_id so
+                // the provider serializer can match the result
+                // back to the assistant's tool_calls entry — a
+                // mismatched id makes the next turn's request
+                // bail on the API side.
+                let id = m.tool_call_id.as_deref().unwrap_or("");
+                Some(ChatMessage::tool_result(id, &m.content))
+            }
+            "system" => Some(ChatMessage::system(&m.content)),
+            _ => None,
+        })
+        .collect();
+    let count = chat_messages.len();
+    {
+        let mut g = agent.lock().await;
+        g.replace_history(chat_messages);
+    }
+
+    // Mutate app state to reflect the new session, then push a
+    // confirmation system message into the chat scrollback.
+    let mut guard = app.lock();
+    guard.current_session_id = Some(record.id.clone());
+    guard.current_session_title = record.title.clone();
+    let title_label = record
+        .title
+        .clone()
+        .unwrap_or_else(|| short_id(&record.id));
+    guard.chat.push(fennec::tui::app::ChatLine::System {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body: format!("resumed: {title_label} ({count} messages)"),
+    });
+}
+
+/// `/model` worker — read or write the active provider's
+/// model. `payload = None` renders an inline panel showing
+/// the current model + the snapshot of known models so the
+/// user can pick one. `Some(name)` rebuilds the provider with
+/// the new model, swaps it on the live agent, and confirms.
+///
+/// Mid-turn swap is rejected (matching Hermes'
+/// `_apply_model_switch` at server.py:1067-1145, which raises
+/// "session busy"). Detection here is a `try_lock` on the
+/// agent's tokio mutex — if it's held, a turn is in flight.
+async fn handle_switch_model(
+    payload: Option<String>,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) {
+    use fennec::agent::pricing;
+
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let push = |body: String, app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>| {
+        let mut g = app.lock();
+        g.chat.push(fennec::tui::app::ChatLine::System {
+            time: now.clone(),
+            body,
+        });
+    };
+
+    match payload {
+        None => {
+            // Read path: snapshot the active model and render the
+            // known-models list inline. No agent mutation.
+            let current = {
+                let guard = agent.lock().await;
+                guard.provider().model().to_string()
+            };
+            let current_label = if current.is_empty() {
+                "(unknown)".to_string()
+            } else {
+                current
+            };
+            let known: Vec<&'static str> = pricing::known_models();
+            let mut body = format!("Active model: {current_label}\nKnown models:\n");
+            for m in &known {
+                body.push_str(&format!("  · {m}\n"));
+            }
+            body.push_str("\nUse /model <name> to switch live (rejected mid-turn).");
+            push(body.trim_end().to_string(), app);
+        }
+        Some(new_model) => {
+            // Write path: reject if the agent is mid-turn, then
+            // rebuild + swap the provider. The new provider Arc
+            // also surfaces the new model in /usage's pricing
+            // lookup automatically since `provider().model()` is
+            // the source of truth.
+            let mut agent_lock = match agent.try_lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    push(
+                        "session busy — finish the current turn before /model".to_string(),
+                        app,
+                    );
+                    return;
+                }
+            };
+            let provider = match resolve_provider_with_model(config, home_dir, &new_model) {
+                Ok(p) => p,
+                Err(e) => {
+                    drop(agent_lock);
+                    push(format!("model swap failed: {e}"), app);
+                    return;
+                }
+            };
+            agent_lock.set_provider(provider);
+            drop(agent_lock);
+            // Persist the new model to disk so the change survives
+            // a restart, mirroring Hermes' `_persist_model_switch`.
+            // A failure here is non-fatal — the live agent already
+            // has the swap applied; we just warn the user.
+            let mut persisted = config.clone();
+            persisted.provider.model = new_model.clone();
+            let config_path = home_dir.join("config.toml");
+            let persist_msg = match persisted.save(&config_path) {
+                Ok(()) => format!("model → {new_model}"),
+                Err(e) => format!(
+                    "model → {new_model} (in-memory only; config.toml save failed: {e})"
+                ),
+            };
+            push(persist_msg, app);
+        }
+    }
+}
+
+/// `/tools` worker — list every registered tool with its
+/// enabled/disabled status, or toggle the listed names. After
+/// any toggle, persist the new disabled set to
+/// `~/.fennec/config.toml` and clear the agent's chat history
+/// (matching Hermes' `_reset_session_agent` behavior on
+/// tools.configure: previously-fired tool_calls in history
+/// would otherwise reference tools the model can no longer
+/// invoke). Mid-turn toggles are rejected.
+async fn handle_tools_toggle(
+    payload: Option<(bool, Vec<String>)>,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let push = |body: String, app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>| {
+        let mut g = app.lock();
+        g.chat.push(fennec::tui::app::ChatLine::System {
+            time: now.clone(),
+            body,
+        });
+    };
+
+    match payload {
+        None => {
+            // List path — read-only, no agent mutation.
+            let guard = agent.lock().await;
+            let mut names = guard.tool_names();
+            names.sort();
+            let mut body = String::from("Tools\n");
+            for n in &names {
+                let mark = if guard.is_tool_enabled(n) { "✓" } else { "✗" };
+                body.push_str(&format!("  {mark} {n}\n"));
+            }
+            body.push_str("\nUse /tools enable|disable <name> to toggle.");
+            drop(guard);
+            push(body.trim_end().to_string(), app);
+        }
+        Some((enable, requested)) => {
+            // Write path — try-lock, mutate, persist, clear history.
+            let mut agent_lock = match agent.try_lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    push(
+                        "session busy — finish the current turn before /tools".to_string(),
+                        app,
+                    );
+                    return;
+                }
+            };
+            let mut changed: Vec<String> = Vec::new();
+            let mut unknown: Vec<String> = Vec::new();
+            for n in &requested {
+                if agent_lock.set_tool_enabled(n, enable) {
+                    changed.push(n.clone());
+                } else if !agent_lock
+                    .tool_names()
+                    .iter()
+                    .any(|t| t == n)
+                {
+                    unknown.push(n.clone());
+                }
+                // If the tool exists but is already in the requested
+                // state, set_tool_enabled returns false — no error,
+                // just no-op (matches Hermes' silent idempotence).
+            }
+            // Capture the new disabled set for persistence.
+            let new_disabled = agent_lock.disabled_tool_names();
+            // Tool change must clear chat history (Hermes' behavior).
+            if !changed.is_empty() {
+                agent_lock.clear_history();
+            }
+            drop(agent_lock);
+
+            // Persist. Best-effort.
+            let mut persisted = config.clone();
+            persisted.tools.disabled = new_disabled;
+            let path = home_dir.join("config.toml");
+            if let Err(e) = persisted.save(&path) {
+                tracing::warn!("config save failed after /tools toggle: {e}");
+            }
+
+            // Reset visible chat history too so the user sees the
+            // reset Hermes also performs.
+            if !changed.is_empty() {
+                let mut g = app.lock();
+                g.chat.clear();
+                g.in_flight_bot_idx = None;
+                g.live_tool = None;
+            }
+
+            let action = if enable { "enabled" } else { "disabled" };
+            let mut body = String::new();
+            if !changed.is_empty() {
+                body.push_str(&format!("{action} {}\n", changed.join(", ")));
+                body.push_str("session reset. new tool configuration is active.");
+            } else {
+                body.push_str(&format!("nothing to {action} (already in that state)"));
+            }
+            if !unknown.is_empty() {
+                body.push_str(&format!("\nunknown tools: {}", unknown.join(", ")));
+            }
+            push(body, app);
+        }
+    }
+}
+
+/// `/reload` worker — re-read `~/.fennec/.env` into the
+/// running process. Newly-set keys take effect on the next
+/// provider call without a restart. Already-built provider
+/// Arcs keep their cached credentials, same as Hermes (which
+/// docstrings this same caveat at server.py:4147-4165).
+fn handle_reload_env(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    home_dir: &std::path::Path,
+) {
+    let env_path = home_dir.join(".env");
+    let body = match fennec::auth_env::reload_env_file(&env_path) {
+        Ok(0) if !env_path.exists() => {
+            format!("no .env file at {}", env_path.display())
+        }
+        Ok(n) => {
+            let noun = if n == 1 { "var" } else { "vars" };
+            format!("reloaded .env ({n} {noun} updated)")
+        }
+        Err(e) => format!("reload failed: {e}"),
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body,
+    });
+}
+
+/// Persist the App's TUI display state (compact, details) into
+/// `~/.fennec/config.toml` so toggles survive a restart. Called
+/// by `/compact` and `/details` after they mutate the live
+/// state. Failure is logged but doesn't surface to the user —
+/// the in-memory toggle already took effect.
+fn handle_persist_tui_settings(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    config: &FennecConfig,
+    home_dir: &std::path::Path,
+) {
+    let (compact, details) = {
+        let g = app.lock();
+        (g.compact_mode, g.details_mode.as_str().to_string())
+    };
+    let mut persisted = config.clone();
+    persisted.tui.compact = compact;
+    persisted.tui.details = details;
+    let path = home_dir.join("config.toml");
+    if let Err(e) = persisted.save(&path) {
+        tracing::warn!("config save failed after TUI settings change: {e}");
+    }
+}
+
+/// `/steer` worker — queue text on the agent so it's injected
+/// after the next tool batch with the "User guidance:" marker.
+/// If a turn isn't currently running (try_lock succeeds), the
+/// queued text still lands on the next tool result of whatever
+/// turn fires next, mirroring Hermes' "no active turn — queued
+/// for next" fallback (`core.ts:527-563`).
+///
+/// `/steer` itself returns immediately — actual injection
+/// happens inside `Agent::turn` / `turn_streaming`'s tool loop
+/// via `apply_pending_steer_to_tool_results`.
+async fn handle_steer(
+    note: String,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let trimmed = note.trim().to_string();
+    let body = if trimmed.is_empty() {
+        "usage: /steer <text>".to_string()
+    } else {
+        // The agent lock might be held by an in-flight turn —
+        // that's exactly the case where /steer is most useful,
+        // and Agent::steer is fine to call against a held
+        // agent because the queue is locked separately. But
+        // we still need *some* reference; use try_lock first to
+        // avoid blocking the submit task on a long-running turn.
+        let preview = truncate_for_status(&trimmed);
+        match agent.try_lock() {
+            Ok(mut g) => {
+                if g.steer(&trimmed) {
+                    format!("steer queued — arrives after next tool call: {preview}")
+                } else {
+                    "steer rejected".to_string()
+                }
+            }
+            Err(_) => {
+                // Turn is mid-flight. We still want the steer to
+                // land — fall back to a non-blocking lock that
+                // suspends the submit task briefly. Hermes' RPC
+                // path takes the agent lock unconditionally, same
+                // shape.
+                let mut g = agent.lock().await;
+                if g.steer(&trimmed) {
+                    format!("steer queued — arrives after next tool call: {preview}")
+                } else {
+                    "steer rejected".to_string()
+                }
+            }
+        }
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: now,
+        body,
+    });
+}
+
+/// `/undo` worker — drop the last user / assistant exchange
+/// from the agent's history. Mid-turn rejection via try_lock
+/// matches Hermes' "session busy" guard at server.py:2424-2449.
+/// The chat-side cleanup (popping ChatLines) was done by the
+/// command handler before we got here.
+async fn handle_undo(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let body = {
+        let mut agent_lock = match agent.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                let mut g = app.lock();
+                g.chat.push(fennec::tui::app::ChatLine::System {
+                    time: now,
+                    body: "session busy — finish the current turn before /undo".into(),
+                });
+                return;
+            }
+        };
+        match agent_lock.pop_last_turn() {
+            Some((n, _user_text)) => {
+                let plural = if n == 1 { "message" } else { "messages" };
+                format!("undid {n} {plural}")
+            }
+            None => "nothing to undo".to_string(),
+        }
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: now,
+        body,
+    });
+}
+
+/// `/retry` worker — pop the last user / assistant exchange,
+/// then re-submit the user message as a fresh streaming turn.
+/// Mid-turn rejection via try_lock. If there's no prior user
+/// message to retry, surfaces "nothing to retry" rather than
+/// silently no-op (matches Hermes' core.ts:587-610).
+async fn handle_retry(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let push = |body: String, app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>| {
+        let mut g = app.lock();
+        g.chat.push(fennec::tui::app::ChatLine::System {
+            time: now.clone(),
+            body,
+        });
+    };
+
+    // Pop + capture the user text under the agent lock, then
+    // drop the lock so turn_streaming can take it back for the
+    // re-run.
+    let user_text = {
+        let mut agent_lock = match agent.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                push(
+                    "session busy — finish the current turn before /retry".into(),
+                    app,
+                );
+                return;
+            }
+        };
+        match agent_lock.pop_last_turn() {
+            Some((_n, text)) => text,
+            None => {
+                drop(agent_lock);
+                push("nothing to retry".into(), app);
+                return;
+            }
+        }
+    };
+
+    push(format!("retrying: {}", truncate_for_status(&user_text)), app);
+    // Re-submit. We hold the agent lock for the full streaming
+    // turn so concurrent commands wait — same as the regular
+    // submit path.
+    let mut agent_lock = agent.lock().await;
+    let _ = agent_lock.turn_streaming(&user_text).await;
+}
+
+fn truncate_for_status(s: &str) -> String {
+    const MAX: usize = 60;
+    let mut iter = s.chars();
+    let head: String = iter.by_ref().take(MAX).collect();
+    if iter.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// `/paste` worker — read an image from the OS clipboard, save
+/// as PNG under `~/.fennec/clipboard/clip-YYYYMMDD-HHMMSS.png`,
+/// and queue it on the agent the same way `/image` does. Pure
+/// text paste isn't handled here because the user's terminal
+/// already gets that for free via Cmd-V / Ctrl-Shift-V into
+/// the input box.
+async fn handle_paste_clipboard(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+    home_dir: &std::path::Path,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let push = |body: String, app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>| {
+        let mut g = app.lock();
+        g.chat.push(fennec::tui::app::ChatLine::System {
+            time: now.clone(),
+            body,
+        });
+    };
+
+    // arboard's Clipboard::new is sync + can block briefly on
+    // Linux X11. Run on a blocking pool so the submit task's
+    // tokio runtime stays responsive.
+    let read_result =
+        tokio::task::spawn_blocking(fennec::tui::clipboard::read_image_rgba).await;
+    let img = match read_result {
+        Ok(Ok(img)) => img,
+        Ok(Err(e)) => {
+            push(format!("paste failed: {e}"), app);
+            return;
+        }
+        Err(e) => {
+            push(format!("paste failed (join error): {e}"), app);
+            return;
+        }
+    };
+
+    let target_dir = home_dir.join("clipboard");
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let target = target_dir.join(format!("clip-{stamp}.png"));
+    if let Err(e) = img.write_png(&target) {
+        push(format!("paste failed: {e}"), app);
+        return;
+    }
+
+    // Reuse the /image attach path so dimensions, token estimate,
+    // and message echoing all match the keyboard /image command.
+    let body = {
+        let mut guard = agent.lock().await;
+        match guard.attach_image(&target) {
+            Ok(att) => {
+                let queued = guard.pending_attachment_count();
+                let dims = match (att.width, att.height) {
+                    (Some(w), Some(h)) => format!("{w}×{h}"),
+                    _ => "?".to_string(),
+                };
+                let tokens = att
+                    .token_estimate
+                    .map(|t| format!("{t} tokens"))
+                    .unwrap_or_else(|| "size unknown".to_string());
+                format!(
+                    "📎 pasted: {name} · {dims} · ~{tokens} · {queued} pending",
+                    name = att.display_name,
+                )
+            }
+            Err(e) => format!("paste attach failed: {e}"),
+        }
+    };
+    push(body, app);
+}
+
+/// `/copy` worker — copy the Nth assistant message (1-indexed,
+/// or the last when `None`) to the OS clipboard via arboard.
+/// Falls back to OSC52 escape on failure (SSH sessions and
+/// sandboxed terminals). Empty chat → "nothing to copy".
+fn handle_copy_assistant(
+    n: Option<usize>,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let body = {
+        let bots: Vec<String> = {
+            let guard = app.lock();
+            guard
+                .chat
+                .iter()
+                .filter_map(|l| match l {
+                    fennec::tui::app::ChatLine::Bot { body, .. } => Some(body.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        if bots.is_empty() {
+            "nothing to copy — no assistant messages yet".to_string()
+        } else {
+            let idx = match n {
+                None => bots.len() - 1,
+                Some(v) => v.saturating_sub(1).min(bots.len() - 1),
+            };
+            let target = bots[idx].clone();
+            match fennec::tui::clipboard::write_with_fallback(&target) {
+                fennec::tui::clipboard::CopyResult::Native => {
+                    format!(
+                        "copied message {}/{} to clipboard",
+                        idx + 1,
+                        bots.len()
+                    )
+                }
+                fennec::tui::clipboard::CopyResult::Osc52 => {
+                    format!(
+                        "sent OSC52 copy sequence (terminal must honor it) — message {}/{}",
+                        idx + 1,
+                        bots.len()
+                    )
+                }
+                fennec::tui::clipboard::CopyResult::Failed => {
+                    "copy failed: native clipboard + OSC52 both unavailable".to_string()
+                }
+            }
+        }
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: now,
+        body,
+    });
+}
+
+/// `/image` worker — load + base64-encode the file, queue it
+/// on the agent for the next user turn, and echo metadata back
+/// to the chat (filename, dimensions, token estimate). Mirrors
+/// Hermes' image.attach RPC (`tui_gateway/server.py:3361-3401`).
+async fn handle_attach_image(
+    path: std::path::PathBuf,
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    agent: &std::sync::Arc<tokio::sync::Mutex<fennec::agent::Agent>>,
+) {
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let body = {
+        let mut guard = agent.lock().await;
+        match guard.attach_image(&path) {
+            Ok(att) => {
+                let queued = guard.pending_attachment_count();
+                let dims = match (att.width, att.height) {
+                    (Some(w), Some(h)) => format!("{w}×{h}"),
+                    _ => "?".to_string(),
+                };
+                let tokens = att
+                    .token_estimate
+                    .map(|t| format!("{t} tokens"))
+                    .unwrap_or_else(|| "size unknown".to_string());
+                format!(
+                    "📎 attached: {name} · {dims} · ~{tokens} · {queued} pending",
+                    name = att.display_name,
+                )
+            }
+            Err(e) => format!("attach failed: {e}"),
+        }
+    };
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: now,
+        body,
+    });
+}
+
+/// `/reload_mcp` worker — Hermes calls
+/// `shutdown_mcp_servers` + `discover_mcp_tools` against the
+/// active session's MCP clients. Fennec's agent doesn't
+/// currently boot MCP clients (the `mcp` module exists but
+/// isn't wired into `build_agent_with_callbacks`), so the
+/// honest behavior is to surface that state rather than fake
+/// a reload. When MCP wiring lands, swap this body for a real
+/// rescan.
+fn handle_reload_mcp(app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>) {
+    let body = "no MCP servers loaded in this build — MCP client wiring \
+                attaches in the upcoming MCP-integration PR; /reload_mcp \
+                will rescan once that's in place"
+        .to_string();
+    let mut g = app.lock();
+    g.chat.push(fennec::tui::app::ChatLine::System {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        body,
+    });
+}
+
+/// Apply a single `TuiEvent` to the app state. Called from the
+/// drain task; runs under the parking_lot mutex briefly.
+fn apply_tui_event(
+    app: &std::sync::Arc<parking_lot::Mutex<fennec::tui::App>>,
+    ev: fennec::tui::callbacks::TuiEvent,
+) {
+    use fennec::tui::app::{ChatLine, LiveTool, ToolHistoryEntry};
+    use fennec::tui::callbacks::TuiEvent;
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    let mut guard = app.lock();
+    match ev {
+        TuiEvent::TurnStart(prompt) => {
+            guard.chat.push(ChatLine::User {
+                time: now,
+                body: prompt,
+            });
+            guard.finalize_bot_message();
+        }
+        TuiEvent::TurnComplete(summary) => {
+            // If streaming was active, the in-flight bot message
+            // already contains the full text — just close it. If
+            // streaming wasn't used (e.g. the non-streaming
+            // `turn()` path), the bot reply hasn't been pushed
+            // yet, so push it now.
+            match guard.in_flight_bot_idx {
+                Some(_) => {
+                    guard.finalize_bot_message();
+                }
+                None if !summary.is_empty() => {
+                    guard.chat.push(ChatLine::Bot {
+                        time: now,
+                        body: summary,
+                    });
+                }
+                _ => {}
+            }
+            guard.live_tool = None;
+        }
+        TuiEvent::TextDelta(delta) => {
+            guard.append_bot_delta(&delta);
+        }
+        TuiEvent::ReasoningDelta(_delta) => {
+            // Reasoning rendering — F1-1 ships text streaming,
+            // reasoning-block rendering (the dim "thinking…" panel
+            // upstream shows above the reply) lands in F1-2.
+        }
+        TuiEvent::ToolStart(s) => {
+            // A tool call breaks the streaming continuity — close
+            // the in-flight bot message so the next text delta
+            // (after the tool result) starts a fresh message.
+            guard.finalize_bot_message();
+            let started = std::time::Instant::now();
+            guard.chat.push(ChatLine::ToolCall {
+                call: format!("{}({})", s.name, s.preview),
+            });
+            // Inline running indicator under the tool-call line.
+            // Replaced with ToolResult on completion so the
+            // scrollback ends up as call → result, with the spinner
+            // visible only while the tool is in flight.
+            guard.chat.push(fennec::tui::app::ChatLine::ToolRunning {
+                label: "running…".into(),
+                started_at: started,
+            });
+            guard.live_tool = Some(LiveTool {
+                name: s.name,
+                args_preview: s.preview,
+                started_at: started,
+                progress: None,
+            });
+        }
+        TuiEvent::ToolProgress(p) => {
+            if let Some(ref mut lt) = guard.live_tool {
+                lt.args_preview = p.preview;
+            }
+        }
+        TuiEvent::ToolComplete(c) => {
+            let summary = c
+                .summary
+                .clone()
+                .unwrap_or_else(|| "(done)".to_string());
+            // Drop the most recent inline running indicator before
+            // pushing the result so the chat reads call → result.
+            if let Some(idx) = guard
+                .chat
+                .iter()
+                .rposition(|l| matches!(l, fennec::tui::app::ChatLine::ToolRunning { .. }))
+            {
+                guard.chat.remove(idx);
+            }
+            guard.chat.push(ChatLine::ToolResult { summary });
+            guard.recent_tools.insert(
+                0,
+                ToolHistoryEntry {
+                    ok: c.error.is_none(),
+                    name: c.name,
+                    note: format!("{}ms", c.duration_ms),
+                },
+            );
+            guard.recent_tools.truncate(8);
+            guard.live_tool = None;
+        }
+        TuiEvent::Status(msg) => {
+            guard.set_status(msg);
+        }
+    }
 }
 
 async fn run_gateway(
@@ -1786,8 +3204,12 @@ async fn main() -> Result<()> {
     let config = pre_config;
 
     match cli.command {
-        Commands::Agent { message, model } => {
-            run_agent(config, home_dir, message, model).await?;
+        Commands::Agent { message, model, tui } => {
+            if tui {
+                run_tui(config, home_dir, model).await?;
+            } else {
+                run_agent(config, home_dir, message, model).await?;
+            }
         }
         Commands::Status => {
             println!("Fennec v{}", env!("CARGO_PKG_VERSION"));

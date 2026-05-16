@@ -224,6 +224,7 @@ impl ResponseStore {
                 content: Some(r.content),
                 tool_calls: None,
                 tool_call_id: None,
+                attachments: None,
             })
             .collect())
     }
