@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
 use crate::security::PathSandbox;
 
 use super::traits::{Tool, ToolResult};
@@ -46,6 +47,12 @@ pub struct TranscribeAudioTool {
     /// Applied to the `audio_path` param before upload so a prompt-injected
     /// path like ~/.ssh/id_rsa can't be sent to OpenAI.
     sandbox: Arc<PathSandbox>,
+    /// Optional handle into the durable memory so transcripts can be
+    /// FTS5-indexed and recalled later via `memory_recall`. Wired in
+    /// `main.rs::build_agent` when memory is available; left `None` in
+    /// tests / minimal wiring. When `None`, the `index` parameter is a
+    /// silent no-op (logged at debug only).
+    memory: Option<Arc<dyn Memory>>,
 }
 
 impl TranscribeAudioTool {
@@ -59,11 +66,21 @@ impl TranscribeAudioTool {
             client,
             model: model.unwrap_or_else(|| "whisper-1".to_string()),
             sandbox: Arc::new(PathSandbox::empty()),
+            memory: None,
         })
     }
 
     pub fn with_sandbox(mut self, sandbox: Arc<PathSandbox>) -> Self {
         self.sandbox = sandbox;
+        self
+    }
+
+    /// Wire a memory backend so the agent can opt into FTS5-indexing
+    /// the transcript by passing `index: true`. Without this wiring the
+    /// `index` parameter is silently ignored (transcript still returned
+    /// in the tool output, just not stored).
+    pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        self.memory = Some(memory);
         self
     }
 }
@@ -91,6 +108,14 @@ impl Tool for TranscribeAudioTool {
                 "language": {
                     "type": "string",
                     "description": "Optional ISO-639-1 code (e.g. 'en', 'es') to help Whisper. Auto-detected if omitted."
+                },
+                "index": {
+                    "type": "boolean",
+                    "description": "Optional. Default false. When true, also store the transcript in durable memory (category 'voice_transcript') so it becomes searchable via memory_recall. Use for meeting recordings, voice notes you want to come back to. Skip for one-off transcriptions."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Optional human-readable label for the indexed transcript (only relevant when index=true). Used as the memory key; defaults to the audio file's basename."
                 }
             },
             "required": ["audio_path"]
@@ -196,9 +221,77 @@ impl Tool for TranscribeAudioTool {
             .unwrap_or("")
             .to_string();
 
+        // Optional FTS5 indexing — opt-in via the `index` param so existing
+        // transcription calls (one-off voice notes, ad-hoc transcripts) keep
+        // their current behavior byte-for-byte. When the agent decides a
+        // transcript is worth keeping (meeting recording, lecture, voice
+        // memo to self), it sets index=true and the transcript becomes
+        // searchable via `memory_recall`.
+        //
+        // Failures here are non-fatal: the transcript is still returned to
+        // the agent. We log at warn so the agent can decide what to do.
+        // Empty transcripts are not indexed (no signal, just storage cost).
+        let index_requested = args.get("index").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut output = text.clone();
+        if index_requested && !text.is_empty() {
+            match &self.memory {
+                Some(memory) => {
+                    let label = args
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .unwrap_or_else(|| {
+                            Path::new(&audio_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("voice_transcript")
+                                .to_string()
+                        });
+                    let entry = MemoryEntry {
+                        key: format!("voice:{}", label),
+                        content: text.clone(),
+                        category: MemoryCategory::Custom("voice_transcript".to_string()),
+                        ..MemoryEntry::default()
+                    };
+                    match memory.store(entry).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                key = %format!("voice:{}", label),
+                                bytes = text.len(),
+                                "Indexed voice transcript into memory"
+                            );
+                            output.push_str(&format!(
+                                "\n\n[indexed as 'voice:{}' — searchable via memory_recall]",
+                                label
+                            ));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Voice transcript indexing failed: {e}; transcript still returned to caller"
+                            );
+                            output.push_str(&format!(
+                                "\n\n[note: indexing requested but failed: {}]",
+                                e
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    tracing::debug!(
+                        "Transcribe tool got index=true but no memory backend was wired; \
+                         returning transcript without indexing"
+                    );
+                    output.push_str(
+                        "\n\n[note: indexing requested but no memory backend is wired]",
+                    );
+                }
+            }
+        }
+
         Ok(ToolResult {
             success: !text.is_empty(),
-            output: text,
+            output,
             error: None,
         })
     }
@@ -447,6 +540,99 @@ mod tests {
             .unwrap();
         assert!(!r.success);
         assert!(r.error.unwrap().contains("failed to read"));
+    }
+
+    /// The schema must advertise the new `index` and `label` parameters
+    /// so the LLM can opt into FTS5-indexing the transcript. Locks in
+    /// the contract; without these the `index` path is unreachable
+    /// because the agent has no way to know it exists.
+    #[test]
+    fn transcribe_schema_includes_index_and_label() {
+        let t = TranscribeAudioTool::new_with_key("sk-test".to_string(), None).unwrap();
+        let schema = t.parameters_schema();
+        let props = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("parameters_schema must be a JSON object with 'properties'");
+        assert!(
+            props.contains_key("index"),
+            "schema missing 'index' boolean param: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            props.contains_key("label"),
+            "schema missing 'label' string param: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        // Required list should NOT include `index` or `label` — they're
+        // optional. Existing transcription calls that don't pass them
+        // must continue to work.
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(!required.contains(&"index".to_string()));
+        assert!(!required.contains(&"label".to_string()));
+    }
+
+    /// `with_memory` plumbs an `Arc<dyn Memory>` into the tool. We can't
+    /// exercise the indexing path end-to-end without networking (the
+    /// transcription step calls the Whisper API), but we can confirm
+    /// the wiring step doesn't panic and yields a tool that still
+    /// passes all early-return validation. Captures the constructor
+    /// contract.
+    #[tokio::test]
+    async fn transcribe_with_memory_still_validates_path() {
+        let memory: Arc<dyn Memory> = Arc::new(NoopMemory);
+        let t = TranscribeAudioTool::new_with_key("sk-test".to_string(), None)
+            .unwrap()
+            .with_memory(memory);
+        let r = t.execute(json!({})).await.unwrap();
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("audio_path"));
+    }
+
+    /// Tiny no-op Memory used only to prove the wiring compiles. Every
+    /// method returns "nothing happened" so the actual indexing path
+    /// (which only runs after a successful Whisper call) is never
+    /// reached in unit tests.
+    struct NoopMemory;
+
+    #[async_trait]
+    impl Memory for NoopMemory {
+        fn name(&self) -> &str {
+            "noop"
+        }
+        async fn store(&self, _entry: MemoryEntry) -> Result<()> {
+            Ok(())
+        }
+        async fn recall(&self, _query: &str, _limit: usize) -> Result<Vec<MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn get(&self, _key: &str) -> Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _limit: usize,
+        ) -> Result<Vec<MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn forget(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self, _category: Option<&MemoryCategory>) -> Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
