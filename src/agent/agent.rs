@@ -50,22 +50,19 @@ pub struct Agent {
     /// when one is configured via `[memory] provider = "<name>"`.
     /// Empty manager (no external) preserves current behavior.
     memory_manager: Arc<crate::plugins::MemoryManager>,
-    /// Resolved Fennec home directory. Used to populate
-    /// `MemoryProviderContext::fennec_home` so providers see the
-    /// active profile's path (e.g. `~/.fennec/profiles/work`) rather
-    /// than a hardcoded `~/.fennec` — otherwise `--profile` would
-    /// silently break for any provider that reads the field.
+    /// Resolved Fennec home directory.
     home_dir: std::path::PathBuf,
-    /// Stable session identifier for the current session. A UUID
-    /// generated at Agent build time and re-generated on
-    /// `clear_history`. Used as the payload for `on_session_start` /
-    /// `on_session_end` so plugins can correlate events to a
-    /// specific conversation.
+    /// Stable session identifier for the current session.
     session_id: String,
     /// Whether the current session's `on_session_start` has fired.
-    /// Set to `true` on the first turn of each session and reset by
-    /// `clear_history` after firing `on_session_end`.
     session_started: bool,
+    /// Auxiliary client for background tasks (curator, future
+    /// title generation, smart-approval LLM, etc.). Not used in
+    /// the main turn loop — kept here so consumers (curator,
+    /// plugin context) can grab a handle. Empty client when no
+    /// auxiliary providers are available; call sites check
+    /// `is_available()` before dispatching.
+    auxiliary_client: Arc<crate::providers::AuxiliaryClient>,
 }
 
 impl Agent {
@@ -630,6 +627,14 @@ impl Agent {
     }
 
     /// Get a reference to the shared provider.
+    /// Handle to the auxiliary client. Curator + future background
+    /// tasks call into this for non-prompt-cache-polluting LLM
+    /// calls. Always present (empty client when no providers are
+    /// available); call sites should `is_available()` first.
+    pub fn auxiliary_client(&self) -> &Arc<crate::providers::AuxiliaryClient> {
+        &self.auxiliary_client
+    }
+
     pub fn provider(&self) -> &Arc<dyn Provider> {
         &self.provider
     }
@@ -672,6 +677,7 @@ pub struct AgentBuilder {
     hooks: Option<Arc<crate::plugins::HookRegistry>>,
     memory_manager: Option<Arc<crate::plugins::MemoryManager>>,
     home_dir: Option<std::path::PathBuf>,
+    auxiliary_client: Option<Arc<crate::providers::AuxiliaryClient>>,
 }
 
 impl AgentBuilder {
@@ -693,37 +699,40 @@ impl AgentBuilder {
             hooks: None,
             memory_manager: None,
             home_dir: None,
+            auxiliary_client: None,
         }
     }
 
-    /// Wire the resolved Fennec home directory. Used to populate
-    /// `MemoryProviderContext::fennec_home` so providers see the
-    /// active profile's state path. Unset → fall back to
-    /// `~/.fennec` (matches the pre-`--profile` behaviour).
+    /// Wire the resolved Fennec home directory.
     pub fn home_dir(mut self, path: std::path::PathBuf) -> Self {
         self.home_dir = Some(path);
         self
     }
 
-    /// Wire in a plugin lifecycle [`HookRegistry`]. The agent fires
-    /// `pre_tool_call` and `post_tool_call` hooks during the tool
-    /// loop. If unset, `Agent::build` substitutes an empty registry
-    /// so the firing path stays the same shape (no branches in the
-    /// hot loop).
+    /// Wire in a plugin lifecycle [`HookRegistry`].
     pub fn hooks(mut self, hooks: Arc<crate::plugins::HookRegistry>) -> Self {
         self.hooks = Some(hooks);
         self
     }
 
-    /// Wire in the plugin [`MemoryManager`]. If unset, `Agent::build`
-    /// substitutes an empty manager (built-in memory only — current
-    /// behavior). When wired with an active provider, the agent calls
-    /// `prefetch` before each LLM turn and `sync_turn` after.
+    /// Wire in the plugin [`MemoryManager`].
     pub fn memory_manager(
         mut self,
         manager: Arc<crate::plugins::MemoryManager>,
     ) -> Self {
         self.memory_manager = Some(manager);
+        self
+    }
+
+    /// Wire in an auxiliary client. If not set, `Agent::build`
+    /// substitutes an empty client so consumers (curator, plugin
+    /// background tasks) can always call `auxiliary_client()` and
+    /// check `is_available()` without a None-check.
+    pub fn auxiliary_client(
+        mut self,
+        client: Arc<crate::providers::AuxiliaryClient>,
+    ) -> Self {
+        self.auxiliary_client = Some(client);
         self
     }
 
@@ -850,16 +859,9 @@ impl AgentBuilder {
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
             turn_count: 0,
-            // An empty `HookRegistry` is a no-op for `fire_*` calls,
-            // so callers that don't wire hooks pay nothing at the
-            // tool-loop level beyond an `Arc` clone.
             hooks: self
                 .hooks
                 .unwrap_or_else(|| Arc::new(crate::plugins::HookRegistry::new())),
-            // Empty manager → no external provider → all the
-            // `prefetch` / `sync_turn` calls return immediately
-            // without doing work. Existing behavior unchanged when
-            // unwired.
             memory_manager,
             home_dir: self.home_dir.unwrap_or_else(|| {
                 dirs::home_dir()
@@ -868,6 +870,13 @@ impl AgentBuilder {
             }),
             session_id: uuid::Uuid::new_v4().to_string(),
             session_started: false,
+            auxiliary_client: self.auxiliary_client.unwrap_or_else(|| {
+                Arc::new(crate::providers::AuxiliaryClient::new(
+                    crate::providers::AuxiliaryConfig::default(),
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }),
         })
     }
 }
