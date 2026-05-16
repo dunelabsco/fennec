@@ -63,12 +63,21 @@ impl MemoryConsolidator {
             return Ok(());
         }
 
-        // Build conversation text for the prompt.
+        // Build conversation text for the prompt. Each message's
+        // content is run through `scrub_text` first so credentials
+        // (API keys, tokens, JWTs, AWS/GCP keys, PEM blocks, emails)
+        // that may have appeared in the raw chat don't get shipped to
+        // the consolidation provider — which is often a cheap third-
+        // party API the user wouldn't necessarily want to see those
+        // secrets. The OUTPUT path already scrubs symmetrically (see
+        // `clean_for_store` below); this is the matching INPUT-side
+        // protection.
         let mut conversation_text = String::new();
         for msg in &recent {
             let role = &msg.role;
-            let content = msg.content.as_deref().unwrap_or("(no content)");
-            conversation_text.push_str(&format!("{role}: {content}\n"));
+            let raw_content = msg.content.as_deref().unwrap_or("(no content)");
+            let scrubbed = scrub_text(raw_content);
+            conversation_text.push_str(&format!("{role}: {scrubbed}\n"));
         }
 
         let prompt = format!(

@@ -1,6 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 
 use super::traits::*;
 use crate::memory::experience::Experience;
@@ -34,7 +35,7 @@ impl CollectiveLayer for MockCollective {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<CollectiveSearchResult>> {
-        let exps = self.experiences.lock().unwrap();
+        let exps = self.experiences.lock();
         let query_lower = query.to_lowercase();
         let results: Vec<CollectiveSearchResult> = exps
             .iter()
@@ -57,12 +58,12 @@ impl CollectiveLayer for MockCollective {
     }
 
     async fn get_experience(&self, id: &str) -> anyhow::Result<Option<Experience>> {
-        let exps = self.experiences.lock().unwrap();
+        let exps = self.experiences.lock();
         Ok(exps.iter().find(|e| e.id == id).cloned())
     }
 
     async fn publish(&self, experience: &Experience) -> anyhow::Result<String> {
-        let mut exps = self.experiences.lock().unwrap();
+        let mut exps = self.experiences.lock();
         let id = experience.id.clone();
         exps.push(experience.clone());
         Ok(id)

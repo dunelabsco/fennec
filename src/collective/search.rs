@@ -49,6 +49,16 @@ pub struct CollectiveSearch {
     prompt_guard: Option<PromptGuard>,
 }
 
+/// Normalize a goal string for dedup comparison.
+///
+/// Goals come from three sources (local, cache, remote) that may format
+/// the same logical goal with different whitespace or case. A byte-exact
+/// comparison would let near-duplicates slip through and waste a result
+/// slot. Trim and lowercase for a stable equivalence class.
+fn normalize_goal(goal: &str) -> String {
+    goal.trim().to_lowercase()
+}
+
 impl CollectiveSearch {
     pub fn new(
         memory: Arc<SqliteMemory>,
@@ -92,8 +102,13 @@ impl CollectiveSearch {
         let cached = self.cache.search_cache(query, limit).await?;
         for result in cached {
             let score = result.relevance_score * result.trust_score;
-            // Deduplicate against local results by goal
-            if !all_results.iter().any(|r| r.result.goal == result.goal) {
+            // Deduplicate against local results by normalized goal so that
+            // whitespace- or case-only variants don't both occupy a slot.
+            let norm = normalize_goal(&result.goal);
+            if !all_results
+                .iter()
+                .any(|r| normalize_goal(&r.result.goal) == norm)
+            {
                 all_results.push(RankedExperience {
                     final_score: score,
                     result,
@@ -110,19 +125,45 @@ impl CollectiveSearch {
                     Ok(remote_results) => {
                         let result_count = remote_results.len();
                         for (idx, result) in remote_results.into_iter().enumerate() {
-                            // Scan for injection if prompt guard is set
+                            // Scan for injection if prompt guard is set.
+                            //
+                            // Drop both Blocked AND Suspicious remote results.
+                            // Suspicious matches the same heuristics as Blocked
+                            // but only escalates to Blocked when GuardAction is
+                            // Block AND the score exceeds the sensitivity
+                            // threshold. With the default action (Warn), a
+                            // poisoned remote result is reported as Suspicious
+                            // and was previously injected into search output
+                            // anyway. For untrusted remote content we don't
+                            // want to surface anything the guard flagged at
+                            // all — the cost of dropping a borderline result
+                            // is far less than the cost of a successful
+                            // prompt-injection attempt.
                             if let Some(ref guard) = self.prompt_guard {
                                 let text = format!(
                                     "{} {}",
                                     result.goal,
                                     result.solution.as_deref().unwrap_or("")
                                 );
-                                if let ScanResult::Blocked(_) = guard.scan(&text) {
-                                    tracing::warn!(
-                                        "Blocked potentially poisoned collective result: {}",
-                                        result.id
-                                    );
-                                    continue;
+                                match guard.scan(&text) {
+                                    ScanResult::Safe => {}
+                                    ScanResult::Blocked(reason) => {
+                                        tracing::warn!(
+                                            id = %result.id,
+                                            reason = %reason,
+                                            "Dropping blocked collective result"
+                                        );
+                                        continue;
+                                    }
+                                    ScanResult::Suspicious(categories, score) => {
+                                        tracing::warn!(
+                                            id = %result.id,
+                                            categories = ?categories,
+                                            score,
+                                            "Dropping suspicious collective result"
+                                        );
+                                        continue;
+                                    }
                                 }
                             }
                             // Cache the result locally
@@ -150,7 +191,11 @@ impl CollectiveSearch {
                                 "Collective remote result"
                             );
 
-                            if !all_results.iter().any(|r| r.result.goal == result.goal) {
+                            let norm = normalize_goal(&result.goal);
+                            if !all_results
+                                .iter()
+                                .any(|r| normalize_goal(&r.result.goal) == norm)
+                            {
                                 all_results.push(RankedExperience {
                                     final_score: score,
                                     result,
@@ -185,5 +230,41 @@ impl CollectiveSearch {
             experiences: all_results,
             confidence,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_goal_lowercases_and_trims() {
+        assert_eq!(normalize_goal("Hello"), "hello");
+        assert_eq!(normalize_goal("  HELLO  "), "hello");
+        assert_eq!(normalize_goal("\t Hello World \n"), "hello world");
+        assert_eq!(normalize_goal(""), "");
+        assert_eq!(normalize_goal("   "), "");
+    }
+
+    #[test]
+    fn normalize_goal_collapses_case_only_variants() {
+        // Whitespace + case-only variants should normalize to the same
+        // key so dedup drops duplicates that look identical to a human.
+        let a = normalize_goal("Reset Plurum Trust Score");
+        let b = normalize_goal("reset plurum trust score");
+        let c = normalize_goal("  RESET PLURUM TRUST SCORE  ");
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn normalize_goal_preserves_internal_whitespace() {
+        // Inner whitespace stays (only leading/trailing are stripped),
+        // so "foo bar" and "foo  bar" still dedup as distinct goals —
+        // matches the upstream's whitespace-sensitive comparison.
+        assert_ne!(
+            normalize_goal("foo bar"),
+            normalize_goal("foo  bar"),
+        );
     }
 }
