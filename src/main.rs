@@ -945,9 +945,17 @@ async fn run_gateway(
     }
 
     // 4. Create ChannelManager, start all channels.
+    //
+    // The listener handles (Telegram/Discord/Slack/WhatsApp/Email pollers)
+    // and the outbound-dispatch handle were previously bound to `_`-prefixed
+    // names, which keeps them alive only for the lexical scope but never
+    // aborts them on shutdown — they kept polling vendor APIs (and printing
+    // reconnect errors to the log) until the runtime was finally dropped at
+    // process exit. Bind them so the shutdown block at the bottom can abort
+    // them explicitly along with the gateway / agent loop / cron handles.
     let manager = ChannelManager::new(channels, bus.clone());
-    let _listener_handles = manager.start_all();
-    let _dispatch_handle = manager.spawn_outbound_dispatch(receiver.outbound_rx);
+    let listener_handles = manager.start_all();
+    let dispatch_handle = manager.spawn_outbound_dispatch(receiver.outbound_rx);
 
     // 5. Start CronScheduler — always runs in gateway mode so user-created
     //    reminders/jobs are delivered. The config.cron.enabled flag is reserved
@@ -1053,8 +1061,13 @@ async fn run_gateway(
                 // Handle /new and /reset commands: clear agent history and
                 // send a confirmation instead of running a full agent turn.
                 if msg.metadata.get("command").map(|s| s.as_str()) == Some("reset") {
-                    let mut agent_lock = agent.lock().await;
-                    agent_lock.clear_history();
+                    // Drop the agent lock before publishing on the bus so
+                    // gateway HTTP /chat (which also takes agent.lock()) is
+                    // not serialized through the outbound publish await.
+                    {
+                        let mut agent_lock = agent.lock().await;
+                        agent_lock.clear_history();
+                    }
                     let outbound = fennec::bus::OutboundMessage {
                         content: "Session reset! Starting fresh.".to_string(),
                         channel: msg.channel.clone(),
@@ -1089,8 +1102,17 @@ async fn run_gateway(
                     });
                 }
 
-                let mut agent_lock = agent.lock().await;
-                match agent_lock.turn(&msg.content).await {
+                // Hold the agent lock only for the LLM turn itself. All
+                // subsequent I/O (typing-indicator abort, streaming
+                // delivery, bus publish) runs without the lock so that
+                // gateway HTTP /chat — which also takes agent.lock() —
+                // doesn't serialize behind a finished agent's outbound
+                // publish.
+                let turn_result = {
+                    let mut agent_lock = agent.lock().await;
+                    agent_lock.turn(&msg.content).await
+                };
+                match turn_result {
                     Ok(response) => {
                         // Stop typing indicator.
                         typing_handle.abort();
@@ -1110,9 +1132,6 @@ async fn run_gateway(
                             .filter(|ch| ch.supports_streaming());
 
                         if let Some(ch) = streaming_channel {
-                            // Drop agent lock before streaming delivery.
-                            drop(agent_lock);
-
                             match ch.send_streaming_start(&msg.chat_id).await {
                                 Ok(Some(mid)) => {
                                     // Deliver the response in chunks to simulate
@@ -1197,9 +1216,15 @@ async fn run_gateway(
         })
     };
 
-    // 8. Handle SIGINT gracefully.
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("Received SIGINT, shutting down...");
+    // 8. Wait for SIGINT or SIGTERM and shut down all background tasks.
+    //
+    // Previously only `tokio::signal::ctrl_c()` was awaited. Under
+    // `systemd stop` / `docker stop` / `kill` the process receives
+    // SIGTERM, which terminates without ever reaching the abort block —
+    // listener handles kept hammering vendor APIs until the runtime was
+    // dropped. We listen for both signals on Unix and fall back to
+    // ctrl_c() on Windows (where SIGTERM doesn't exist).
+    wait_for_shutdown_signal().await;
 
     // Tell the gateway to stop accepting new connections and drain.
     // `send` only fails if all receivers have been dropped, which would
@@ -1226,15 +1251,57 @@ async fn run_gateway(
         }
     }
 
-    // Abort the rest of the supervised tasks. These don't have graceful
-    // shutdown wired yet; that's a separate concern (see audit punch list
-    // for bus + shutdown lifecycle).
+    // Abort the rest of the supervised tasks.
     agent_loop.abort();
     if let Some(h) = _cron_handle {
         h.abort();
     }
+    for h in listener_handles {
+        h.abort();
+    }
+    dispatch_handle.abort();
 
     Ok(())
+}
+
+/// Wait for SIGINT (Ctrl-C) or SIGTERM and log which one fired.
+///
+/// On Unix, listens for both via `tokio::select!`. On Windows there's no
+/// SIGTERM, so we just await `ctrl_c()`. The `signal` feature is enabled
+/// in `Cargo.toml`.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // `signal()` can fail if the underlying syscall registration fails
+        // (e.g. fd exhaustion). If SIGTERM registration fails we degrade
+        // to SIGINT-only rather than aborting startup — better to run
+        // without graceful systemd shutdown than to refuse to come up.
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to install SIGTERM handler: {e}; falling back to SIGINT only"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("Received SIGINT, shutting down...");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received SIGINT, shutting down...");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, shutting down...");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Received Ctrl-C, shutting down...");
+    }
 }
 
 #[tokio::main]
