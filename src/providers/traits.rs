@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 pub enum StreamEvent {
     /// A chunk of text content.
     Delta(String),
+    /// A chunk of reasoning / extended-thinking content. Anthropic
+    /// streams these as `thinking_delta` events on `content_block_delta`
+    /// SSE frames. OpenAI's o1/o3/o4 don't stream reasoning live —
+    /// providers emit a single `Reasoning(full_text)` just before
+    /// [`Self::Done`] when the response carries it.
+    Reasoning(String),
     /// A tool call has started.
     ToolCallStart { id: String, name: String },
     /// Incremental arguments JSON for a tool call.
@@ -129,6 +135,14 @@ pub struct ChatResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<UsageInfo>,
+    /// Extended-thinking / reasoning text from the model. Anthropic
+    /// returns this as separate `thinking` content blocks when
+    /// extended thinking is enabled; OpenAI's o1/o3/o4 surface it
+    /// as `message.reasoning`. `None` when the model didn't emit
+    /// reasoning (or the user disabled it). Multiple thinking
+    /// blocks from one response are joined with newlines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Token usage information.
@@ -193,6 +207,12 @@ pub async fn default_chat_stream(
     let response = provider.chat(request).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move {
+        // Reasoning before content so consumers (the renderer)
+        // see thinking text first, matching the order Anthropic's
+        // streaming uses (thinking blocks always precede text).
+        if let Some(reasoning) = response.reasoning {
+            let _ = tx.send(StreamEvent::Reasoning(reasoning)).await;
+        }
         if let Some(content) = response.content {
             let _ = tx.send(StreamEvent::Delta(content)).await;
         }

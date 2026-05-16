@@ -312,6 +312,7 @@ mod tests {
                 content: Some(self.response_text.clone()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             })
         }
         fn supports_tool_calling(&self) -> bool {

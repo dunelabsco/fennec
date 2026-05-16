@@ -345,6 +345,13 @@ impl Agent {
                 }
             }
 
+            // Forward reasoning text (if any) before regular content
+            // so frontends render thinking blocks first, matching the
+            // streaming-path order.
+            if let Some(ref reasoning) = response.reasoning {
+                self.callbacks.on_reasoning_delta(reasoning);
+            }
+
             if response.tool_calls.is_empty() {
                 // No tool calls — final assistant response.
                 let text = response.content.unwrap_or_default();
@@ -662,6 +669,13 @@ impl Agent {
                     StreamEvent::Delta(text) => {
                         accumulated_text.push_str(&text);
                         self.callbacks.on_text_delta(&text);
+                    }
+                    StreamEvent::Reasoning(text) => {
+                        // Forward reasoning deltas to the
+                        // frontend; not appended to
+                        // accumulated_text since the assistant
+                        // message is text-only at this layer.
+                        self.callbacks.on_reasoning_delta(&text);
                     }
                     StreamEvent::ToolCallStart { id, name } => {
                         current_tool = Some((id, name, String::new()));

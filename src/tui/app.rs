@@ -50,6 +50,18 @@ pub enum ChatLine {
     /// animates on tick. Replaced with `ToolResult` once the
     /// tool completes.
     ToolRunning { label: String, started_at: Instant },
+    /// Extended-thinking / reasoning block from the model
+    /// (Anthropic `thinking` content blocks; OpenAI o1/o3
+    /// `message.reasoning` field). Renders dim above the next
+    /// bot reply. `is_streaming = true` while deltas are still
+    /// arriving so the renderer shows a live cursor; flipped
+    /// to false when the bot's text reply starts (or the turn
+    /// ends without one).
+    ReasoningBlock {
+        body: String,
+        started_at: Instant,
+        is_streaming: bool,
+    },
 }
 
 /// Currently-executing tool, surfaced in the right column's
@@ -541,6 +553,12 @@ pub struct App {
     ///     result body)
     ///   - Expanded: full detail (current F1-1 behavior)
     pub details_mode: DetailsMode,
+    /// Per-section overrides set via `/details <section> <mode>`.
+    /// When a key (e.g. `"thinking"`) is present, the renderer
+    /// uses that mode for the matching section instead of the
+    /// global `details_mode`. Mirrors Hermes' `ui.sections`
+    /// (`domain/details.ts:51-74`).
+    pub details_section_overrides: std::collections::HashMap<String, DetailsMode>,
     /// `/mouse` toggle — drives crossterm's mouse-tracking
     /// enable/disable on the next frame. Off by default to avoid
     /// stealing the user's terminal-native scroll wheel.
@@ -550,6 +568,10 @@ pub struct App {
     /// are arriving so they accumulate into one growing message
     /// instead of pushing a new line per delta.
     pub in_flight_bot_idx: Option<usize>,
+    /// Index of the in-flight `ChatLine::ReasoningBlock` for
+    /// streaming thinking deltas. Same pattern as
+    /// `in_flight_bot_idx` — `None` between turns.
+    pub in_flight_reasoning_idx: Option<usize>,
     /// Voice subsystem handle. The `/voice` command flips its
     /// state; the tick handler polls it for transcriptions /
     /// errors and updates the UI accordingly.
@@ -594,8 +616,10 @@ impl App {
             should_quit: false,
             compact_mode: false,
             details_mode: DetailsMode::Expanded,
+            details_section_overrides: std::collections::HashMap::new(),
             mouse_enabled: false,
             in_flight_bot_idx: None,
+            in_flight_reasoning_idx: None,
             voice: super::voice::VoiceController::new(),
             current_session_id: None,
             current_session_title: None,
@@ -674,6 +698,71 @@ impl App {
     /// `append_bot_delta` will start a fresh message.
     pub fn finalize_bot_message(&mut self) {
         self.in_flight_bot_idx = None;
+    }
+
+    /// Append a streaming reasoning delta to the in-flight
+    /// thinking block. Mirrors `append_bot_delta`'s pattern but
+    /// for `ChatLine::ReasoningBlock`. The block stays
+    /// `is_streaming = true` until [`Self::finalize_reasoning_block`]
+    /// is called (typically when the bot's text reply starts or
+    /// the turn ends).
+    pub fn append_reasoning_delta(&mut self, delta: &str) {
+        if let Some(idx) = self.in_flight_reasoning_idx {
+            if let Some(ChatLine::ReasoningBlock { body, .. }) =
+                self.chat.get_mut(idx)
+            {
+                body.push_str(delta);
+                return;
+            }
+            self.in_flight_reasoning_idx = None;
+        }
+        self.chat.push(ChatLine::ReasoningBlock {
+            body: delta.to_string(),
+            started_at: Instant::now(),
+            is_streaming: true,
+        });
+        self.in_flight_reasoning_idx = Some(self.chat.len() - 1);
+    }
+
+    /// Stop the live cursor on the in-flight reasoning block —
+    /// usually called when the assistant's text reply begins
+    /// (thinking is done streaming).
+    pub fn finalize_reasoning_block(&mut self) {
+        if let Some(idx) = self.in_flight_reasoning_idx.take() {
+            if let Some(ChatLine::ReasoningBlock { is_streaming, .. }) =
+                self.chat.get_mut(idx)
+            {
+                *is_streaming = false;
+            }
+        }
+    }
+
+    /// Effective `DetailsMode` for the `thinking` section.
+    /// Per-section override (`details_section_overrides["thinking"]`)
+    /// wins; otherwise falls back to the global
+    /// `details_mode`. Mirrors `domain/details.ts:69-74`'s
+    /// `sectionMode()`.
+    pub fn reasoning_mode(&self) -> DetailsMode {
+        self.details_section_overrides
+            .get("thinking")
+            .copied()
+            .unwrap_or(self.details_mode)
+    }
+
+    /// Set or clear a per-section override.
+    pub fn set_section_override(
+        &mut self,
+        section: impl Into<String>,
+        mode: Option<DetailsMode>,
+    ) {
+        match mode {
+            Some(m) => {
+                self.details_section_overrides.insert(section.into(), m);
+            }
+            None => {
+                self.details_section_overrides.remove(&section.into());
+            }
+        }
     }
 
     /// Handle a key press. Routes to the focused pane; some keys
@@ -1540,6 +1629,54 @@ mod tests {
         app.append_bot_delta("second reply");
         assert_eq!(app.chat.len(), 2);
         assert_eq!(app.in_flight_bot_idx, Some(1));
+    }
+
+    #[test]
+    fn reasoning_deltas_accumulate_into_streaming_block() {
+        let mut app = App::new();
+        app.append_reasoning_delta("let me ");
+        app.append_reasoning_delta("think...");
+        assert_eq!(app.chat.len(), 1);
+        match &app.chat[0] {
+            ChatLine::ReasoningBlock {
+                body,
+                is_streaming,
+                ..
+            } => {
+                assert_eq!(body, "let me think...");
+                assert!(*is_streaming);
+            }
+            other => panic!("expected ReasoningBlock, got {:?}", other),
+        }
+        assert_eq!(app.in_flight_reasoning_idx, Some(0));
+    }
+
+    #[test]
+    fn finalize_reasoning_block_stops_streaming_flag() {
+        let mut app = App::new();
+        app.append_reasoning_delta("draft");
+        app.finalize_reasoning_block();
+        assert_eq!(app.in_flight_reasoning_idx, None);
+        match &app.chat[0] {
+            ChatLine::ReasoningBlock { is_streaming, .. } => {
+                assert!(!*is_streaming);
+            }
+            other => panic!("expected ReasoningBlock, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reasoning_mode_prefers_section_override_over_global() {
+        let mut app = App::new();
+        app.details_mode = DetailsMode::Hidden;
+        // No override → global wins.
+        assert_eq!(app.reasoning_mode(), DetailsMode::Hidden);
+        // Set override → wins.
+        app.set_section_override("thinking", Some(DetailsMode::Expanded));
+        assert_eq!(app.reasoning_mode(), DetailsMode::Expanded);
+        // Reset override → fall back to global again.
+        app.set_section_override("thinking", None);
+        assert_eq!(app.reasoning_mode(), DetailsMode::Hidden);
     }
 
     #[test]

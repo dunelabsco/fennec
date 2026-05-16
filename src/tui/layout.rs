@@ -372,6 +372,68 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                     ]));
                 }
             },
+            ChatLine::ReasoningBlock {
+                body,
+                is_streaming,
+                ..
+            } => {
+                // Per-section override (`/details thinking <mode>`)
+                // wins over the global mode.
+                let mode = app.reasoning_mode();
+                match mode {
+                    DetailsMode::Hidden => {
+                        // Section omitted entirely.
+                    }
+                    DetailsMode::Collapsed => {
+                        // Header + 160-char preview, matching
+                        // Hermes' THINKING_COT_MAX truncation.
+                        let preview = compact_preview(body, 160);
+                        let est_tokens = (body.len() + 3) / 4;
+                        let header = format!(
+                            "    ▾ Thinking (~{est_tokens} tokens)"
+                        );
+                        lines.push(Line::from(Span::styled(
+                            header,
+                            Style::default().fg(SUBDUED).add_modifier(Modifier::DIM),
+                        )));
+                        if !preview.is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                format!("      {preview}"),
+                                Style::default()
+                                    .fg(SUBDUED)
+                                    .add_modifier(Modifier::DIM),
+                            )));
+                        }
+                    }
+                    DetailsMode::Expanded => {
+                        // Full text. Hermes wraps `▾ Thinking`
+                        // header + body lines indented 4 spaces.
+                        lines.push(Line::from(Span::styled(
+                            "    ▾ Thinking",
+                            Style::default().fg(SUBDUED).add_modifier(Modifier::DIM),
+                        )));
+                        for raw_line in body.split('\n') {
+                            lines.push(Line::from(Span::styled(
+                                format!("      {raw_line}"),
+                                Style::default()
+                                    .fg(SUBDUED)
+                                    .add_modifier(Modifier::DIM),
+                            )));
+                        }
+                        if *is_streaming {
+                            // Live cursor at the tail. `▍` blinks
+                            // via app.cursor_visible (driven by
+                            // ~500ms tick) — close enough to
+                            // Hermes' 420ms cadence for parity.
+                            let cur = if app.cursor_visible { "▍" } else { " " };
+                            lines.push(Line::from(Span::styled(
+                                format!("      {cur}"),
+                                Style::default().fg(SUBDUED),
+                            )));
+                        }
+                    }
+                }
+            }
         }
         // Spacer between entries — only in non-compact mode.
         // Compact view drops the blank rows so more turns fit
@@ -1278,5 +1340,33 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max - 1).collect();
         out.push('…');
         out
+    }
+}
+
+/// Hermes' `compactPreview` (`lib/text.ts:93-96`): collapse
+/// whitespace runs to a single space, then truncate to `max`
+/// chars with `…` suffix. Used for the `Collapsed` thinking
+/// mode where we show a single-line preview.
+fn compact_preview(s: &str, max: usize) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.chars().count() <= max {
+        trimmed.to_string()
+    } else {
+        let mut head: String = trimmed.chars().take(max.saturating_sub(1)).collect();
+        head.push('…');
+        head
     }
 }
