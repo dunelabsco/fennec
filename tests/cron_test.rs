@@ -147,8 +147,14 @@ async fn test_scheduler_tick_fires_due_job() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let mut store = JobStore::new(tmp.path());
 
-    // Job with no last_run should fire immediately.
-    store.add_job(sample_job("fire_me", "test_fire", "every 1m"));
+    // PR #19 changed behavior: newly-added jobs no longer fire on the
+    // first tick (avoids surprise execution at startup). To exercise the
+    // due-job path here, plant a last_run far enough in the past that the
+    // job's interval has unambiguously elapsed.
+    let mut job = sample_job("fire_me", "test_fire", "every 1m");
+    let past = chrono::Utc::now() - chrono::Duration::hours(1);
+    job.last_run = Some(past.to_rfc3339());
+    store.add_job(job);
 
     let (bus, mut receiver) = MessageBus::new(16);
     let mut scheduler = CronScheduler::new(store, bus, Some(60));
