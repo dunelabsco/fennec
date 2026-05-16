@@ -46,6 +46,7 @@ pub fn register_all(r: &mut CommandRegistry) {
     r.register(Box::new(Image));
     r.register(Box::new(Paste));
     r.register(Box::new(Copy));
+    r.register(Box::new(Edit));
 }
 
 // -- Lifecycle / focus -------------------------------------------
@@ -98,6 +99,7 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("image <path>", "attach an image to the next message"),
     ("paste", "paste clipboard text into the input"),
     ("copy [n]", "copy a past assistant message to clipboard"),
+    ("edit", "open $EDITOR with the current input pre-filled (also Ctrl-G)"),
 ];
 
 struct Quit;
@@ -882,6 +884,23 @@ impl CommandHandler for Copy {
     }
 }
 
+struct Edit;
+impl CommandHandler for Edit {
+    fn name(&self) -> &'static str {
+        "edit"
+    }
+    fn help(&self) -> &'static str {
+        "open $EDITOR with the current input pre-filled (also Ctrl-G)"
+    }
+    fn execute(&self, _args: &str, app: &mut App) -> Result<CommandOutcome> {
+        // Capture the current composer text so the editor opens
+        // with whatever the user has already typed. Empty input
+        // is fine — the editor will start with an empty buffer.
+        app.pending_editor = Some(app.input.text());
+        Ok(CommandOutcome::Status("opening editor…".into()))
+    }
+}
+
 // -- Helpers ----------------------------------------------------
 
 fn push_system(app: &mut App, body: String) {
@@ -1034,8 +1053,6 @@ mod tests {
         use crate::tui::app::DetailsMode;
         let r = CommandRegistry::with_builtins();
         let mut app = App::new();
-        // /details thinking collapsed → only thinking section
-        // gets the override; global mode stays Expanded.
         r.dispatch("details", "thinking collapsed", &mut app).unwrap();
         assert_eq!(app.details_mode, DetailsMode::Expanded);
         assert_eq!(
@@ -1043,8 +1060,6 @@ mod tests {
             Some(DetailsMode::Collapsed)
         );
         assert_eq!(app.reasoning_mode(), DetailsMode::Collapsed);
-        // /details thinking reset → override cleared, falls back
-        // to global.
         r.dispatch("details", "thinking reset", &mut app).unwrap();
         assert!(app.details_section_overrides.get("thinking").is_none());
         assert_eq!(app.reasoning_mode(), DetailsMode::Expanded);
@@ -1074,6 +1089,38 @@ mod tests {
             }
             other => panic!("expected Status, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn edit_command_sets_pending_editor_with_input_text() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        for c in "draft prompt".chars() {
+            app.input.insert_char(c);
+        }
+        r.dispatch("edit", "", &mut app).unwrap();
+        assert_eq!(app.pending_editor.as_deref(), Some("draft prompt"));
+    }
+
+    #[test]
+    fn ctrl_g_in_input_focus_sets_pending_editor() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = App::new();
+        app.focus = crate::tui::app::Focus::Input;
+        for c in "ask the agent".chars() {
+            app.input.insert_char(c);
+        }
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(app.pending_editor.as_deref(), Some("ask the agent"));
+    }
+
+    #[test]
+    fn alt_g_in_input_focus_also_triggers_editor_request() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = App::new();
+        app.focus = crate::tui::app::Focus::Input;
+        app.handle_key(KeyCode::Char('g'), KeyModifiers::ALT);
+        assert_eq!(app.pending_editor.as_deref(), Some(""));
     }
 
     #[test]

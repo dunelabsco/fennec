@@ -205,12 +205,14 @@ mod tests {
                 content: Some("hello".into()),
                 tool_calls: None,
                 tool_call_id: None,
+                attachments: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: Some("hi there".into()),
                 tool_calls: None,
                 tool_call_id: None,
+                attachments: None,
             },
         ];
         append_messages(&store, "c1", &msgs).await.unwrap();
@@ -235,12 +237,14 @@ mod tests {
                     arguments: serde_json::json!({}),
                 }]),
                 tool_call_id: None,
+                attachments: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: Some("final".into()),
                 tool_calls: None,
                 tool_call_id: None,
+                attachments: None,
             },
         ];
         append_messages(&store, "c1", &msgs).await.unwrap();

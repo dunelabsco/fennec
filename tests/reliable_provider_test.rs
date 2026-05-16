@@ -41,7 +41,9 @@ impl Provider for SuccessProvider {
                 input_tokens: 10,
                 output_tokens: 5,
                 cache_read_tokens: None,
+                cache_write_tokens: None,
             }),
+            reasoning: None,
         })
     }
 
@@ -133,6 +135,7 @@ impl Provider for FlakeyProvider {
                 content: Some(format!("recovered response from {}", self.provider_name)),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             })
         }
     }

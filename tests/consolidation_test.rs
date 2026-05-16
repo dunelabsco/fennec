@@ -44,6 +44,7 @@ impl Provider for MockProvider {
             content: Some(text),
             tool_calls: vec![],
             usage: None,
+            reasoning: None,
         })
     }
 

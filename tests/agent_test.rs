@@ -161,7 +161,9 @@ async fn test_simple_chat_response() {
             input_tokens: 10,
             output_tokens: 5,
             cache_read_tokens: None,
+            cache_write_tokens: None,
         }),
+        reasoning: None,
     };
 
     let provider = MockProvider::new(vec![response]);
@@ -187,6 +189,7 @@ async fn test_tool_call_and_response() {
             arguments: json!({"message": "ping"}),
         }],
         usage: None,
+        reasoning: None,
     };
 
     // Second response: the model returns a final text response.
@@ -194,6 +197,7 @@ async fn test_tool_call_and_response() {
         content: Some("The echo said: echo: ping".to_string()),
         tool_calls: vec![],
         usage: None,
+        reasoning: None,
     };
 
     let provider = MockProvider::new(vec![tool_call_response, final_response]);
@@ -223,6 +227,7 @@ async fn test_max_iterations_exceeded() {
                 arguments: json!({"message": "loop"}),
             }],
             usage: None,
+            reasoning: None,
         });
     }
 

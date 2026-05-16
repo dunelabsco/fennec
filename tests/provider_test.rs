@@ -63,7 +63,9 @@ fn chat_response_with_tool_calls() {
             input_tokens: 100,
             output_tokens: 50,
             cache_read_tokens: Some(80),
+            cache_write_tokens: None,
         }),
+        reasoning: None,
     };
 
     assert_eq!(response.content.as_deref(), Some("Let me check that file."));
@@ -83,6 +85,7 @@ fn chat_response_empty() {
         content: None,
         tool_calls: vec![],
         usage: None,
+        reasoning: None,
     };
     assert!(response.content.is_none());
     assert!(response.tool_calls.is_empty());

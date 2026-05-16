@@ -571,7 +571,7 @@ impl From<exports::fennec::plugin::plugin::ToolSpec> for ToolSpecOwned {
 // We implement it on `PluginHostState` here so that the linker
 // (above) can wire wasm imports to our Rust functions.
 
-use fennec::plugin::host::{
+use self::fennec::plugin::host::{
     Host, HostError, HttpHeader, HttpReq, HttpResp, LogLevel as WitLogLevel, MemoryEntry as WitMemEntry,
 };
 

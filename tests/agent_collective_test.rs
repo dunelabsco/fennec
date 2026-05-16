@@ -121,7 +121,9 @@ async fn test_agent_works_without_collective() {
             input_tokens: 10,
             output_tokens: 5,
             cache_read_tokens: None,
+            cache_write_tokens: None,
         }),
+        reasoning: None,
     };
 
     let provider = CapturingProvider::new(vec![response]);
@@ -143,6 +145,7 @@ async fn test_agent_collective_search_failure_graceful() {
         content: Some("Still works!".to_string()),
         tool_calls: vec![],
         usage: None,
+        reasoning: None,
     };
 
     let provider = CapturingProvider::new(vec![response]);
@@ -194,6 +197,7 @@ async fn test_agent_no_collective_injection_when_no_results() {
             content: Some("No context needed.".to_string()),
             tool_calls: vec![],
             usage: None,
+            reasoning: None,
         }])) as Arc<dyn Provider>)
         .memory(Arc::new(StubMemory) as Arc<dyn Memory>)
         .collective(Arc::new(search))

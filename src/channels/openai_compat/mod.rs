@@ -307,7 +307,9 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 5,
                         cache_read_tokens: None,
+                        cache_write_tokens: None,
                     }),
+                    reasoning: None,
                 }),
                 stream_events: Mutex::new(vec![
                     StreamEvent::Delta("Hel".into()),
@@ -761,6 +763,7 @@ mod tests {
                 arguments: json!({"x": 1}),
             }],
             usage: None,
+            reasoning: None,
         };
         let body = json!({"model": "x", "messages": [{"role": "user", "content": "x"}]});
         let r = ch

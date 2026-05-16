@@ -489,6 +489,7 @@ mod tests {
             content: Some("ok".to_string()),
             tool_calls: vec![],
             usage: None,
+            reasoning: None,
         }
     }
 
@@ -546,12 +547,14 @@ mod tests {
                 content: Some("first".to_string()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             })]));
         let second: Arc<dyn Provider> =
             Arc::new(MockProvider::new("second", vec![Ok(ChatResponse {
                 content: Some("second".to_string()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             })]));
         let chain = vec![
             ChainEntry {
@@ -596,6 +599,7 @@ mod tests {
                 content: Some("from second".to_string()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             })],
         ));
         let chain = vec![
@@ -735,6 +739,7 @@ mod tests {
                     content: Some("recovered".to_string()),
                     tool_calls: vec![],
                     usage: None,
+                    reasoning: None,
                 }),
                 Err(anyhow!("HTTP 402 insufficient_quota")),
             ],
