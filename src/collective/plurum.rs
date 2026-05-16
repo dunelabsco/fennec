@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -179,17 +179,37 @@ struct ErrorResponse {
 // ---------------------------------------------------------------------------
 
 impl PlurumlClient {
-    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+    /// Build a Plurum API client.
+    ///
+    /// Returns `Err` if the underlying reqwest client cannot be built
+    /// (e.g. missing TLS roots, broken proxy config, DNS-resolver init
+    /// failure). The previous `.expect("failed to build reqwest client")`
+    /// would panic the entire process at startup on a misconfigured
+    /// rustls install, taking down all of Fennec for what is really an
+    /// optional integration. Callers in `main.rs` treat the error the
+    /// same way as a missing API key — collective integration is
+    /// disabled, the rest of the agent runs fine.
+    ///
+    /// The client also enforces an HTTPS-only policy and a 5-second
+    /// connect timeout in addition to the existing 10-second total
+    /// request timeout. `https_only(true)` blocks accidental HTTP
+    /// downgrade if the configured `base_url` is malformed; the
+    /// connect timeout caps the worst-case wait when the Plurum
+    /// endpoint is unreachable so a slow startup probe doesn't hang
+    /// the agent for the full 10 seconds.
+    pub fn new(api_key: String, base_url: Option<String>) -> Result<Self> {
         let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
+            .https_only(true)
             .build()
-            .expect("failed to build reqwest client");
+            .context("building Plurum reqwest client")?;
 
-        Self {
+        Ok(Self {
             api_key,
             base_url: base_url.unwrap_or_else(|| "https://api.plurum.ai".to_string()),
             client,
-        }
+        })
     }
 
     /// Build a request with standard headers.
@@ -202,13 +222,40 @@ impl PlurumlClient {
     }
 
     /// Parse an error response body into a contextual anyhow error.
+    ///
+    /// 429 (Too Many Requests) and 503 (Service Unavailable) are
+    /// classified explicitly so callers / log aggregators can tell a
+    /// rate-limit / availability issue apart from a real API error
+    /// (4xx schema mismatch, 5xx bug). When the upstream sends a
+    /// `Retry-After` header it's surfaced in the error message so the
+    /// number lands in logs even without dedicated retry plumbing.
     async fn parse_error(resp: reqwest::Response) -> anyhow::Error {
-        let status = resp.status().as_u16();
+        let status = resp.status();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let body = resp.text().await.unwrap_or_default();
         let message = serde_json::from_str::<ErrorResponse>(&body)
             .map(|e| e.message)
             .unwrap_or(body);
-        anyhow::anyhow!("Plurum API error ({}): {}", status, message)
+
+        let label = match status.as_u16() {
+            429 => "rate limited",
+            503 => "service unavailable",
+            _ => "API error",
+        };
+        match retry_after {
+            Some(ra) => anyhow::anyhow!(
+                "Plurum {} ({}, retry-after: {}): {}",
+                label,
+                status,
+                ra,
+                message
+            ),
+            None => anyhow::anyhow!("Plurum {} ({}): {}", label, status, message),
+        }
     }
 }
 

@@ -38,7 +38,7 @@ impl McpClient {
     /// Connect to an MCP server over HTTP.
     pub async fn connect_http(url: &str) -> Result<Self> {
         let label = derive_http_label(url);
-        let transport: Arc<dyn Transport> = Arc::new(HttpTransport::new(url));
+        let transport: Arc<dyn Transport> = Arc::new(HttpTransport::new(url)?);
         Self::initialize(transport, label).await
     }
 
