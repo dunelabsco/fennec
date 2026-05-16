@@ -1,3 +1,3 @@
 pub mod store;
 
-pub use store::{SessionRecord, SessionStore, SearchHit};
+pub use store::{MessageRow, SearchHit, SessionRecord, SessionStore};

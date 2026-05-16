@@ -116,6 +116,11 @@ enum Commands {
         #[command(subcommand)]
         action: CuratorAction,
     },
+    /// MCP (Model Context Protocol) integration.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -128,8 +133,7 @@ enum CuratorAction {
     Pause,
     /// Resume automatic curator runs.
     Resume,
-    /// Pin a skill so it is exempt from auto-transitions and curator
-    /// consolidation.
+    /// Pin a skill so it is exempt from auto-transitions and curator consolidation.
     Pin { name: String },
     /// Remove a pin.
     Unpin { name: String },
@@ -137,18 +141,16 @@ enum CuratorAction {
     Restore { name: String },
 }
 
-/// Decrypt a channel-config secret through the [`SecretStore`], matching
-/// the fail-closed pattern used for `provider.api_key` and
-/// `collective.api_key`.
-///
-/// Return values:
-/// * `Some(String::new())` — the field was empty in config (caller should
-///   skip the channel via existing enabled+non-empty guards).
-/// * `Some(plaintext)` — successfully decrypted (or plaintext passthrough
-///   for legacy non-`enc2:` configs; `SecretStore` logs a warn).
-/// * `None` — the field was non-empty but decryption failed. The caller
-///   MUST treat the channel as disabled rather than handing the
-///   ciphertext to the vendor as if it were a live token.
+#[derive(Subcommand, Debug)]
+enum McpAction {
+    /// Run Fennec as an MCP server on stdio.
+    Serve {
+        #[arg(short, long)]
+        verbose: bool,
+    },
+}
+
+/// Decrypt a channel-config secret through the [`SecretStore`].
 fn decrypt_channel_secret(
     secret_store: &SecretStore,
     raw: &str,
@@ -1751,6 +1753,11 @@ async fn main() -> Result<()> {
         Commands::Curator { action } => {
             run_curator_command(&config, &home_dir, action).await?;
         }
+        Commands::Mcp { action } => match action {
+            McpAction::Serve { verbose } => {
+                run_mcp_serve(home_dir, verbose).await?;
+            }
+        },
     }
 
     Ok(())
@@ -2080,6 +2087,56 @@ async fn build_provider_for_curator(
     };
     let primary: Arc<dyn Provider> = build_provider(config, api_key, None).into();
     Ok(Some(build_auxiliary_client(config, primary, &secret_store)))
+}
+
+/// Run Fennec as an MCP server on stdio. Logs to stderr (stdout is
+/// the protocol transport — anything written there desyncs the
+/// JSON-RPC stream). Read-only mode: the server doesn't bring up
+/// channel listeners, just exposes the session DB and a stub
+/// channel list. `messages_send` returns a clear error in that
+/// mode; users who need send must run `fennec gateway` separately
+/// and configure the MCP server to share its channel manager
+/// (future work).
+async fn run_mcp_serve(home_dir: std::path::PathBuf, verbose: bool) -> Result<()> {
+    use fennec::mcp::serve::{EventBridge, McpServerHandler, ServerState, run_stdio};
+    use fennec::sessions::SessionStore;
+
+    // Re-init logging to stderr only — silencing the default
+    // tracing-subscriber that may have been pointed at stdout.
+    let level = if verbose {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(level)
+        .try_init();
+
+    let db_path = home_dir.join("sessions.db");
+    let store = Arc::new(
+        SessionStore::new(&db_path)
+            .with_context(|| format!("opening sessions DB at {}", db_path.display()))?,
+    );
+
+    let bridge = EventBridge::new();
+    bridge
+        .seed_from_store(&store)
+        .await
+        .context("seeding event-bridge cursor from session store")?;
+    let _poller = bridge.spawn_poller(Arc::clone(&store));
+
+    let state = ServerState::new(home_dir.clone(), Arc::clone(&store));
+    // Read-only mode: no channels attached. messages_send and
+    // channels_list will report empty. The user can still consume
+    // every read tool and the events stream.
+    let handler = McpServerHandler::new(state, bridge);
+
+    tracing::info!(
+        db = %db_path.display(),
+        "Fennec MCP server starting on stdio"
+    );
+    run_stdio(handler).await
 }
 
 async fn run_doctor(config: &FennecConfig, home_dir: &std::path::Path) -> Result<()> {

@@ -168,6 +168,13 @@ impl ChannelManager {
     }
 
     /// Look up a channel by name.
+    /// Names of every registered channel, in registration order.
+    /// Used by the MCP server's `channels_list` tool to enumerate
+    /// destinations.
+    pub fn list_channel_names(&self) -> Vec<String> {
+        self.channels.iter().map(|c| c.name().to_string()).collect()
+    }
+
     pub fn get_channel(&self, name: &str) -> Option<Arc<dyn Channel>> {
         self.channels_by_name.get(name).cloned()
     }
