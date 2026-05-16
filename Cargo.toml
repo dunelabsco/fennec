@@ -70,6 +70,10 @@ inventory = "0.3"
 # needs a slim build.
 wasmtime = "27"
 wasmtime-wasi = "27"
+# Embed the repo's bundled skills/ directory into the fennec binary at
+# compile time so a fresh install ships with the full bundled-skill set
+# without a separate install step.
+include_dir = "0.7"
 
 [dev-dependencies]
 tempfile = "3.15"
