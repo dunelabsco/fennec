@@ -1,0 +1,139 @@
+// Fennec plugin interface (WIT — WebAssembly Interface Types).
+//
+// This file is the contract between the Fennec runtime and any
+// `.wasm` plugin dropped into `~/.fennec/plugins/<name>/`. Plugin
+// authors implement the `fennec-plugin` world below; the Fennec
+// host implements the `host` interface that plugins import.
+//
+// To author a plugin in Rust:
+//   1. Add `wit-bindgen = "0.x"` to your plugin's Cargo.toml
+//   2. Place a copy of this file at `wit/plugin.wit` in your project
+//   3. Use `wit_bindgen::generate!` to produce typed bindings
+//   4. Implement the `Guest` trait on your plugin type
+//   5. Build with `cargo build --target wasm32-wasip2 --release`
+//   6. Drop the resulting `.wasm` and a `plugin.toml` into
+//      `~/.fennec/plugins/<your-plugin-name>/`
+//
+// The host import surface starts deliberately small (C2a). Future
+// PRs add channel send, sub-tool invocation, more memory ops, and
+// config read.
+
+package fennec:plugin@0.1.0;
+
+// What the host (Fennec) provides to plugins.
+interface host {
+    // Log levels matching `tracing` macros.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    // Emit a log message via the host's `tracing` subscriber.
+    // Logged under the target `fennec::plugin::<plugin-name>`.
+    log: func(level: log-level, message: string);
+
+    // Current Unix time in milliseconds since the epoch.
+    // Provided so plugins don't need a wasi-clocks dependency for
+    // simple timestamp use.
+    now-millis: func() -> u64;
+
+    // Errors from any host function are returned as a single string;
+    // plugins can match on substrings to distinguish kinds, but the
+    // canonical interface is opaque.
+    record host-error {
+        message: string,
+    }
+
+    // ---- HTTP -------------------------------------------------------
+    //
+    // Goes through the host's URL guard. Calls to private IPs
+    // (RFC 1918, link-local, loopback) and non-http(s) schemes are
+    // rejected with an error. Body size capped at 10 MiB.
+
+    record http-header {
+        name: string,
+        value: string,
+    }
+
+    record http-req {
+        method: string,            // "GET" / "POST" / "PUT" / "PATCH" / "DELETE" / "HEAD"
+        url: string,
+        headers: list<http-header>,
+        body: option<list<u8>>,    // raw bytes; UTF-8 if you want a string
+    }
+
+    record http-resp {
+        status: u16,
+        headers: list<http-header>,
+        body: list<u8>,
+    }
+
+    http-request: func(req: http-req) -> result<http-resp, host-error>;
+
+    // ---- Filesystem -------------------------------------------------
+    //
+    // All paths are evaluated against the host's PathSandbox. Reads
+    // and writes outside the configured whitelist return an error.
+    // The plugin sees what the agent itself sees; plugins are not a
+    // privilege escalation.
+
+    read-file: func(path: string) -> result<list<u8>, host-error>;
+    write-file: func(path: string, contents: list<u8>) -> result<_, host-error>;
+
+    // ---- Memory -----------------------------------------------------
+    //
+    // Light wrapper around the host's Memory trait. Plugins can
+    // recall and store entries in the same SQLite store the agent
+    // uses. Entries land in a category derived from the plugin name
+    // by default, so plugins can't pollute Core/Daily/Conversation
+    // categories without explicit category override (which the host
+    // gates).
+
+    record memory-entry {
+        key: string,
+        content: string,
+        category: string,
+        created-at: string,        // RFC3339
+    }
+
+    memory-recall: func(query: string, limit: u32) -> result<list<memory-entry>, host-error>;
+    memory-store: func(key: string, content: string) -> result<_, host-error>;
+}
+
+// What plugins implement.
+interface plugin {
+    // A tool the plugin contributes to the agent. The host wraps
+    // each spec in a `Tool` that calls back into the plugin's
+    // `invoke` when the agent fires the tool.
+    record tool-spec {
+        // Tool name as the LLM sees it. Must be unique across the
+        // agent's tool list; the host rejects duplicates at load.
+        name: string,
+        // One-line description shown to the LLM in the tool list.
+        description: string,
+        // JSON Schema (as a JSON-encoded string) describing the
+        // tool's parameter shape.
+        parameters-schema-json: string,
+    }
+
+    // Called once at plugin load. Returns the list of tools this
+    // plugin contributes. An empty list is valid (a plugin that only
+    // observes lifecycle hooks — a future extension).
+    register: func() -> list<tool-spec>;
+
+    // Called by the host whenever the agent invokes one of this
+    // plugin's tools. `args-json` is the JSON-encoded argument
+    // object; the plugin returns either a JSON-encoded result string
+    // (success) or an error message.
+    invoke: func(tool-name: string, args-json: string) -> result<string, string>;
+}
+
+// The plugin world wires the two interfaces together: plugins
+// implement `plugin` and may import functions from `host`.
+world fennec-plugin {
+    import host;
+    export plugin;
+}
