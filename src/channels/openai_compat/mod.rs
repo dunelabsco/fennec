@@ -33,7 +33,14 @@
 
 pub mod auth;
 pub mod handlers;
+pub mod response_store;
+pub mod session_id;
 pub mod types;
+
+pub use response_store::{ResponseRecord, ResponseStore};
+pub use session_id::{
+    CHANNEL_NAME as SESSION_CHANNEL_NAME, MAX_HISTORY_MESSAGES, SESSION_ID_PREFIX,
+};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -92,12 +99,13 @@ impl OpenAiCompatChannel {
     /// full agent loop (tools, memory, skills, channels). Concurrent
     /// HTTP requests serialize behind the agent's mutex.
     ///
-    /// **Conversation semantics**: only the *last user message* in
-    /// the request's `messages` array is fed to `agent.turn()`. The
-    /// agent maintains its own session history across requests, so
-    /// the channel is effectively stateful from the agent's
-    /// perspective. Future PR (E-2-3) will add per-session
-    /// continuity via an `X-Fennec-Session-Id` header.
+    /// **Default-session conversation semantics**: only the
+    /// *last user message* in the request's `messages` array is fed
+    /// to `agent.turn()`. The agent maintains its own session
+    /// history across requests; the channel is stateful from the
+    /// agent's perspective. To get per-session isolation, use
+    /// [`Self::from_config_with_sessions`] and have clients send
+    /// `X-Fennec-Session-Id`.
     pub fn from_config_with_agent(
         config: &OpenAiCompatChannelEntry,
         agent: Arc<Mutex<Agent>>,
@@ -110,6 +118,39 @@ impl OpenAiCompatChannel {
             agent,
             Arc::new(config.api_key.clone()),
             Arc::new(config.model_name.clone()),
+        );
+        Some(Self {
+            config: config.clone(),
+            state,
+        })
+    }
+
+    /// Agent constructor with session scoping. Activates:
+    ///   - `X-Fennec-Session-Id` header on `/v1/chat/completions`
+    ///     (per-session conversation history loaded from `session_store`)
+    ///   - `POST /v1/responses` (OpenAI Responses API with
+    ///     `previous_response_id` chaining via `response_store`)
+    ///
+    /// Default-session behavior is preserved when `X-Fennec-Session-Id`
+    /// is absent — clients that don't know about sessions get the
+    /// same single-shared-agent behavior as
+    /// `from_config_with_agent`.
+    pub fn from_config_with_sessions(
+        config: &OpenAiCompatChannelEntry,
+        agent: Arc<Mutex<Agent>>,
+        session_store: Arc<crate::sessions::SessionStore>,
+        response_store: Arc<ResponseStore>,
+    ) -> Option<Self> {
+        if !config.enabled {
+            return None;
+        }
+        warn_on_open_config(config);
+        let state = ServerState::from_agent_with_sessions(
+            agent,
+            Arc::new(config.api_key.clone()),
+            Arc::new(config.model_name.clone()),
+            session_store,
+            response_store,
         );
         Some(Self {
             config: config.clone(),
@@ -155,6 +196,7 @@ impl OpenAiCompatChannel {
                 "/v1/chat/completions",
                 post(handlers::chat_completions),
             )
+            .route("/v1/responses", post(handlers::responses))
             .with_state(state);
 
         if !self.config.cors_origins.is_empty() {
