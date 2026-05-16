@@ -16,3 +16,4 @@ pub mod mcp;
 pub mod sessions;
 pub mod onboard;
 pub mod doctor;
+pub mod plugins;
