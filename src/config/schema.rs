@@ -440,6 +440,7 @@ pub struct ChannelsConfig {
     pub email: EmailChannelEntry,
     pub webhook: WebhookChannelEntry,
     pub openai_compat: OpenAiCompatChannelEntry,
+    pub signal: SignalChannelEntry,
 }
 
 impl Default for ChannelsConfig {
@@ -452,6 +453,34 @@ impl Default for ChannelsConfig {
             email: EmailChannelEntry::default(),
             webhook: WebhookChannelEntry::default(),
             openai_compat: OpenAiCompatChannelEntry::default(),
+            signal: SignalChannelEntry::default(),
+        }
+    }
+}
+
+/// Signal channel — connects to a `signal-cli` daemon over HTTP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SignalChannelEntry {
+    pub enabled: bool,
+    pub http_url: String,
+    pub account: String,
+    pub allowed_users: Vec<String>,
+    pub group_allowed_users: Vec<String>,
+    pub ignore_stories: bool,
+    pub home_chat_id: String,
+}
+
+impl Default for SignalChannelEntry {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            http_url: "http://127.0.0.1:8080".to_string(),
+            account: String::new(),
+            allowed_users: Vec::new(),
+            group_allowed_users: Vec::new(),
+            ignore_stories: true,
+            home_chat_id: String::new(),
         }
     }
 }

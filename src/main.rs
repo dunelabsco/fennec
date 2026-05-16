@@ -1252,8 +1252,6 @@ async fn run_gateway(
     }
 
     if ch_config.openai_compat.enabled {
-        // Construct the session + response stores so the channel can
-        // honor `X-Fennec-Session-Id` and serve `/v1/responses`.
         let openai_session_store = Arc::new(
             fennec::sessions::SessionStore::new(&home_dir.join("sessions.db"))
                 .context("opening sessions.db for openai_compat")?,
@@ -1282,10 +1280,16 @@ async fn run_gateway(
             );
         }
     }
-    // Drop the unused-variable warning — `provider` is now optional
-    // (the agent owns it internally). Keeping the binding so the
-    // `build_agent` return tuple still destructures cleanly.
     let _ = provider;
+
+    if let Some(ch) = fennec::channels::SignalChannel::from_config(&ch_config.signal) {
+        channels.push(Arc::new(ch));
+        tracing::info!(
+            account = %ch_config.signal.account,
+            http_url = %ch_config.signal.http_url,
+            "Signal channel enabled"
+        );
+    }
 
     // 3a. Populate the channel map so tools (e.g. ask_user) can reach channels.
     {
