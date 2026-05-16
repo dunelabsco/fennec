@@ -429,6 +429,29 @@ impl WasmPluginInstance {
         Ok(res)
     }
 
+    /// Call the plugin's exported `cli-execute` function. Returns
+    /// the plugin's chosen Unix-style exit code (0 = success,
+    /// nonzero = error).
+    pub async fn call_cli_execute(
+        &self,
+        name: &str,
+        args: &[String],
+    ) -> Result<i32> {
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        let code = inner
+            .bindings
+            .fennec_plugin_plugin()
+            .call_cli_execute(&mut inner.store, name, args)
+            .with_context(|| {
+                format!(
+                    "plugin '{}' cli-execute({}) trapped",
+                    self.plugin_name, name
+                )
+            })?;
+        Ok(code)
+    }
+
     pub async fn call_memory_on_memory_write(
         &self,
         action: crate::plugins::MemoryWriteAction,

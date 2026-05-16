@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::tools::traits::Tool;
 
+use super::cli::CliCommandHandler;
 use super::hooks::{
     OnSessionEndHook, OnSessionStartHook, PostLlmCallHook, PostToolCallHook,
     PreLlmCallHook, PreToolCallHook,
@@ -26,6 +27,11 @@ pub struct PluginContext {
     on_session_start_hooks: Vec<OnSessionStartHook>,
     on_session_end_hooks: Vec<OnSessionEndHook>,
     memory_providers: Vec<Arc<dyn MemoryProvider>>,
+    /// Handler closures keyed by plugin CLI command name. Bound to
+    /// the names declared in
+    /// [`Plugin::cli_commands`](super::traits::Plugin::cli_commands)
+    /// — the registry checks the two lists agree at dispatch time.
+    cli_handlers: Vec<(String, CliCommandHandler)>,
 }
 
 impl PluginContext {
@@ -39,6 +45,7 @@ impl PluginContext {
             on_session_start_hooks: Vec::new(),
             on_session_end_hooks: Vec::new(),
             memory_providers: Vec::new(),
+            cli_handlers: Vec::new(),
         }
     }
 
@@ -94,6 +101,27 @@ impl PluginContext {
         self.memory_providers.push(provider);
     }
 
+    /// Bind a handler closure to one of this plugin's CLI commands.
+    ///
+    /// The plugin's [`Plugin::cli_commands`](super::traits::Plugin::cli_commands)
+    /// returns the *metadata* (names + descriptions); this method
+    /// wires the *handler* for each. They're correlated by name —
+    /// the registry pairs them up at agent-build time and warns if
+    /// any name lacks a matching handler.
+    ///
+    /// `handler` is a synchronous closure receiving the args
+    /// following `fennec <plugin-cmd>` and returning a Unix-style
+    /// exit code. Handlers run on the main process thread (not in a
+    /// spawned task), so a long-running command blocks the CLI.
+    /// Plugins that need async work spawn it themselves and join.
+    pub fn register_cli_command(
+        &mut self,
+        name: impl Into<String>,
+        handler: CliCommandHandler,
+    ) {
+        self.cli_handlers.push((name.into(), handler));
+    }
+
     /// Drain everything the plugin contributed. Used by the registry.
     pub(super) fn into_parts(self) -> PluginContextParts {
         PluginContextParts {
@@ -105,6 +133,7 @@ impl PluginContext {
             on_session_start_hooks: self.on_session_start_hooks,
             on_session_end_hooks: self.on_session_end_hooks,
             memory_providers: self.memory_providers,
+            cli_handlers: self.cli_handlers,
         }
     }
 }
@@ -119,6 +148,7 @@ pub(super) struct PluginContextParts {
     pub on_session_start_hooks: Vec<OnSessionStartHook>,
     pub on_session_end_hooks: Vec<OnSessionEndHook>,
     pub memory_providers: Vec<Arc<dyn MemoryProvider>>,
+    pub cli_handlers: Vec<(String, CliCommandHandler)>,
 }
 
 impl Default for PluginContext {
