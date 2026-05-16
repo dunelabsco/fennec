@@ -1442,39 +1442,29 @@ async fn main() -> Result<()> {
     // parse. The first pass is allowed to be permissive — it just
     // peeks for those two values.
 
-<<<<<<< HEAD
-    // Resolve the Fennec home directory from the flags.
-    //
-    // `--config-dir` and `--profile` are mutually exclusive: each is a
-    // way of choosing the same thing (where state lives), and accepting
-    // both at once would force an arbitrary precedence rule that's
-    // easy to misremember. Reject the combination with a clear error
-    // rather than silently picking one. When neither is set we fall
-    // back to the historical default (`$FENNEC_HOME` or `~/.fennec/`),
-    // so existing installs are byte-identical.
-    let home_dir = match (cli.config_dir.as_deref(), cli.profile.as_deref()) {
-        (Some(_), Some(_)) => {
-            anyhow::bail!(
-                "--config-dir and --profile are mutually exclusive; use one or the other"
-            );
-        }
+    // Resolve the Fennec home directory from raw argv BEFORE clap
+    // parses, so plugin CLI discovery (below) sees the right
+    // `[plugins].enabled` list. `--config-dir` and `--profile` are
+    // mutually exclusive — each picks the same thing (where state
+    // lives) so accepting both at once would force an arbitrary
+    // precedence rule. Reject the combination here.
+    let raw_args: Vec<String> = std::env::args().collect();
+    let pre_config_dir = preparse_config_dir(&raw_args);
+    let pre_profile = preparse_profile(&raw_args);
+    if pre_config_dir.is_some() && pre_profile.is_some() {
+        anyhow::bail!(
+            "--config-dir and --profile are mutually exclusive; use one or the other"
+        );
+    }
+    let pre_home = match (pre_config_dir.as_deref(), pre_profile.as_deref()) {
         (Some(path), None) => FennecConfig::resolve_home(Some(path)),
         (None, Some(name)) => FennecConfig::resolve_profile_home(name)
             .with_context(|| format!("resolving profile '{}'", name))?,
-        (None, None) => FennecConfig::resolve_home(None),
+        _ => FennecConfig::resolve_home(None),
     };
-    let config_path = home_dir.join("config.toml");
-    let config = if config_path.exists() {
-        FennecConfig::load(&config_path)
-            .with_context(|| format!("loading config from {}", config_path.display()))?
-=======
-    let raw_args: Vec<String> = std::env::args().collect();
-    let pre_config_dir = preparse_config_dir(&raw_args);
-    let pre_home = FennecConfig::resolve_home(pre_config_dir.as_deref());
     let pre_config_path = pre_home.join("config.toml");
     let pre_config = if pre_config_path.exists() {
         FennecConfig::load(&pre_config_path).unwrap_or_default()
->>>>>>> pr-50
     } else {
         FennecConfig::default()
     };
@@ -1588,6 +1578,22 @@ fn preparse_config_dir(args: &[String]) -> Option<String> {
             return iter.next().cloned();
         }
         if let Some(v) = a.strip_prefix("--config-dir=") {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Pre-parse the `--profile` flag from raw argv, same pattern as
+/// `preparse_config_dir`. Plugin CLI discovery has to happen before
+/// clap parses, so both flags need pre-extraction.
+fn preparse_profile(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        if a == "--profile" {
+            return iter.next().cloned();
+        }
+        if let Some(v) = a.strip_prefix("--profile=") {
             return Some(v.to_string());
         }
     }
