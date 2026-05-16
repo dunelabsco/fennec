@@ -424,6 +424,7 @@ async fn build_agent(
     Arc<Mutex<Option<CronOrigin>>>,
     fennec::bus::PendingReplies,
     fennec::bus::ChatDirectory,
+    Arc<dyn Provider>,
 )> {
     // Create SecretStore.
     let secret_store =
@@ -986,7 +987,7 @@ async fn build_agent(
         .build()
         .context("building agent")?;
 
-    Ok((agent, memory, cron_origin, pending_replies, chat_directory))
+    Ok((agent, memory, cron_origin, pending_replies, chat_directory, provider))
 }
 
 async fn run_agent(
@@ -998,7 +999,7 @@ async fn run_agent(
     // CLI mode doesn't run the gateway, so the channel-aware handles are
     // unused here. We still need to bind them to suppress unused-let
     // warnings without losing the build_agent return-shape.
-    let (mut agent, memory, _cron_origin, _pending_replies, _chat_directory) =
+    let (mut agent, memory, _cron_origin, _pending_replies, _chat_directory, _provider) =
         build_agent(&config, &home_dir, model, None, None).await?;
 
     if let Some(msg) = message {
@@ -1079,7 +1080,7 @@ async fn run_gateway(
     let channel_map = new_channel_map();
 
     // 2. Build Agent (pass channel map so ask_user tool can reach channels).
-    let (agent, _memory, cron_origin, pending_replies, chat_directory) =
+    let (agent, _memory, cron_origin, pending_replies, chat_directory, provider) =
         build_agent(
             &config,
             &home_dir,
@@ -1247,6 +1248,19 @@ async fn run_gateway(
             port = ch_config.webhook.port,
             routes = ch_config.webhook.routes.len(),
             "Webhook channel enabled"
+        );
+    }
+
+    if let Some(ch) = fennec::channels::OpenAiCompatChannel::from_config(
+        &ch_config.openai_compat,
+        Arc::clone(&provider),
+    ) {
+        channels.push(Arc::new(ch));
+        tracing::info!(
+            host = %ch_config.openai_compat.host,
+            port = ch_config.openai_compat.port,
+            model = %ch_config.openai_compat.model_name,
+            "OpenAI-compat channel enabled"
         );
     }
 

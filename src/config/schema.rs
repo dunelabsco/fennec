@@ -439,6 +439,7 @@ pub struct ChannelsConfig {
     pub whatsapp: WhatsAppChannelEntry,
     pub email: EmailChannelEntry,
     pub webhook: WebhookChannelEntry,
+    pub openai_compat: OpenAiCompatChannelEntry,
 }
 
 impl Default for ChannelsConfig {
@@ -450,6 +451,32 @@ impl Default for ChannelsConfig {
             whatsapp: WhatsAppChannelEntry::default(),
             email: EmailChannelEntry::default(),
             webhook: WebhookChannelEntry::default(),
+            openai_compat: OpenAiCompatChannelEntry::default(),
+        }
+    }
+}
+
+/// OpenAI-compatible HTTP API channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenAiCompatChannelEntry {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub api_key: String,
+    pub model_name: String,
+    pub cors_origins: String,
+}
+
+impl Default for OpenAiCompatChannelEntry {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".into(),
+            port: 8642,
+            api_key: String::new(),
+            model_name: "fennec-agent".into(),
+            cors_origins: String::new(),
         }
     }
 }
