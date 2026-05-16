@@ -1,5 +1,5 @@
 pub mod schema;
 pub use schema::{
     AuxiliaryConfigToml, AuxiliaryTaskToml, FennecConfig, ProviderConfig,
-    SkillsConfigToml, SkillsGuardConfigToml,
+    SkillsConfigToml, SkillsGuardConfigToml, WebhookChannelEntry, WebhookRouteEntry,
 };
