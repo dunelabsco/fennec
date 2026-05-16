@@ -19,6 +19,8 @@ tokio = { version = "1.50", default-features = false, features = ["rt-multi-thre
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking", "multipart"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 chacha20poly1305 = "0.10"
+zeroize = "1"
+fs2 = "0.4"
 async-trait = "0.1"
 parking_lot = "0.12"
 clap = { version = "4.5", features = ["derive"] }
