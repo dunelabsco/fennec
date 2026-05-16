@@ -1095,6 +1095,10 @@ async fn stream_response(
                     // we synthesize at Done; the upstream Usage event
                     // is informational and ignored here.
                 }
+                StreamEvent::Reasoning(_) => {
+                    // Extended thinking is consumed by the TUI; the
+                    // OpenAI wire protocol has no equivalent field.
+                }
             }
         }
     };
@@ -1294,6 +1298,9 @@ async fn stream_response_via_agent(
                 }
                 StreamEvent::Usage(_) => {
                     // Token usage is informational here; ignored.
+                }
+                StreamEvent::Reasoning(_) => {
+                    // No OpenAI counterpart.
                 }
             }
         }
