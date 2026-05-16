@@ -22,6 +22,7 @@ fn make_outbound(content: &str) -> OutboundMessage {
         chat_id: "chat_1".to_string(),
         reply_to: None,
         metadata: HashMap::new(),
+        attachments: Vec::new(),
     }
 }
 

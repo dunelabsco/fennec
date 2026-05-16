@@ -117,6 +117,7 @@ async fn test_outbound_dispatch_to_correct_channel() {
         chat_id: "ch_123".to_string(),
         reply_to: None,
         metadata: HashMap::new(),
+        attachments: Vec::new(),
     };
     bus.publish_outbound(out_msg).await.unwrap();
 
@@ -127,6 +128,7 @@ async fn test_outbound_dispatch_to_correct_channel() {
         chat_id: "ch_456".to_string(),
         reply_to: None,
         metadata: HashMap::new(),
+        attachments: Vec::new(),
     };
     bus.publish_outbound(out_msg2).await.unwrap();
 
@@ -199,6 +201,7 @@ async fn test_outbound_unknown_channel_ignored() {
         chat_id: "ch_999".to_string(),
         reply_to: None,
         metadata: HashMap::new(),
+        attachments: Vec::new(),
     };
     bus.publish_outbound(out_msg).await.unwrap();
 

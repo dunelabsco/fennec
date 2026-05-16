@@ -9,6 +9,7 @@ pub mod email;
 pub mod webhook;
 pub mod openai_compat;
 pub mod signal;
+pub mod matrix;
 
 pub use traits::{Channel, ChannelMessage, SendMessage};
 pub use cli::CliChannel;
@@ -21,6 +22,7 @@ pub use email::EmailChannel;
 pub use webhook::WebhookChannel;
 pub use openai_compat::OpenAiCompatChannel;
 pub use signal::SignalChannel;
+pub use matrix::MatrixChannel;
 
 use std::collections::HashMap;
 use std::sync::Arc;
