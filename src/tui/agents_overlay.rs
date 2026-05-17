@@ -8,15 +8,15 @@
 //! usable.
 //!
 //! Visual language follows Fennec's existing palette + border
-//! style, not Hermes' specific UX:
-//!   - SAND_GOLD title + outer double border
-//!   - SUBDUED metadata, MUTED_GREEN/AMBER/TERRACOTTA status dots
+//! style, not the upstream's specific UX:
+//!   - s.sand_gold title + outer double border
+//!   - s.subdued metadata, s.muted_green/s.amber/s.terracotta status dots
 //!   - The same `▸ tool · name(args)` glyphs the chat panel uses
 //!     for tool calls
-//!   - Single-line key-hint footer in SAND_GOLD/SUBDUED
+//!   - Single-line key-hint footer in s.sand_gold/s.subdued
 //!
-//! Hot-branch heat marker uses an AMBER → TERRACOTTA gradient
-//! (matching our existing alert palette). Hermes' algorithm is
+//! Hot-branch heat marker uses an s.amber → s.terracotta gradient
+//! (matching our existing alert palette). the upstream's algorithm is
 //! ported verbatim — `tools / sec` normalised to tree peak.
 
 use ratatui::Frame;
@@ -29,13 +29,14 @@ use ratatui::widgets::{
 };
 
 use super::app::App;
+use super::skin::Skin;
 use super::spawn_tree::{SpawnTree, SubagentStatus};
-use super::theme::*;
 
 /// Top-level overlay renderer. Sized to most of the screen with
 /// a 4-cell margin so the underlying status bar / shortcuts row
 /// stay visible behind it.
 pub fn draw_agents_overlay(f: &mut Frame, screen: Rect, app: &App) {
+    let s = &app.skin;
     let width = screen.width.saturating_sub(4);
     let height = screen.height.saturating_sub(2);
     let area = Rect {
@@ -82,11 +83,11 @@ pub fn draw_agents_overlay(f: &mut Frame, screen: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(SAND_GOLD))
-        .style(Style::default().bg(BG_DUSK))
+        .border_style(Style::default().fg(s.sand_gold))
+        .style(Style::default().bg(s.bg_dusk))
         .title(Line::from(Span::styled(
             title,
-            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
+            Style::default().fg(s.sand_gold).add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -113,9 +114,210 @@ pub fn draw_agents_overlay(f: &mut Frame, screen: Rect, app: &App) {
             .split(body[0])
     };
 
-    draw_tree_pane(f, panes[0], app, tree);
-    draw_detail_pane(f, panes[1], app, tree);
+    // /replay-diff mode swaps the two-pane layout for a
+    // side-by-side diff of the chosen snapshots.
+    if let Some((a, b)) = app.agents_diff_pair {
+        draw_diff_view(f, body[0], app, a, b);
+    } else {
+        draw_tree_pane(f, panes[0], app, tree);
+        draw_detail_pane(f, panes[1], app, tree);
+    }
     draw_overlay_footer(f, body[1], app, tree);
+}
+
+/// Side-by-side comparison of two completed spawn-tree snapshots.
+/// Reads `(a, b)` as 1-based indices into `spawn_history`. Renders
+/// summary stats for each + a delta row. Modelled on the upstream's
+/// `replay-diff` (`agentsOverlay.tsx:573-678`) but trimmed to the
+/// metrics Fennec's `AggregateMetrics` actually carries — no
+/// per-token graph, no Gantt diff.
+fn draw_diff_view(f: &mut Frame, area: Rect, app: &App, a: usize, b: usize) {
+    let s = &app.skin;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(s.panel_border))
+        .title(Line::from(vec![
+            Span::styled("┤ ", Style::default().fg(s.panel_border)),
+            Span::styled("diff", Style::default().fg(s.sand_gold)),
+            Span::styled(
+                format!(" · {a} → {b} "),
+                Style::default().fg(s.subdued),
+            ),
+            Span::styled("├", Style::default().fg(s.panel_border)),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let snap_a = app.spawn_history.get(a.saturating_sub(1));
+    let snap_b = app.spawn_history.get(b.saturating_sub(1));
+    let (Some(snap_a), Some(snap_b)) = (snap_a, snap_b) else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "snapshot pair out of range",
+                Style::default().fg(s.subdued),
+            ))),
+            inner,
+        );
+        return;
+    };
+
+    // Layout: two snapshot panes side-by-side on top, a single
+    // delta row underneath. The delta row makes the side-by-side
+    // a real diff (not just two adjacent totals).
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(8)])
+        .split(inner);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(split[0]);
+    draw_diff_pane(f, panes[0], "baseline", a, &snap_a.tree, s);
+    draw_diff_pane(f, panes[1], "candidate", b, &snap_b.tree, s);
+    draw_diff_deltas(f, split[1], &snap_a.tree, &snap_b.tree, s);
+}
+
+/// Render the Δ metrics row that makes diff-view a real diff.
+/// One line per metric: `tools: 12 → 18 (+6)`. Sign is `+/-/±0`.
+fn draw_diff_deltas(
+    f: &mut Frame,
+    area: Rect,
+    a: &SpawnTree,
+    b: &SpawnTree,
+    s: &Skin,
+) {
+    let ta = tree_totals(a);
+    let tb = tree_totals(b);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " Δ metrics",
+        Style::default().fg(s.sand_gold).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(delta_field_u(
+        "tools",
+        ta.subtree_tools as i64,
+        tb.subtree_tools as i64,
+        s,
+    ));
+    lines.push(delta_field_u(
+        "duration",
+        ta.subtree_duration_ms as i64,
+        tb.subtree_duration_ms as i64,
+        s,
+    ));
+    lines.push(delta_field_u(
+        "depth",
+        ta.max_depth as i64,
+        tb.max_depth as i64,
+        s,
+    ));
+    lines.push(delta_field_u(
+        "tokens",
+        (ta.input_tokens + ta.output_tokens) as i64,
+        (tb.input_tokens + tb.output_tokens) as i64,
+        s,
+    ));
+    if ta.cost_usd > 0.0 || tb.cost_usd > 0.0 {
+        let delta = tb.cost_usd - ta.cost_usd;
+        let sign = if delta > 0.0 {
+            "+"
+        } else if delta < 0.0 {
+            "-"
+        } else {
+            "±"
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:<10}", "cost"), Style::default().fg(s.subdued)),
+            Span::styled(
+                format!("${:.4} → ${:.4}  ({sign}${:.4})", ta.cost_usd, tb.cost_usd, delta.abs()),
+                Style::default().fg(s.text_cream),
+            ),
+        ]));
+    }
+    if ta.files_touched > 0 || tb.files_touched > 0 {
+        lines.push(delta_field_u(
+            "files",
+            ta.files_touched as i64,
+            tb.files_touched as i64,
+            s,
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn delta_field_u(label: &str, a: i64, b: i64, s: &Skin) -> Line<'static> {
+    let delta = b - a;
+    let sign = match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => "+",
+        std::cmp::Ordering::Less => "-",
+        std::cmp::Ordering::Equal => "±",
+    };
+    Line::from(vec![
+        Span::styled(format!(" {label:<10}"), Style::default().fg(s.subdued)),
+        Span::styled(
+            format!("{a} → {b}  ({sign}{})", delta.abs()),
+            Style::default().fg(s.text_cream),
+        ),
+    ])
+}
+
+fn draw_diff_pane(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    index: usize,
+    tree: &SpawnTree,
+    s: &Skin,
+) {
+    let totals = tree_totals(tree);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("[{index}] {label} "),
+            Style::default().fg(s.sand_gold).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("· {} agent{}", tree.len(), plural(tree.len())),
+            Style::default().fg(s.subdued),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(diff_field("tools", &totals.subtree_tools.to_string(), s));
+    lines.push(diff_field(
+        "duration",
+        &format!("{} ms", totals.subtree_duration_ms),
+        s,
+    ));
+    lines.push(diff_field("depth", &totals.max_depth.to_string(), s));
+    lines.push(diff_field(
+        "tokens",
+        &format!(
+            "{} in · {} out",
+            totals.input_tokens, totals.output_tokens
+        ),
+        s,
+    ));
+    if totals.cost_usd > 0.0 {
+        lines.push(diff_field("cost", &format!("${:.4}", totals.cost_usd), s));
+    }
+    if totals.files_touched > 0 {
+        lines.push(diff_field("files", &totals.files_touched.to_string(), s));
+    }
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn diff_field(label: &str, value: &str, s: &Skin) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {label:<10}"), Style::default().fg(s.subdued)),
+        Span::styled(value.to_string(), Style::default().fg(s.text_cream)),
+    ])
 }
 
 fn plural(n: usize) -> &'static str {
@@ -152,7 +354,7 @@ fn tree_totals(tree: &SpawnTree) -> super::spawn_tree::AggregateMetrics {
 
 /// 8-step unicode bar sparkline derived from agents-per-depth.
 /// Zero columns render as a space so a sparse tree doesn't read
-/// as uniform activity. Matches Hermes' `SPARK_RAMP`.
+/// as uniform activity. Matches the upstream's `SPARK_RAMP`.
 fn sparkline(widths: &[u32]) -> String {
     const RAMP: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
     let max = widths.iter().copied().max().unwrap_or(0);
@@ -211,14 +413,15 @@ fn status_mix(tree: &SpawnTree) -> String {
 }
 
 fn draw_tree_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
+    let s = &app.skin;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(PANEL_BORDER))
+        .border_style(Style::default().fg(s.panel_border))
         .title(Line::from(vec![
-            Span::styled("┤ ", Style::default().fg(PANEL_BORDER)),
-            Span::styled("tree", Style::default().fg(SAND_GOLD)),
-            Span::styled(" ├", Style::default().fg(PANEL_BORDER)),
+            Span::styled("┤ ", Style::default().fg(s.panel_border)),
+            Span::styled("tree", Style::default().fg(s.sand_gold)),
+            Span::styled(" ├", Style::default().fg(s.panel_border)),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -227,7 +430,7 @@ fn draw_tree_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "no sub-agents — delegate from a turn to populate",
-                Style::default().fg(SUBDUED),
+                Style::default().fg(s.subdued),
             ))),
             inner,
         );
@@ -265,13 +468,13 @@ fn draw_tree_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
     let mix = status_mix(tree);
     let mut header_spans = Vec::new();
     if !spark.is_empty() {
-        header_spans.push(Span::styled(spark, Style::default().fg(SAND_GOLD)));
+        header_spans.push(Span::styled(spark, Style::default().fg(s.sand_gold)));
     }
     if !mix.is_empty() {
         if !header_spans.is_empty() {
-            header_spans.push(Span::styled("  ", Style::default().fg(SUBDUED)));
+            header_spans.push(Span::styled("  ", Style::default().fg(s.subdued)));
         }
-        header_spans.push(Span::styled(mix, Style::default().fg(SUBDUED)));
+        header_spans.push(Span::styled(mix, Style::default().fg(s.subdued)));
     }
 
     let mut lines: Vec<Line> = Vec::new();
@@ -285,7 +488,7 @@ fn draw_tree_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
     if flat.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("no rows match filter: {}", app.agents_filter.label()),
-            Style::default().fg(SUBDUED),
+            Style::default().fg(s.subdued),
         )));
     } else {
         for id in &flat {
@@ -295,6 +498,7 @@ fn draw_tree_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
                     node,
                     app.agents_cursor.as_deref(),
                     peak,
+                    s,
                 ));
             }
         }
@@ -309,10 +513,11 @@ fn draw_tree_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
 /// (first roots in render order). Each row is `id · ▓▓▓` with
 /// the bar showing the node's lifetime relative to the earliest
 /// `started_at`. The cursor's row is highlighted. Matches
-/// Hermes' `GanttStrip` (`agentsOverlay.tsx:216-348`) without
+/// the upstream's `GanttStrip` (`agentsOverlay.tsx:216-348`) without
 /// the live-tick refresh — ratatui's full-frame redraw already
 /// covers that.
 fn draw_gantt_strip(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
+    let s = &app.skin;
     use std::time::Instant;
     // Pick nodes: first 6 roots; if there are fewer than 6
     // roots, pad with their first descendants.
@@ -374,8 +579,8 @@ fn draw_gantt_strip(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
             format!("{:<6}", id)
         };
         let is_selected = app.agents_cursor.as_deref() == Some(id.as_str());
-        let bar_color = status_color(node.status);
-        let label_color = if is_selected { SAND_GOLD } else { SUBDUED };
+        let bar_color = status_color(node.status, s);
+        let label_color = if is_selected { s.sand_gold } else { s.subdued };
         lines.push(Line::from(vec![
             Span::styled(format!("{id_label} "), Style::default().fg(label_color)),
             Span::styled(pad, Style::default()),
@@ -393,17 +598,18 @@ fn render_row(
     node: &super::spawn_tree::SubagentNode,
     cursor_id: Option<&str>,
     peak: f64,
+    s: &Skin,
 ) -> Line<'static> {
     let indent = "  ".repeat(node.depth as usize);
     let is_selected = cursor_id == Some(node.id.as_str());
     let metrics = tree.aggregate(&node.id);
     let bucket = tree.hot_bucket(&node.id, peak);
-    let heat_color = heat_color_for(bucket);
+    let heat_color = heat_color_for(bucket, s);
     let goal_preview =
         truncate_goal(&node.goal, 28usize.saturating_sub(node.depth as usize * 2));
-    let row_bg = if is_selected { HIGHLIGHT_BG } else { BG_DUSK };
+    let row_bg = if is_selected { s.highlight_bg } else { s.bg_dusk };
     let row_style = Style::default().bg(row_bg);
-    let glyph_color = status_color(node.status);
+    let glyph_color = status_color(node.status, s);
     let mut spans = Vec::with_capacity(8);
     spans.push(Span::styled(indent, row_style));
     if bucket >= 2 {
@@ -418,23 +624,23 @@ fn render_row(
     spans.push(Span::styled(
         goal_preview,
         row_style
-            .fg(TEXT_CREAM)
+            .fg(s.text_cream)
             .add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() }),
     ));
     spans.push(Span::styled(
         format!(" · {}t", metrics.local_tools),
-        row_style.fg(SUBDUED),
+        row_style.fg(s.subdued),
     ));
     if metrics.descendant_count > 0 {
         spans.push(Span::styled(
             format!(" ↓{}", metrics.descendant_count),
-            row_style.fg(SUBDUED),
+            row_style.fg(s.subdued),
         ));
     }
     if metrics.active_count > 0 {
         spans.push(Span::styled(
             format!(" ⚡{}", metrics.active_count),
-            row_style.fg(AMBER),
+            row_style.fg(s.amber),
         ));
     }
     Line::from(spans)
@@ -442,21 +648,22 @@ fn render_row(
 
 
 fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
+    let s = &app.skin;
     let focused = app.agents_detail_focused;
-    let border_color = if focused { SAND_GOLD } else { PANEL_BORDER };
+    let border_color = if focused { s.sand_gold } else { s.panel_border };
     let title_label = if focused {
-        Span::styled("detail · scrolling", Style::default().fg(SAND_GOLD))
+        Span::styled("detail · scrolling", Style::default().fg(s.sand_gold))
     } else {
-        Span::styled("detail", Style::default().fg(SAND_GOLD))
+        Span::styled("detail", Style::default().fg(s.sand_gold))
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(border_color))
         .title(Line::from(vec![
-            Span::styled("┤ ", Style::default().fg(PANEL_BORDER)),
+            Span::styled("┤ ", Style::default().fg(s.panel_border)),
             title_label,
-            Span::styled(" ├", Style::default().fg(PANEL_BORDER)),
+            Span::styled(" ├", Style::default().fg(s.panel_border)),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -465,7 +672,7 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "no node selected",
-                Style::default().fg(SUBDUED),
+                Style::default().fg(s.subdued),
             ))),
             inner,
         );
@@ -475,7 +682,7 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "selected node not in active tree",
-                Style::default().fg(SUBDUED),
+                Style::default().fg(s.subdued),
             ))),
             inner,
         );
@@ -491,15 +698,15 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
     lines.push(Line::from(vec![
         Span::styled(
             format!("#{id_short} "),
-            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
+            Style::default().fg(s.sand_gold).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{} ", node.status.glyph()),
-            Style::default().fg(status_color(node.status)),
+            Style::default().fg(status_color(node.status, s)),
         ),
         Span::styled(
             truncate_goal(&node.goal, inner.width.saturating_sub(18) as usize),
-            Style::default().fg(TEXT_CREAM).add_modifier(Modifier::BOLD),
+            Style::default().fg(s.text_cream).add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::raw(""));
@@ -508,18 +715,20 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
     lines.push(meta_line(
         "depth",
         &format!("{} · {}", node.depth, node.status.label()),
-        status_color(node.status),
+        status_color(node.status, s),
+        s,
     ));
     if let Some(ref m) = node.model {
-        lines.push(meta_line("model", m, SUBDUED));
+        lines.push(meta_line("model", m, s.subdued, s));
     }
     if !node.toolsets.is_empty() {
-        lines.push(meta_line("toolsets", &node.toolsets.join(", "), SUBDUED));
+        lines.push(meta_line("toolsets", &node.toolsets.join(", "), s.subdued, s));
     }
     lines.push(meta_line(
         "tools",
         &format!("{} (subtree {})", metrics.local_tools, metrics.subtree_tools),
-        SUBDUED,
+        s.subdued,
+        s,
     ));
     lines.push(meta_line(
         "subtree",
@@ -530,23 +739,26 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
             metrics.max_depth,
             metrics.active_count,
         ),
-        SUBDUED,
+        s.subdued,
+        s,
     ));
     if node.duration_ms() > 0 {
         lines.push(meta_line(
             "elapsed",
             &format_duration_ms(node.duration_ms()),
-            SUBDUED,
+            s.subdued,
+            s,
         ));
     }
     if node.iteration > 0 {
-        lines.push(meta_line("iteration", &node.iteration.to_string(), SUBDUED));
+        lines.push(meta_line("iteration", &node.iteration.to_string(), s.subdued, s));
     }
     if node.api_calls > 0 {
         lines.push(meta_line(
             "api calls",
             &node.api_calls.to_string(),
-            SUBDUED,
+            s.subdued,
+            s,
         ));
     }
     lines.push(Line::raw(""));
@@ -557,7 +769,7 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
     let local_cost = node.cost_usd;
     let subtree_cost = metrics.cost_usd - local_cost;
     if local_tokens > 0 || local_cost > 0.0 || subtree_tokens > 0 || subtree_cost > 0.0 {
-        push_section_header(&mut lines, "Budget", None, true);
+        push_section_header(&mut lines, "Budget", None, true, s);
         if local_tokens > 0 {
             let mut value = format!(
                 "{} in · {} out",
@@ -567,19 +779,20 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
             if node.reasoning_tokens > 0 {
                 value.push_str(&format!(" · {} reasoning", fmt_tokens(node.reasoning_tokens)));
             }
-            lines.push(field_line("tokens", &value));
+            lines.push(field_line("tokens", &value, s));
         }
         if local_cost > 0.0 {
             let mut value = fmt_cost(local_cost);
             if subtree_cost >= 0.01 {
                 value.push_str(&format!(" · subtree +{}", fmt_cost(subtree_cost)));
             }
-            lines.push(field_line("cost", &value));
+            lines.push(field_line("cost", &value, s));
         }
         if subtree_tokens > 0 {
             lines.push(field_line(
                 "subtree tokens",
                 &format!("+{}", fmt_tokens(subtree_tokens)),
+                s,
             ));
         }
         lines.push(Line::raw(""));
@@ -592,17 +805,18 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
             "Files",
             Some(node.files_read.len() + node.files_written.len()),
             false,
+            s,
         );
         for p in node.files_written.iter().take(8) {
             lines.push(Line::from(Span::styled(
                 format!("  +{p}"),
-                Style::default().fg(MUTED_GREEN),
+                Style::default().fg(s.muted_green),
             )));
         }
         for p in node.files_read.iter().take(8) {
             lines.push(Line::from(vec![
-                Span::styled("  · ", Style::default().fg(SUBDUED)),
-                Span::styled(p.clone(), Style::default().fg(TEXT_CREAM)),
+                Span::styled("  · ", Style::default().fg(s.subdued)),
+                Span::styled(p.clone(), Style::default().fg(s.text_cream)),
             ]));
         }
         let overflow = node.files_read.len().saturating_sub(8)
@@ -610,7 +824,7 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
         if overflow > 0 {
             lines.push(Line::from(Span::styled(
                 format!("  …+{overflow} more"),
-                Style::default().fg(SUBDUED),
+                Style::default().fg(s.subdued),
             )));
         }
         lines.push(Line::raw(""));
@@ -623,26 +837,26 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
         node.tools.len()
     };
     if tool_count > 0 {
-        push_section_header(&mut lines, "Tool calls", Some(tool_count), true);
+        push_section_header(&mut lines, "Tool calls", Some(tool_count), true, s);
         if !node.tools.is_empty() {
             for tool in node.tools.iter().take(20) {
                 lines.push(Line::from(vec![
-                    Span::styled("  ▸ ", Style::default().fg(TOOL_PINK)),
+                    Span::styled("  ▸ ", Style::default().fg(s.tool_pink)),
                     Span::styled(
                         tool.name.clone(),
-                        Style::default().fg(TOOL_PINK).add_modifier(Modifier::BOLD),
+                        Style::default().fg(s.tool_pink).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(" · ", Style::default().fg(SUBDUED)),
+                    Span::styled(" · ", Style::default().fg(s.subdued)),
                     Span::styled(
                         truncate_inline(&tool.preview, inner.width as usize),
-                        Style::default().fg(SUBDUED),
+                        Style::default().fg(s.subdued),
                     ),
                 ]));
             }
             if node.tools.len() > 20 {
                 lines.push(Line::from(Span::styled(
                     format!("  …+{} more", node.tools.len() - 20),
-                    Style::default().fg(SUBDUED),
+                    Style::default().fg(s.subdued),
                 )));
             }
         } else {
@@ -650,10 +864,10 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
             // names if no live tools are recorded.
             for entry in node.output_tail.iter().take(20) {
                 lines.push(Line::from(vec![
-                    Span::styled("  ▸ ", Style::default().fg(TOOL_PINK)),
+                    Span::styled("  ▸ ", Style::default().fg(s.tool_pink)),
                     Span::styled(
                         entry.tool.clone(),
-                        Style::default().fg(TOOL_PINK).add_modifier(Modifier::BOLD),
+                        Style::default().fg(s.tool_pink).add_modifier(Modifier::BOLD),
                     ),
                 ]));
             }
@@ -668,9 +882,10 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
             "Output",
             Some(node.output_tail.len()),
             true,
+            s,
         );
         for entry in node.output_tail.iter() {
-            let tool_color = if entry.is_error { TERRACOTTA } else { SAND_GOLD };
+            let tool_color = if entry.is_error { s.terracotta } else { s.sand_gold };
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(
@@ -681,9 +896,9 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
                 Span::styled(
                     truncate_inline(&entry.preview, inner.width as usize),
                     if entry.is_error {
-                        Style::default().fg(TERRACOTTA)
+                        Style::default().fg(s.terracotta)
                     } else {
-                        Style::default().fg(TEXT_CREAM)
+                        Style::default().fg(s.text_cream)
                     },
                 ),
             ]));
@@ -693,13 +908,13 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
 
     // ── Progress section (notes) ─────────────────────────────
     if !node.notes.is_empty() {
-        push_section_header(&mut lines, "Progress", Some(node.notes.len()), false);
+        push_section_header(&mut lines, "Progress", Some(node.notes.len()), false, s);
         for note in node.notes.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
             lines.push(Line::from(vec![
-                Span::styled("  · ", Style::default().fg(SUBDUED)),
+                Span::styled("  · ", Style::default().fg(s.subdued)),
                 Span::styled(
                     truncate_inline(note, inner.width as usize),
-                    Style::default().fg(SUBDUED),
+                    Style::default().fg(s.subdued),
                 ),
             ]));
         }
@@ -708,18 +923,18 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
 
     // ── Summary section ──────────────────────────────────────
     if let Some(ref summary) = node.summary {
-        push_section_header(&mut lines, "Summary", None, true);
+        push_section_header(&mut lines, "Summary", None, true, s);
         lines.push(Line::from(Span::styled(
             format!("  {summary}"),
-            Style::default().fg(TEXT_CREAM),
+            Style::default().fg(s.text_cream),
         )));
         lines.push(Line::raw(""));
     } else if let Some(ref out) = node.output {
-        push_section_header(&mut lines, "Output text", None, true);
+        push_section_header(&mut lines, "Output text", None, true, s);
         for raw in out.split('\n').take(12) {
             lines.push(Line::from(Span::styled(
                 format!("  {raw}"),
-                Style::default().fg(TEXT_CREAM),
+                Style::default().fg(s.text_cream),
             )));
         }
     }
@@ -751,9 +966,9 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .style(Style::default().fg(if app.agents_detail_focused {
-                    SAND_GOLD
+                    s.sand_gold
                 } else {
-                    SUBDUED
+                    s.subdued
                 })),
             bar_area,
             &mut state,
@@ -763,7 +978,7 @@ fn draw_detail_pane(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
 
 /// Push a section-header line to the detail-pane output. `▾`
 /// signals the section is open, `▸` collapsed (rendered for
-/// parity with Hermes' visual language — Fennec currently always
+/// parity with the upstream's visual language — Fennec currently always
 /// shows the section body when open, since no key toggle is
 /// wired). `count` adds `(N)` when present.
 fn push_section_header(
@@ -771,6 +986,7 @@ fn push_section_header(
     title: &str,
     count: Option<usize>,
     open: bool,
+    s: &Skin,
 ) {
     let glyph = if open { "▾" } else { "▸" };
     let count_suffix = count
@@ -779,15 +995,15 @@ fn push_section_header(
     lines.push(Line::from(vec![
         Span::styled(
             format!("{glyph} {title}{count_suffix}"),
-            Style::default().fg(SAND_GOLD).add_modifier(Modifier::BOLD),
+            Style::default().fg(s.sand_gold).add_modifier(Modifier::BOLD),
         ),
     ]));
 }
 
-fn field_line(label: &str, value: &str) -> Line<'static> {
+fn field_line(label: &str, value: &str, s: &Skin) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {label:<10}"), Style::default().fg(SUBDUED)),
-        Span::styled(value.to_string(), Style::default().fg(TEXT_CREAM)),
+        Span::styled(format!("  {label:<10}"), Style::default().fg(s.subdued)),
+        Span::styled(value.to_string(), Style::default().fg(s.text_cream)),
     ])
 }
 
@@ -826,43 +1042,44 @@ fn format_duration_ms(ms: u64) -> String {
     }
 }
 
-fn meta_line(label: &str, value: &str, color: Color) -> Line<'static> {
+fn meta_line(label: &str, value: &str, color: Color, s: &Skin) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{label:<12}"),
-            Style::default().fg(SUBDUED),
+            Style::default().fg(s.subdued),
         ),
         Span::styled(value.to_string(), Style::default().fg(color)),
     ])
 }
 
-fn status_color(status: SubagentStatus) -> Color {
+fn status_color(status: SubagentStatus, s: &Skin) -> Color {
     match status {
-        SubagentStatus::Queued => AMBER,
-        SubagentStatus::Running => MUTED_GREEN,
-        SubagentStatus::Completed => MUTED_GREEN,
-        SubagentStatus::Failed => TERRACOTTA,
-        SubagentStatus::Interrupted => SUBDUED,
+        SubagentStatus::Queued => s.amber,
+        SubagentStatus::Running => s.muted_green,
+        SubagentStatus::Completed => s.muted_green,
+        SubagentStatus::Failed => s.terracotta,
+        SubagentStatus::Interrupted => s.subdued,
     }
 }
 
 /// Hot-branch palette: amber → terracotta gradient. Buckets 0-1
 /// stay un-coloured (no heat marker); 2-4 light up progressively.
-fn heat_color_for(bucket: usize) -> Color {
+fn heat_color_for(bucket: usize, s: &Skin) -> Color {
     match bucket {
-        2 => AMBER,
-        3 => TOOL_PINK,
-        4 => TERRACOTTA,
-        _ => SUBDUED,
+        2 => s.amber,
+        3 => s.tool_pink,
+        4 => s.terracotta,
+        _ => s.subdued,
     }
 }
 
 fn draw_overlay_footer(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
+    let s = &app.skin;
     // Transient flash takes priority over the legend when set.
     if let Some((body, _)) = app.agents_flash.as_ref() {
         let flash = Paragraph::new(Line::from(Span::styled(
             format!(" ⚑ {body}"),
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default().fg(s.amber).add_modifier(Modifier::BOLD),
         )));
         f.render_widget(flash, area);
         return;
@@ -881,29 +1098,29 @@ fn draw_overlay_footer(f: &mut Frame, area: Rect, app: &App, tree: &SpawnTree) {
         " · live".to_string()
     };
     let footer = Line::from(vec![
-        Span::styled(" ↑↓/jk ", Style::default().fg(SAND_GOLD)),
-        Span::styled("nav ", Style::default().fg(SUBDUED)),
-        Span::styled("[s] ", Style::default().fg(SAND_GOLD)),
+        Span::styled(" ↑↓/jk ", Style::default().fg(s.sand_gold)),
+        Span::styled("nav ", Style::default().fg(s.subdued)),
+        Span::styled("[s] ", Style::default().fg(s.sand_gold)),
         Span::styled(
             format!("sort:{} ", app.agents_sort.label()),
-            Style::default().fg(SUBDUED),
+            Style::default().fg(s.subdued),
         ),
-        Span::styled("[f] ", Style::default().fg(SAND_GOLD)),
+        Span::styled("[f] ", Style::default().fg(s.sand_gold)),
         Span::styled(
             format!("filter:{} ", app.agents_filter.label()),
-            Style::default().fg(SUBDUED),
+            Style::default().fg(s.subdued),
         ),
-        Span::styled("[]/<> ", Style::default().fg(SAND_GOLD)),
-        Span::styled("history ", Style::default().fg(SUBDUED)),
-        Span::styled("[p] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("pause ", Style::default().fg(SUBDUED)),
-        Span::styled("[x/X] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("kill[+sub] ", Style::default().fg(SUBDUED)),
-        Span::styled("[q/esc] ", Style::default().fg(SAND_GOLD)),
-        Span::styled("close", Style::default().fg(SUBDUED)),
+        Span::styled("[]/<> ", Style::default().fg(s.sand_gold)),
+        Span::styled("history ", Style::default().fg(s.subdued)),
+        Span::styled("[p] ", Style::default().fg(s.sand_gold)),
+        Span::styled("pause ", Style::default().fg(s.subdued)),
+        Span::styled("[x/X] ", Style::default().fg(s.sand_gold)),
+        Span::styled("kill[+sub] ", Style::default().fg(s.subdued)),
+        Span::styled("[q/esc] ", Style::default().fg(s.sand_gold)),
+        Span::styled("close", Style::default().fg(s.subdued)),
         Span::styled(
             mode_marker,
-            Style::default().fg(SUBDUED).add_modifier(Modifier::DIM),
+            Style::default().fg(s.subdued).add_modifier(Modifier::DIM),
         ),
     ]);
     f.render_widget(Paragraph::new(footer), area);

@@ -16,6 +16,12 @@ impl SystemPromptBuilder {
         }
     }
 
+    /// Accessor used by `Agent::set_persona` to preserve the
+    /// existing identity name across a persona swap.
+    pub fn identity_name(&self) -> &str {
+        &self.identity_name
+    }
+
     /// Build the full system prompt string.
     ///
     /// - `memory_context`: recent memory entries formatted as strings.

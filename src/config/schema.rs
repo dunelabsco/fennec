@@ -99,7 +99,10 @@ pub struct AuxiliaryTaskToml {
     pub timeout_secs: u64,
 }
 
-/// User-toggleable TUI display settings.
+/// User-toggleable TUI display settings that survive a restart.
+/// New entries here should match the command that toggles them —
+/// `/compact`, `/details`, `/skin`, `/statusbar`, `/indicator`,
+/// `/verbose`, `/busy`, `/reasoning`, `/personality`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TuiConfig {
@@ -113,6 +116,28 @@ pub struct TuiConfig {
     /// Hermes' `details_mode.*` config keys + `ui.sections`.
     #[serde(default)]
     pub details_sections: std::collections::HashMap<String, String>,
+    /// Status bar position. One of `"top"`, `"bottom"`, `"off"`.
+    /// Empty / unknown falls back to `"bottom"` at runtime to
+    /// preserve existing behaviour. Toggled by `/statusbar`.
+    pub statusbar: String,
+    /// Active skin (theme variant). Empty falls back to
+    /// `"fennec-warm"` (current palette). Toggled by `/skin`.
+    pub skin: String,
+    /// Spinner indicator style. One of `"braille"` (default,
+    /// matches existing behaviour), `"ascii"`, `"kaomoji"`,
+    /// `"emoji"`, `"unicode"`. Toggled by `/indicator`.
+    pub indicator: String,
+    /// Tool-output verbosity. One of `"normal"` (default) or
+    /// `"verbose"`. Toggled by `/verbose`.
+    pub verbose: String,
+    /// Behaviour when Enter is pressed mid-turn. One of
+    /// `"interrupt"` (default), `"queue"`, `"steer"`. Toggled
+    /// by `/busy`.
+    pub busy: String,
+    /// Active persona name. Empty = use IdentityConfig.persona
+    /// as-is. Otherwise looks up a built-in or user preset.
+    /// Toggled by `/personality`.
+    pub personality: String,
 }
 
 /// Tool toggle configuration.

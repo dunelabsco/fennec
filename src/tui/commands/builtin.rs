@@ -48,6 +48,23 @@ pub fn register_all(r: &mut CommandRegistry) {
     r.register(Box::new(Copy));
     r.register(Box::new(Edit));
     r.register(Box::new(Agents));
+    // F1-2-E commands.
+    r.register(Box::new(Fortune));
+    r.register(Box::new(Queue));
+    r.register(Box::new(StatusBar));
+    r.register(Box::new(Logs));
+    r.register(Box::new(Indicator));
+    r.register(Box::new(ReloadSkills));
+    r.register(Box::new(Verbose));
+    r.register(Box::new(Busy));
+    r.register(Box::new(Reasoning));
+    r.register(Box::new(Personality));
+    r.register(Box::new(Branch));
+    r.register(Box::new(Replay));
+    r.register(Box::new(ReplayDiff));
+    r.register(Box::new(Compress));
+    r.register(Box::new(Rollback));
+    r.register(Box::new(Skin));
 }
 
 // -- Lifecycle / focus -------------------------------------------
@@ -102,6 +119,22 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("copy [n]", "copy a past assistant message to clipboard"),
     ("edit", "open $EDITOR with the current input pre-filled (also Ctrl-G)"),
     ("agents", "open the spawn-tree dashboard (/agents pause|resume|status)"),
+    ("fortune", "show a random / daily fortune"),
+    ("queue [msg]", "enqueue a message for the next turn"),
+    ("statusbar / sb", "toggle status bar (top|bottom|off|toggle)"),
+    ("logs [n]", "show the last n tracing lines"),
+    ("indicator", "spinner style (braille|ascii|kaomoji|emoji|unicode)"),
+    ("reload-skills", "rescan ~/.fennec/skills and refresh prompt"),
+    ("verbose", "tool-output verbosity (on|off|cycle)"),
+    ("busy", "Enter mid-turn behaviour (interrupt|queue|steer|status)"),
+    ("reasoning", "thinking effort + visibility (off|low|medium|high|xhigh|hide|show)"),
+    ("personality", "swap persona name (empty resets to default)"),
+    ("branch / fork", "fork the current session into a new row"),
+    ("replay", "open spawn-tree history (N|last|list|load)"),
+    ("replay-diff", "diff two spawn-tree snapshots in the overlay"),
+    ("compress [topic]", "summarise older history into one message"),
+    ("rollback", "list checkpoints or restore one (rollback list|<hash>)"),
+    ("skin [name]", "swap theme variant (fennec-warm|mono|light|cool|list)"),
 ];
 
 struct Quit;
@@ -988,6 +1021,612 @@ impl CommandHandler for Agents {
     }
 }
 
+// -- F1-2-E command set -----------------------------------------
+
+struct Fortune;
+impl CommandHandler for Fortune {
+    fn name(&self) -> &'static str {
+        "fortune"
+    }
+    fn help(&self) -> &'static str {
+        "show a random or daily fortune"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let mode = args.trim().to_lowercase();
+        let line = match mode.as_str() {
+            "" | "random" => random_fortune(),
+            "daily" | "stable" | "today" => daily_fortune(
+                app.current_session_id.as_deref().unwrap_or("anon"),
+            ),
+            _ => {
+                return Ok(CommandOutcome::Status(
+                    "usage: /fortune [random|daily]".into(),
+                ));
+            }
+        };
+        push_system(app, line);
+        Ok(CommandOutcome::Status("ok".into()))
+    }
+}
+
+const FORTUNES: &[&str] = &[
+    "🦊 minimal diff, maximal calm",
+    "🌅 the desert remembers every footprint",
+    "✨ ship the smaller change first",
+    "🔥 a clean compile is its own reward",
+    "🌾 test what you trust; trust what you test",
+    "🪶 brevity is the soul of code review",
+    "🌙 sleep on the breaking change",
+    "🧭 every refactor is an act of optimism",
+    "🍶 read the error before fixing the symptom",
+    "🌵 patience scales; haste compounds",
+];
+const LEGENDARIES: &[&str] = &[
+    "🌟 legendary drop: the fox's silent compile",
+    "🌟 legendary drop: the merge that fixed three bugs you didn't know about",
+    "🌟 legendary drop: a green CI run on Monday morning",
+];
+
+fn fortune_hash(seed: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    seed.hash(&mut h);
+    h.finish()
+}
+
+fn random_fortune() -> String {
+    // Use a fresh-each-call seed via nanos so /fortune feels live.
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    if n % 20 == 0 {
+        LEGENDARIES[(n as usize) % LEGENDARIES.len()].to_string()
+    } else {
+        FORTUNES[(n as usize) % FORTUNES.len()].to_string()
+    }
+}
+
+fn daily_fortune(session_id: &str) -> String {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let seed = format!("{session_id}|{today}");
+    let n = fortune_hash(&seed);
+    if n % 20 == 0 {
+        LEGENDARIES[(n as usize) % LEGENDARIES.len()].to_string()
+    } else {
+        FORTUNES[(n as usize) % FORTUNES.len()].to_string()
+    }
+}
+
+struct Queue;
+impl CommandHandler for Queue {
+    fn name(&self) -> &'static str {
+        "queue"
+    }
+    fn help(&self) -> &'static str {
+        "enqueue a message for the next turn (or count queued)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let text = args.trim();
+        if text.is_empty() {
+            let n = app.queued_input.len();
+            let body = if n == 0 {
+                "queue is empty".to_string()
+            } else {
+                format!(
+                    "{n} queued message{}",
+                    if n == 1 { "" } else { "s" }
+                )
+            };
+            push_system(app, body);
+            return Ok(CommandOutcome::Status("ok".into()));
+        }
+        app.queued_input.push_back(text.to_string());
+        let preview: String = text.chars().take(50).collect();
+        let suffix = if text.chars().count() > 50 { "…" } else { "" };
+        push_system(app, format!("queued: \"{preview}{suffix}\""));
+        Ok(CommandOutcome::Status("queued".into()))
+    }
+}
+
+struct StatusBar;
+impl CommandHandler for StatusBar {
+    fn name(&self) -> &'static str {
+        "statusbar"
+    }
+    fn help(&self) -> &'static str {
+        "status bar position (top|bottom|off|toggle)"
+    }
+    fn aliases(&self) -> &[&'static str] {
+        &["sb"]
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let raw = args.trim().to_lowercase();
+        let next = match raw.as_str() {
+            "" | "toggle" => app.statusbar_position.toggle(),
+            other => match crate::tui::app::StatusBarPosition::parse(other) {
+                Some(p) => p,
+                None => {
+                    return Ok(CommandOutcome::Status(
+                        "usage: /statusbar [top|bottom|off|toggle]".into(),
+                    ));
+                }
+            },
+        };
+        if next == app.statusbar_position {
+            push_system(
+                app,
+                format!("status bar already {}", next.as_str()),
+            );
+            return Ok(CommandOutcome::Status("noop".into()));
+        }
+        app.statusbar_position = next;
+        push_system(app, format!("status bar {}", next.as_str()));
+        Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
+    }
+}
+
+struct Logs;
+impl CommandHandler for Logs {
+    fn name(&self) -> &'static str {
+        "logs"
+    }
+    fn help(&self) -> &'static str {
+        "show the last n tracing lines (1..80, default 20)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let n_raw = args.trim();
+        let n: usize = if n_raw.is_empty() {
+            20
+        } else {
+            n_raw.parse::<usize>().unwrap_or(20).clamp(1, 80)
+        };
+        let lines = app.log_ring.tail(n);
+        if lines.is_empty() {
+            push_system(app, "no tracing output captured yet".into());
+            return Ok(CommandOutcome::Status("empty".into()));
+        }
+        let mut body = format!("last {} log line{}:\n", lines.len(), if lines.len() == 1 { "" } else { "s" });
+        for line in &lines {
+            body.push_str("  ");
+            body.push_str(line);
+            body.push('\n');
+        }
+        push_system(app, body.trim_end().to_string());
+        Ok(CommandOutcome::Status(format!("shown {}", lines.len())))
+    }
+}
+
+struct Indicator;
+impl CommandHandler for Indicator {
+    fn name(&self) -> &'static str {
+        "indicator"
+    }
+    fn help(&self) -> &'static str {
+        "spinner style (braille|ascii|kaomoji|emoji|unicode)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let raw = args.trim().to_lowercase();
+        if raw.is_empty() {
+            push_system(
+                app,
+                format!("indicator: {}", app.indicator_style.as_str()),
+            );
+            return Ok(CommandOutcome::Status("ok".into()));
+        }
+        let Some(next) = crate::tui::app::IndicatorStyle::parse(&raw) else {
+            return Ok(CommandOutcome::Status(
+                "usage: /indicator [braille|ascii|kaomoji|emoji|unicode]".into(),
+            ));
+        };
+        if next == app.indicator_style {
+            push_system(app, format!("indicator already {}", next.as_str()));
+            return Ok(CommandOutcome::Status("noop".into()));
+        }
+        app.indicator_style = next;
+        push_system(app, format!("indicator → {}", next.as_str()));
+        Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
+    }
+}
+
+struct ReloadSkills;
+impl CommandHandler for ReloadSkills {
+    fn name(&self) -> &'static str {
+        "reload-skills"
+    }
+    fn help(&self) -> &'static str {
+        "rescan ~/.fennec/skills and refresh the agent's prompt"
+    }
+    fn aliases(&self) -> &[&'static str] {
+        &["reload_skills"]
+    }
+    fn execute(&self, _args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        Ok(CommandOutcome::Agent(AgentAction::ReloadSkills))
+    }
+}
+
+struct Verbose;
+impl CommandHandler for Verbose {
+    fn name(&self) -> &'static str {
+        "verbose"
+    }
+    fn help(&self) -> &'static str {
+        "tool-output verbosity (on|off|cycle)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let raw = args.trim().to_lowercase();
+        let next = match raw.as_str() {
+            "" | "cycle" => app.verbosity.toggle(),
+            other => match crate::tui::app::VerbosityMode::parse(other) {
+                Some(v) => v,
+                None => {
+                    return Ok(CommandOutcome::Status(
+                        "usage: /verbose [on|off|cycle]".into(),
+                    ));
+                }
+            },
+        };
+        if next == app.verbosity {
+            push_system(app, format!("verbose already {}", next.as_str()));
+            return Ok(CommandOutcome::Status("noop".into()));
+        }
+        app.verbosity = next;
+        push_system(app, format!("verbose: {}", next.as_str()));
+        Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
+    }
+}
+
+struct Busy;
+impl CommandHandler for Busy {
+    fn name(&self) -> &'static str {
+        "busy"
+    }
+    fn help(&self) -> &'static str {
+        "Enter mid-turn behaviour (interrupt|queue|steer|status)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let raw = args.trim().to_lowercase();
+        match raw.as_str() {
+            "" | "status" => {
+                push_system(
+                    app,
+                    format!("busy input mode: {}", app.busy_mode.as_str()),
+                );
+                Ok(CommandOutcome::Status("ok".into()))
+            }
+            other => match crate::tui::app::BusyMode::parse(other) {
+                Some(next) => {
+                    if next == app.busy_mode {
+                        push_system(
+                            app,
+                            format!("busy already {}", next.as_str()),
+                        );
+                        return Ok(CommandOutcome::Status("noop".into()));
+                    }
+                    app.busy_mode = next;
+                    push_system(app, format!("busy → {}", next.as_str()));
+                    Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
+                }
+                None => Ok(CommandOutcome::Status(
+                    "usage: /busy [interrupt|queue|steer|status]".into(),
+                )),
+            },
+        }
+    }
+}
+
+struct Reasoning;
+impl CommandHandler for Reasoning {
+    fn name(&self) -> &'static str {
+        "reasoning"
+    }
+    fn help(&self) -> &'static str {
+        "thinking effort + visibility (off|low|medium|high|xhigh|hide|show)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        use crate::agent::thinking::ThinkingLevel;
+        let raw = args.trim().to_lowercase();
+        match raw.as_str() {
+            "" => {
+                push_system(app, "usage: /reasoning [off|low|medium|high|xhigh|hide|show]".into());
+                Ok(CommandOutcome::Status("ok".into()))
+            }
+            "hide" => {
+                app.show_reasoning = false;
+                push_system(app, "reasoning · hidden".into());
+                Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
+            }
+            "show" => {
+                app.show_reasoning = true;
+                push_system(app, "reasoning · shown".into());
+                Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
+            }
+            "off" | "low" | "medium" | "high" | "max" | "xhigh" => {
+                let level = match raw.as_str() {
+                    "off" => ThinkingLevel::Off,
+                    "low" => ThinkingLevel::Low,
+                    "medium" => ThinkingLevel::Medium,
+                    "high" => ThinkingLevel::High,
+                    "max" | "xhigh" => ThinkingLevel::Max,
+                    _ => unreachable!(),
+                };
+                push_system(app, format!("reasoning effort → {raw}"));
+                Ok(CommandOutcome::Agent(AgentAction::SetThinkingLevel(level)))
+            }
+            _ => Ok(CommandOutcome::Status(
+                "usage: /reasoning [off|low|medium|high|max|hide|show]".into(),
+            )),
+        }
+    }
+}
+
+struct Personality;
+impl CommandHandler for Personality {
+    fn name(&self) -> &'static str {
+        "personality"
+    }
+    fn help(&self) -> &'static str {
+        "swap the agent's persona by preset name (empty = reset)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let name = args.trim().to_string();
+        if name == app.personality_name {
+            let label = if name.is_empty() { "default".into() } else { name.clone() };
+            push_system(app, format!("personality already {label}"));
+            return Ok(CommandOutcome::Status("noop".into()));
+        }
+        let preset_persona = lookup_personality(&name);
+        match preset_persona {
+            Some(persona) => {
+                app.personality_name = name.clone();
+                let label = if name.is_empty() { "default".into() } else { name };
+                push_system(app, format!("personality → {label}"));
+                Ok(CommandOutcome::Agent(AgentAction::SetPersona(persona)))
+            }
+            None => Ok(CommandOutcome::Status(format!(
+                "/personality: unknown preset '{name}' (see /help for the list)"
+            ))),
+        }
+    }
+}
+
+/// Built-in personality presets. Map a name → persona string the
+/// agent injects into its system prompt. Empty `""` name resets
+/// to the IdentityConfig default. Users can add their own presets
+/// later via config; built-ins ship out of the box.
+fn lookup_personality(name: &str) -> Option<String> {
+    match name {
+        "" | "default" => Some(
+            "Your personal AI agent — sharp, resourceful, and always on.".to_string(),
+        ),
+        "terse" => Some(
+            "A focused operator. Brief replies, no preamble, never reasoning out loud unless asked.".to_string(),
+        ),
+        "tutor" => Some(
+            "A patient teacher. Explains every step, anticipates confusion, offers concrete examples.".to_string(),
+        ),
+        "reviewer" => Some(
+            "A meticulous reviewer. Calls out edge cases, security issues, naming, and consistency. \
+             Pushes back on ambiguous requirements.".to_string(),
+        ),
+        "researcher" => Some(
+            "A curious investigator. Pulls primary sources, cross-checks claims, distinguishes data from opinion.".to_string(),
+        ),
+        _ => None,
+    }
+}
+
+struct Branch;
+impl CommandHandler for Branch {
+    fn name(&self) -> &'static str {
+        "branch"
+    }
+    fn help(&self) -> &'static str {
+        "fork the current session into a fresh row"
+    }
+    fn aliases(&self) -> &[&'static str] {
+        &["fork"]
+    }
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        let raw = args.trim();
+        let title = if raw.is_empty() {
+            None
+        } else {
+            Some(raw.to_string())
+        };
+        Ok(CommandOutcome::Agent(AgentAction::BranchSession(title)))
+    }
+}
+
+struct Replay;
+impl CommandHandler for Replay {
+    fn name(&self) -> &'static str {
+        "replay"
+    }
+    fn help(&self) -> &'static str {
+        "open a completed spawn tree (N|last|list)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let raw = args.trim();
+        let lower = raw.to_lowercase();
+        if app.spawn_history.is_empty() {
+            push_system(app, "no completed spawn trees this session".into());
+            return Ok(CommandOutcome::Status("empty".into()));
+        }
+        if lower == "list" || lower == "ls" {
+            let mut body = format!(
+                "spawn history · {} snapshot{}:\n",
+                app.spawn_history.len(),
+                if app.spawn_history.len() == 1 { "" } else { "s" }
+            );
+            for i in 0..app.spawn_history.len() {
+                if let Some(snap) = app.spawn_history.get(i) {
+                    body.push_str(&format!(
+                        "  {idx}. {n} agent{plural} · {label}\n",
+                        idx = i + 1,
+                        n = snap.tree.len(),
+                        plural = if snap.tree.len() == 1 { "" } else { "s" },
+                        label = snap.label,
+                    ));
+                }
+            }
+            push_system(app, body.trim_end().to_string());
+            return Ok(CommandOutcome::Status("listed".into()));
+        }
+        let max = app.spawn_history.len();
+        let index = if raw.is_empty() || lower == "last" {
+            1
+        } else {
+            match raw.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= max => n,
+                _ => {
+                    return Ok(CommandOutcome::Status(format!(
+                        "/replay: index out of range 1..{max}"
+                    )));
+                }
+            }
+        };
+        app.agents_history_index = index;
+        // Clear any in-flight diff pair so reopening the overlay
+        // after a /replay-diff session shows the single-tree
+        // view, not the side-by-side diff.
+        app.agents_diff_pair = None;
+        app.show_agents_overlay = true;
+        app.agents_cursor = app.agents_flat_node_ids().first().cloned();
+        push_system(app, format!("replay · {index}/{max}"));
+        Ok(CommandOutcome::Status("ok".into()))
+    }
+}
+
+struct ReplayDiff;
+impl CommandHandler for ReplayDiff {
+    fn name(&self) -> &'static str {
+        "replay-diff"
+    }
+    fn help(&self) -> &'static str {
+        "compare two spawn-tree snapshots (history indexes a b)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.len() != 2 {
+            return Ok(CommandOutcome::Status(
+                "usage: /replay-diff <a> <b>  (e.g. /replay-diff 1 2 for last two)".into(),
+            ));
+        }
+        let parse_idx = |s: &str| -> Option<usize> {
+            s.parse::<usize>()
+                .ok()
+                .filter(|n| *n >= 1 && *n <= app.spawn_history.len())
+        };
+        let (Some(a), Some(b)) = (parse_idx(parts[0]), parse_idx(parts[1])) else {
+            return Ok(CommandOutcome::Status(format!(
+                "/replay-diff: could not resolve indices · history has {} entries",
+                app.spawn_history.len()
+            )));
+        };
+        app.agents_diff_pair = Some((a, b));
+        app.agents_history_index = 0;
+        app.show_agents_overlay = true;
+        push_system(app, format!("diff · {a} → {b}"));
+        Ok(CommandOutcome::Status("ok".into()))
+    }
+}
+
+struct Compress;
+impl CommandHandler for Compress {
+    fn name(&self) -> &'static str {
+        "compress"
+    }
+    fn help(&self) -> &'static str {
+        "summarise older history into a single system message"
+    }
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        let topic = args.trim();
+        let payload = if topic.is_empty() {
+            None
+        } else {
+            Some(topic.to_string())
+        };
+        Ok(CommandOutcome::Agent(AgentAction::CompressHistory(payload)))
+    }
+}
+
+struct Skin;
+impl CommandHandler for Skin {
+    fn name(&self) -> &'static str {
+        "skin"
+    }
+    fn help(&self) -> &'static str {
+        "swap theme variant (empty = status, list = enumerate built-ins)"
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let raw = args.trim();
+        let lower = raw.to_lowercase();
+        if raw.is_empty() {
+            let active = if app.skin_name.is_empty() {
+                "fennec-warm"
+            } else {
+                app.skin_name.as_str()
+            };
+            push_system(app, format!("skin: {active}"));
+            return Ok(CommandOutcome::Status("ok".into()));
+        }
+        if lower == "list" || lower == "ls" {
+            let names = crate::tui::skin::Skin::builtin_names();
+            push_system(app, format!("skins: {}", names.join(", ")));
+            return Ok(CommandOutcome::Status("ok".into()));
+        }
+        // Resolve via the user's fennec home so `~/.fennec/skins/<name>.toml`
+        // Built-ins are applied immediately; user-defined skins
+        // need disk lookup, so we defer to `ApplyUserSkin` which
+        // runs in the submit loop where `home_dir` is in scope.
+        // For built-ins we set `skin_name` AND `skin` together;
+        // for user skins we wait — the worker sets both fields
+        // only on successful resolve so a missing file doesn't
+        // leave the persisted name pointing at a phantom skin.
+        match crate::tui::skin::Skin::builtin(raw) {
+            Some(s) => {
+                app.skin_name = raw.to_string();
+                app.skin = s;
+                push_system(app, format!("skin → {raw}"));
+                Ok(CommandOutcome::Agent(AgentAction::PersistTuiSettings))
+            }
+            None => {
+                // User-defined skin — actual load happens in the
+                // submit loop where the home_dir handle is available.
+                push_system(
+                    app,
+                    format!("skin → {raw}  (resolving from ~/.fennec/skins/{raw}.toml)"),
+                );
+                Ok(CommandOutcome::Agent(AgentAction::ApplyUserSkin(
+                    raw.to_string(),
+                )))
+            }
+        }
+    }
+}
+
+struct Rollback;
+impl CommandHandler for Rollback {
+    fn name(&self) -> &'static str {
+        "rollback"
+    }
+    fn help(&self) -> &'static str {
+        "conversation rollback (list or <hash>)"
+    }
+    fn execute(&self, args: &str, _app: &mut App) -> Result<CommandOutcome> {
+        let trimmed = args.trim();
+        let lower = trimmed.to_lowercase();
+        if trimmed.is_empty() || lower == "list" || lower == "ls" {
+            return Ok(CommandOutcome::Agent(AgentAction::RollbackList));
+        }
+        Ok(CommandOutcome::Agent(AgentAction::RollbackTo(
+            trimmed.to_string(),
+        )))
+    }
+}
+
 // -- Helpers ----------------------------------------------------
 
 fn push_system(app: &mut App, body: String) {
@@ -1021,6 +1660,7 @@ fn first_line(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::{BusyMode, IndicatorStyle, StatusBarPosition, VerbosityMode};
 
     fn dispatch(name: &str, args: &str) -> (CommandOutcome, App) {
         let r = CommandRegistry::with_builtins();
@@ -1483,12 +2123,319 @@ mod tests {
             "help", "quit", "clear", "resume", "title", "save", "history",
             "compact", "details", "redraw", "mouse", "model", "voice",
             "usage", "status", "steer", "undo", "retry", "skills", "tools",
-            "reload", "reload-mcp", "image", "paste", "copy",
+            "reload", "reload-mcp", "image", "paste", "copy", "agents",
+            "fortune", "queue", "statusbar", "logs", "indicator",
+            "reload-skills", "verbose", "busy", "reasoning", "personality",
+            "branch", "replay", "replay-diff", "compress", "rollback", "skin",
         ] {
             assert!(
                 names.contains(required),
                 "missing required command: {required}"
             );
         }
+    }
+
+    #[test]
+    fn fortune_random_emits_system_line() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("fortune", "", &mut app).unwrap();
+        let body = last_system_body(&app).unwrap();
+        assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn fortune_unknown_arg_surfaces_usage() {
+        let (outcome, _app) = dispatch("fortune", "weekly");
+        match outcome {
+            CommandOutcome::Status(s) => assert!(s.contains("usage")),
+            other => panic!("expected Status with usage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn queue_no_arg_reports_count() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("queue", "", &mut app).unwrap();
+        assert!(last_system_body(&app).unwrap().contains("empty"));
+        app.queued_input.push_back("first".into());
+        r.dispatch("queue", "", &mut app).unwrap();
+        assert!(last_system_body(&app).unwrap().contains("1 queued message"));
+    }
+
+    #[test]
+    fn queue_with_arg_enqueues_message() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("queue", "explore option B", &mut app).unwrap();
+        assert_eq!(app.queued_input.len(), 1);
+        assert_eq!(app.queued_input[0], "explore option B");
+    }
+
+    #[test]
+    fn statusbar_toggle_cycles_all_three_positions() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        assert_eq!(app.statusbar_position, StatusBarPosition::Bottom);
+        r.dispatch("statusbar", "toggle", &mut app).unwrap();
+        assert_eq!(app.statusbar_position, StatusBarPosition::Top);
+        r.dispatch("sb", "toggle", &mut app).unwrap();
+        assert_eq!(app.statusbar_position, StatusBarPosition::Off);
+        r.dispatch("statusbar", "toggle", &mut app).unwrap();
+        assert_eq!(app.statusbar_position, StatusBarPosition::Bottom);
+    }
+
+    #[test]
+    fn statusbar_top_emits_persist() {
+        let (outcome, app) = dispatch("statusbar", "top");
+        assert_eq!(app.statusbar_position, StatusBarPosition::Top);
+        match outcome {
+            CommandOutcome::Agent(AgentAction::PersistTuiSettings) => {}
+            other => panic!("expected PersistTuiSettings, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn logs_empty_says_no_output() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("logs", "", &mut app).unwrap();
+        assert!(last_system_body(&app).unwrap().contains("no tracing output"));
+    }
+
+    #[test]
+    fn logs_clamps_n_to_range() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        for i in 0..150 {
+            app.log_ring.push(format!("line {i}"));
+        }
+        r.dispatch("logs", "200", &mut app).unwrap();
+        // 200 clamps to 80 → 80 lines shown.
+        let body = last_system_body(&app).unwrap();
+        assert!(body.contains("last 80 log lines"), "got: {body}");
+    }
+
+    #[test]
+    fn indicator_cycles_styles() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        assert_eq!(app.indicator_style, IndicatorStyle::Braille);
+        r.dispatch("indicator", "kaomoji", &mut app).unwrap();
+        assert_eq!(app.indicator_style, IndicatorStyle::Kaomoji);
+    }
+
+    #[test]
+    fn verbose_cycle_toggles() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("verbose", "cycle", &mut app).unwrap();
+        assert_eq!(app.verbosity, VerbosityMode::Verbose);
+        r.dispatch("verbose", "off", &mut app).unwrap();
+        assert_eq!(app.verbosity, VerbosityMode::Normal);
+    }
+
+    #[test]
+    fn busy_status_reports_current_mode() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("busy", "status", &mut app).unwrap();
+        assert!(last_system_body(&app).unwrap().contains("interrupt"));
+    }
+
+    #[test]
+    fn busy_set_emits_persist() {
+        let (outcome, app) = dispatch("busy", "queue");
+        assert_eq!(app.busy_mode, BusyMode::Queue);
+        match outcome {
+            CommandOutcome::Agent(AgentAction::PersistTuiSettings) => {}
+            other => panic!("expected PersistTuiSettings, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reasoning_level_emits_set_thinking_level() {
+        let (outcome, _app) = dispatch("reasoning", "high");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::SetThinkingLevel(
+                crate::agent::thinking::ThinkingLevel::High,
+            )) => {}
+            other => panic!("expected SetThinkingLevel(High), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reasoning_hide_toggles_show_flag() {
+        let (_outcome, app) = dispatch("reasoning", "hide");
+        assert!(!app.show_reasoning);
+    }
+
+    #[test]
+    fn personality_unknown_preset_returns_status() {
+        let (outcome, app) = dispatch("personality", "anarchic");
+        assert_eq!(app.personality_name, "");
+        match outcome {
+            CommandOutcome::Status(s) => assert!(s.contains("unknown preset")),
+            other => panic!("expected unknown-preset status, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn personality_terse_emits_set_persona() {
+        let (outcome, app) = dispatch("personality", "terse");
+        assert_eq!(app.personality_name, "terse");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::SetPersona(p)) => {
+                assert!(p.starts_with("A focused operator"));
+            }
+            other => panic!("expected SetPersona, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn branch_no_arg_emits_branch_session_with_none() {
+        let (outcome, _app) = dispatch("branch", "");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::BranchSession(None)) => {}
+            other => panic!("expected BranchSession(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fork_alias_dispatches_to_branch() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        let outcome = r.dispatch("fork", "explore", &mut app).unwrap();
+        match outcome {
+            CommandOutcome::Agent(AgentAction::BranchSession(Some(t))) => {
+                assert_eq!(t, "explore");
+            }
+            other => panic!("expected BranchSession(Some), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reload_skills_emits_action() {
+        let (outcome, _app) = dispatch("reload-skills", "");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::ReloadSkills) => {}
+            other => panic!("expected ReloadSkills, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn replay_empty_history_says_so() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("replay", "", &mut app).unwrap();
+        assert!(last_system_body(&app).unwrap().contains("no completed"));
+    }
+
+    #[test]
+    fn replay_diff_validates_argument_count() {
+        let (outcome, _app) = dispatch("replay-diff", "1");
+        match outcome {
+            CommandOutcome::Status(s) => assert!(s.contains("usage")),
+            other => panic!("expected usage status, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compress_no_arg_emits_compress_history_with_none() {
+        let (outcome, _app) = dispatch("compress", "");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::CompressHistory(None)) => {}
+            other => panic!("expected CompressHistory(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compress_with_arg_passes_focus_topic() {
+        let (outcome, _app) = dispatch("compress", "auth refactor");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::CompressHistory(Some(t))) => {
+                assert_eq!(t, "auth refactor");
+            }
+            other => panic!("expected CompressHistory(Some), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rollback_no_arg_emits_rollback_list() {
+        let (outcome, _app) = dispatch("rollback", "");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::RollbackList) => {}
+            other => panic!("expected RollbackList, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rollback_list_alias_dispatches_to_list() {
+        let (outcome, _app) = dispatch("rollback", "list");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::RollbackList) => {}
+            other => panic!("expected RollbackList, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rollback_hash_emits_rollback_to() {
+        let (outcome, _app) = dispatch("rollback", "deadbeef");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::RollbackTo(h)) => {
+                assert_eq!(h, "deadbeef");
+            }
+            other => panic!("expected RollbackTo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn skin_no_arg_reports_active_palette() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("skin", "", &mut app).unwrap();
+        assert!(last_system_body(&app).unwrap().contains("fennec-warm"));
+    }
+
+    #[test]
+    fn skin_list_enumerates_builtins() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("skin", "list", &mut app).unwrap();
+        let body = last_system_body(&app).unwrap();
+        assert!(body.contains("fennec-warm"));
+        assert!(body.contains("mono"));
+        assert!(body.contains("light"));
+        assert!(body.contains("cool"));
+    }
+
+    #[test]
+    fn skin_builtin_swaps_app_skin() {
+        let (outcome, app) = dispatch("skin", "mono");
+        assert_eq!(app.skin_name, "mono");
+        assert_eq!(app.skin.name, "mono");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::PersistTuiSettings) => {}
+            other => panic!("expected PersistTuiSettings, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn skin_unknown_dispatches_apply_user_skin() {
+        let (outcome, _app) = dispatch("skin", "custom-name");
+        match outcome {
+            CommandOutcome::Agent(AgentAction::ApplyUserSkin(name)) => {
+                assert_eq!(name, "custom-name");
+            }
+            other => panic!("expected ApplyUserSkin, got {:?}", other),
+        }
+    }
+
+    fn last_system_body(app: &App) -> Option<String> {
+        app.chat.iter().rev().find_map(|l| match l {
+            ChatLine::System { body, .. } => Some(body.clone()),
+            _ => None,
+        })
     }
 }

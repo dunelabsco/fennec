@@ -45,27 +45,27 @@ pub enum AgentAction {
     /// `None` means "show the current title". Empty string means
     /// "clear the title". A non-empty string sets the title.
     SessionTitle(Option<String>),
-    /// Resume a saved session by id-or-title (Hermes' fallback
+    /// Resume a saved session by id-or-title (the upstream's fallback
     /// matches by exact title when no id matches).
     SessionResume(String),
     /// Show the active model and a known-models list, or swap
     /// to a different model live (mid-turn requests are
-    /// rejected, mirroring Hermes' `_apply_model_switch`).
+    /// rejected, mirroring the upstream's `_apply_model_switch`).
     /// `None` payload means "show". `Some(name)` means "switch".
     SwitchModel(Option<String>),
     /// `/tools` actions. `None` lists every registered tool with
     /// its enabled/disabled status; `Some((true, names))` enables
     /// the listed names; `Some((false, names))` disables them.
     /// Persistence to config.toml + chat-history reset happen
-    /// alongside the toggle in the submit loop, matching Hermes'
+    /// alongside the toggle in the submit loop, matching the upstream's
     /// tools.configure (server.py:6213-6280).
     ToolsToggle(Option<(bool, Vec<String>)>),
     /// Re-read `~/.fennec/.env` into the running process so
     /// changed env-only credentials (API keys, base URLs) take
-    /// effect on the next provider call. Mirrors Hermes' reload.env.
+    /// effect on the next provider call. Mirrors the upstream's reload.env.
     ReloadEnv,
     /// Rescan MCP servers configured for the running session.
-    /// Hermes' reload.mcp shuts down + rediscovers; Fennec's
+    /// the upstream's reload.mcp shuts down + rediscovers; Fennec's
     /// agent doesn't currently boot any MCP clients, so this
     /// surfaces an honest "not yet wired" status instead of a
     /// silent no-op.
@@ -85,10 +85,47 @@ pub enum AgentAction {
     /// when the native clipboard isn't available.
     CopyAssistantMessage(Option<usize>),
     /// Snapshot the current TUI display state (compact_mode +
-    /// details_mode) into config.toml so the toggle survives
-    /// restart. Emitted by `/compact` and `/details` whenever
-    /// they mutate App.
+    /// details_mode + statusbar + indicator + verbosity + busy +
+    /// personality + skin) into config.toml so the toggle
+    /// survives restart. Emitted by every command that mutates a
+    /// persisted field in `TuiConfig`.
     PersistTuiSettings,
+    /// Set the agent's thinking effort. `Off`/`Low`/`Medium`/
+    /// `High`/`XHigh`. Mid-turn requests are honoured on the
+    /// next tool iteration. Emitted by `/reasoning <level>`.
+    SetThinkingLevel(crate::agent::thinking::ThinkingLevel),
+    /// Swap the persona string the agent injects into its
+    /// system prompt on the next turn. Empty string restores the
+    /// IdentityConfig.persona default. Emitted by `/personality`.
+    SetPersona(String),
+    /// Fork the current session into a fresh row in the
+    /// SessionStore, copying the existing history. `None` lets
+    /// the store pick a default title; `Some(title)` sets one.
+    /// Emitted by `/branch [name]` (alias `/fork`).
+    BranchSession(Option<String>),
+    /// Re-scan `~/.fennec/skills/` + rebuild the skills prompt
+    /// fragment on the live agent. Real reload (not the existing
+    /// `/reload-mcp` placeholder pattern). Emitted by
+    /// `/reload-skills`.
+    ReloadSkills,
+    /// LLM-driven history compression. `Option<String>` is an
+    /// optional focus topic the user passes via
+    /// `/compress <topic>`. Replaces older history with a single
+    /// summary `system` message; the most recent few turns stay
+    /// intact.
+    CompressHistory(Option<String>),
+    /// Conversation-only rollback. `RollbackList` prints every
+    /// checkpoint recorded in the active session. `RollbackTo`
+    /// restores the session_messages table + the agent's
+    /// in-memory history to the checkpoint's `message_count`.
+    /// No filesystem rollback (deliberate scope choice).
+    RollbackList,
+    RollbackTo(String),
+    /// Apply a user-defined skin from `~/.fennec/skins/<name>.toml`.
+    /// Built-in skins (`fennec-warm`, `mono`, `light`, `cool`) are
+    /// applied directly in the command handler — this variant
+    /// only fires for non-built-in names that need disk lookup.
+    ApplyUserSkin(String),
 }
 
 /// Outcome of running a slash command. Drives the TUI's response

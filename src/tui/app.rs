@@ -38,7 +38,7 @@ fn collect_subtree_ids_sorted(
 }
 
 /// Comparator used to order sibling rows under the active
-/// overlay sort mode. Mirrors Hermes' `SORT_COMPARATORS` table
+/// overlay sort mode. Mirrors the upstream's `SORT_COMPARATORS` table
 /// (`agentsOverlay.tsx:67-72`).
 fn compare_nodes(
     tree: &SpawnTree,
@@ -74,7 +74,7 @@ fn compare_nodes(
     }
 }
 
-/// Ranks statuses for the "Status" sort mode. Matches Hermes'
+/// Ranks statuses for the "Status" sort mode. Matches the upstream's
 /// `STATUS_RANK` (`agentsOverlay.tsx:59-65`) so failed agents
 /// surface first, completed last.
 fn status_rank(status: super::spawn_tree::SubagentStatus) -> u8 {
@@ -88,7 +88,7 @@ fn status_rank(status: super::spawn_tree::SubagentStatus) -> u8 {
     }
 }
 
-/// Whether a node passes the active filter. Mirrors Hermes'
+/// Whether a node passes the active filter. Mirrors the upstream's
 /// `FILTER_PREDICATES` table. Note: `leaf` checks for zero
 /// children in the *spawn tree*, not the registry, so an
 /// archived snapshot with no recorded children counts as a leaf.
@@ -649,7 +649,7 @@ pub struct App {
     /// `/details` mode — controls visibility of inline tool
     /// details (call args, running spinner, result summary) and
     /// reasoning blocks when those land in F1-2. Three settings
-    /// matching Hermes (`ui-tui/src/app/slash/commands/ops.ts`):
+    /// matching the upstream (`ui-tui/src/app/slash/commands/ops.ts`):
     ///   - Hidden: skip tool blocks entirely
     ///   - Collapsed: render only `▸ tool · name` (no args / no
     ///     result body)
@@ -719,7 +719,7 @@ pub struct App {
     /// 0 = live spawn tree; 1..N pulls the Nth-most-recent
     /// snapshot from `spawn_history`. Bumped by `[` `<` / `]` `>`.
     /// When the live tree clears mid-turn, `on_tick` auto-follows
-    /// onto index 1 with a flash message — matches Hermes'
+    /// onto index 1 with a flash message — matches the upstream's
     /// "turn finished · inspect freely" pattern.
     pub agents_history_index: usize,
     /// Transient one-liner shown in the overlay footer.
@@ -739,6 +739,224 @@ pub struct App {
     /// (main.rs path). `None` in unit tests + smoke tests so
     /// `App::new()` stays cheap and dependency-free.
     pub delegation_registry: Option<crate::agent::DelegationRegistry>,
+    /// Ring buffer of recent tracing log lines. Powers `/logs`.
+    /// Empty in test mode (no tracing layer installed); the
+    /// TUI bootstrap injects a live ring shared with the
+    /// tracing subscriber.
+    pub log_ring: super::log_ring::LogRing,
+    /// Status-bar position. Driven by `/statusbar`. Persisted in
+    /// `TuiConfig.statusbar`.
+    pub statusbar_position: StatusBarPosition,
+    /// Indicator (spinner) style. Driven by `/indicator`.
+    /// Persisted in `TuiConfig.indicator`.
+    pub indicator_style: IndicatorStyle,
+    /// Tool-output verbosity. Driven by `/verbose`. Persisted in
+    /// `TuiConfig.verbose`.
+    pub verbosity: VerbosityMode,
+    /// Behaviour when Enter is pressed mid-turn. Driven by
+    /// `/busy`. Persisted in `TuiConfig.busy`.
+    pub busy_mode: BusyMode,
+    /// Active personality preset name. Driven by `/personality`.
+    /// Persisted in `TuiConfig.personality`. Empty = use the
+    /// IdentityConfig.persona as-loaded.
+    pub personality_name: String,
+    /// Messages enqueued via `/queue` to send as the next user
+    /// turn (front of queue first). Drained by the submit loop.
+    pub queued_input: std::collections::VecDeque<String>,
+    /// Active skin name. Driven by `/skin`. Persisted in
+    /// `TuiConfig.skin`. Empty = default fennec-warm palette.
+    pub skin_name: String,
+    /// Whether reasoning blocks are shown in the chat. Driven by
+    /// `/reasoning hide|show`. Default `true` to preserve existing
+    /// behaviour. Visual effect is rendered by F1-2-B's reasoning
+    /// pane (this branch just stores + persists the flag).
+    pub show_reasoning: bool,
+    /// Indices `(a, b)` (1-based into `spawn_history`) of the
+    /// snapshot pair to render in the agents overlay's diff view.
+    /// `None` = normal single-tree mode. Set by `/replay-diff`.
+    pub agents_diff_pair: Option<(usize, usize)>,
+    /// Active skin (theme variant). Renderers read every colour
+    /// from this struct rather than the `theme::*` constants so
+    /// `/skin <name>` can swap palettes at runtime. Default is
+    /// the fennec-warm palette (literally the same RGB values as
+    /// the existing `theme::*` constants).
+    pub skin: super::skin::Skin,
+    /// Shared with the main `Agent` so `/busy interrupt` can
+    /// cooperatively cancel the running turn. `None` outside TUI
+    /// mode; populated by the bootstrap before the agent builds.
+    pub main_interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// Status-bar position toggled by `/statusbar`. Mirrors the
+/// upstream's `statusbar` config field with the same canonical
+/// string forms; default is `Bottom` to preserve existing
+/// behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusBarPosition {
+    #[default]
+    Bottom,
+    Top,
+    Off,
+}
+
+impl StatusBarPosition {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "bottom" | "on" => Some(Self::Bottom),
+            "top" => Some(Self::Top),
+            "off" | "hidden" => Some(Self::Off),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bottom => "bottom",
+            Self::Top => "top",
+            Self::Off => "off",
+        }
+    }
+    /// 3-state cycle: Bottom → Top → Off → Bottom. Visits every
+    /// position so `/statusbar toggle` from the default actually
+    /// surfaces Top instead of jumping straight to Off.
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Bottom => Self::Top,
+            Self::Top => Self::Off,
+            Self::Off => Self::Bottom,
+        }
+    }
+}
+
+/// Spinner-indicator style. `Braille` is the existing 10-frame
+/// braille animation; the alternatives mirror the upstream
+/// so config files round-trip between agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndicatorStyle {
+    #[default]
+    Braille,
+    Ascii,
+    Kaomoji,
+    Emoji,
+    Unicode,
+}
+
+impl IndicatorStyle {
+    pub const ALL: [Self; 5] = [
+        Self::Braille,
+        Self::Ascii,
+        Self::Kaomoji,
+        Self::Emoji,
+        Self::Unicode,
+    ];
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "braille" | "" => Some(Self::Braille),
+            "ascii" => Some(Self::Ascii),
+            "kaomoji" => Some(Self::Kaomoji),
+            "emoji" => Some(Self::Emoji),
+            "unicode" => Some(Self::Unicode),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Braille => "braille",
+            Self::Ascii => "ascii",
+            Self::Kaomoji => "kaomoji",
+            Self::Emoji => "emoji",
+            Self::Unicode => "unicode",
+        }
+    }
+    /// Pick the current frame based on elapsed ms since session
+    /// start. 10 fps for braille, slower for face animations so
+    /// they're readable.
+    pub fn frame(&self, elapsed_ms: u128) -> &'static str {
+        match self {
+            Self::Braille => {
+                const F: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                F[(elapsed_ms / 100) as usize % F.len()]
+            }
+            Self::Ascii => {
+                const F: [&str; 4] = ["|", "/", "-", "\\"];
+                F[(elapsed_ms / 150) as usize % F.len()]
+            }
+            Self::Kaomoji => {
+                const F: [&str; 4] = ["(･ω･)", "(･ｪ･)", "(•́ω•̀)", "(•̀ω•́)"];
+                F[(elapsed_ms / 350) as usize % F.len()]
+            }
+            Self::Emoji => {
+                const F: [&str; 4] = ["🦊", "🌅", "✨", "🔥"];
+                F[(elapsed_ms / 400) as usize % F.len()]
+            }
+            Self::Unicode => {
+                const F: [&str; 6] = ["◐", "◓", "◑", "◒", "◴", "◵"];
+                F[(elapsed_ms / 150) as usize % F.len()]
+            }
+        }
+    }
+}
+
+/// Tool-output verbosity. `Normal` (default) shows the existing
+/// collapsed/expanded view from `/details`; `Verbose` doesn't
+/// truncate tool previews and shows full args.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerbosityMode {
+    #[default]
+    Normal,
+    Verbose,
+}
+
+impl VerbosityMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "normal" | "" => Some(Self::Normal),
+            "on" | "verbose" => Some(Self::Verbose),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Verbose => "verbose",
+        }
+    }
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Normal => Self::Verbose,
+            Self::Verbose => Self::Normal,
+        }
+    }
+}
+
+/// Behaviour when the user presses Enter while the agent is busy.
+/// `Interrupt` (default) cancels the running turn and starts a
+/// new one; `Queue` parks the message until the turn finishes;
+/// `Steer` routes it through the existing `/steer` injection
+/// path so it lands as user-guidance after the next tool batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BusyMode {
+    #[default]
+    Interrupt,
+    Queue,
+    Steer,
+}
+
+impl BusyMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "interrupt" | "" => Some(Self::Interrupt),
+            "queue" => Some(Self::Queue),
+            "steer" => Some(Self::Steer),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Interrupt => "interrupt",
+            Self::Queue => "queue",
+            Self::Steer => "steer",
+        }
+    }
 }
 
 /// Sort modes for the `/agents` overlay tree-pane row list.
@@ -841,6 +1059,18 @@ impl App {
             agents_detail_focused: false,
             agents_detail_scroll: 0,
             delegation_registry: None,
+            log_ring: super::log_ring::LogRing::new(),
+            statusbar_position: StatusBarPosition::default(),
+            indicator_style: IndicatorStyle::default(),
+            verbosity: VerbosityMode::default(),
+            busy_mode: BusyMode::default(),
+            personality_name: String::new(),
+            queued_input: std::collections::VecDeque::new(),
+            skin_name: String::new(),
+            show_reasoning: true,
+            agents_diff_pair: None,
+            skin: super::skin::Skin::default(),
+            main_interrupt_flag: None,
         }
     }
 
@@ -1770,7 +2000,7 @@ impl App {
             && !self.spawn_history.is_empty()
         {
             // Already on index 0; bump to 1 only if there's a
-            // snapshot newer than what we just settled (Hermes
+            // snapshot newer than what we just settled (the upstream
             // uses the same "snapshot we just pushed" trigger).
             // SpawnHistory.push happens elsewhere when a tree
             // settles, so by the time we observe is_empty +
@@ -1806,12 +2036,10 @@ impl App {
         self.transient_status = Some((msg.into(), Instant::now()));
     }
 
-    /// Animated spinner glyph for live tool indicators. Cycles at
-    /// ~10Hz using the started_at clock.
+    /// Animated spinner glyph for live tool indicators. Style
+    /// follows `App.indicator_style` (toggleable via `/indicator`).
     pub fn spinner_glyph(&self) -> &'static str {
-        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let elapsed = self.started_at.elapsed().as_millis();
-        FRAMES[(elapsed / 100) as usize % FRAMES.len()]
+        self.indicator_style.frame(self.started_at.elapsed().as_millis())
     }
 }
 
