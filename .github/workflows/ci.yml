@@ -48,6 +48,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # System libraries required by Rust deps:
+      #   libasound2-dev — cpal (voice/audio capture in TUI)
+      #   libxcb*-dev    — arboard (clipboard /paste support)
+      #   pkg-config     — many *-sys crates discover libs via it
+      - name: Install system dev libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libasound2-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -91,6 +103,14 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install system dev libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libasound2-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
       - name: Install stable toolchain (with clippy)
         uses: dtolnay/rust-toolchain@stable
