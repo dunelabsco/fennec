@@ -28,6 +28,7 @@
 //! agent and the renderer in the same process trivially, and we
 //! save a whole RPC layer.
 
+pub mod agents_overlay;
 pub mod app;
 pub mod callbacks;
 pub mod clipboard;
@@ -35,6 +36,7 @@ pub mod commands;
 pub mod editor;
 pub mod layout;
 pub mod modal;
+pub mod spawn_tree;
 pub mod theme;
 pub mod usage_panel;
 pub mod voice;

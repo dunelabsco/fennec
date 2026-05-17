@@ -21,8 +21,8 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::callbacks::{
-    AgentCallbacks, ApprovalRequest, ClarifyRequest, SecretRequest, ToolComplete,
-    ToolProgress, ToolStart,
+    AgentCallbacks, ApprovalRequest, ClarifyRequest, SecretRequest, SubagentComplete,
+    SubagentSpawn, ToolComplete, ToolProgress, ToolStart,
 };
 
 use super::app::App;
@@ -60,6 +60,23 @@ pub enum TuiEvent {
         request: SecretRequest,
         resp_tx: oneshot::Sender<Option<String>>,
     },
+    /// New sub-agent spawned via the `delegate` tool. Carries the
+    /// id, optional parent_id (for nested spawns), and the goal
+    /// the parent passed.
+    SubagentSpawn(SubagentSpawn),
+    /// Sub-agent's main loop began — separate from spawn so the
+    /// overlay can show the queued → running transition.
+    SubagentStart(String),
+    /// Streaming text delta from a sub-agent.
+    SubagentText { id: String, delta: String },
+    /// Streaming reasoning delta from a sub-agent.
+    SubagentThinking { id: String, delta: String },
+    /// A tool started inside a sub-agent.
+    SubagentTool { id: String, start: ToolStart },
+    /// Free-text progress note from a sub-agent.
+    SubagentProgress { id: String, note: String },
+    /// Sub-agent finished — final event for that branch.
+    SubagentComplete(SubagentComplete),
 }
 
 /// Sender side of the bridge — held by the `AgentCallbacks` impl.
@@ -160,6 +177,46 @@ impl AgentCallbacks for TuiBridge {
             return None;
         }
         resp_rx.await.unwrap_or(None)
+    }
+
+    fn on_subagent_spawn(&self, spawn: SubagentSpawn) {
+        let _ = self.tx.send(TuiEvent::SubagentSpawn(spawn));
+    }
+
+    fn on_subagent_start(&self, id: &str) {
+        let _ = self.tx.send(TuiEvent::SubagentStart(id.to_string()));
+    }
+
+    fn on_subagent_text(&self, id: &str, delta: &str) {
+        let _ = self.tx.send(TuiEvent::SubagentText {
+            id: id.to_string(),
+            delta: delta.to_string(),
+        });
+    }
+
+    fn on_subagent_thinking(&self, id: &str, delta: &str) {
+        let _ = self.tx.send(TuiEvent::SubagentThinking {
+            id: id.to_string(),
+            delta: delta.to_string(),
+        });
+    }
+
+    fn on_subagent_tool(&self, id: &str, start: ToolStart) {
+        let _ = self.tx.send(TuiEvent::SubagentTool {
+            id: id.to_string(),
+            start,
+        });
+    }
+
+    fn on_subagent_progress(&self, id: &str, note: &str) {
+        let _ = self.tx.send(TuiEvent::SubagentProgress {
+            id: id.to_string(),
+            note: note.to_string(),
+        });
+    }
+
+    fn on_subagent_complete(&self, complete: SubagentComplete) {
+        let _ = self.tx.send(TuiEvent::SubagentComplete(complete));
     }
 }
 

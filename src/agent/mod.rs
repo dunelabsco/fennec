@@ -3,6 +3,7 @@ pub mod attachment;
 pub mod callbacks;
 pub mod compressor;
 pub mod context;
+pub mod delegation;
 pub mod loop_;
 pub mod pricing;
 pub mod scrub;
@@ -14,4 +15,5 @@ pub use callbacks::{
     AgentCallbacks, ApprovalRequest, CallbacksHandle, ClarifyRequest, NoCallbacks,
     SecretRequest, ToolComplete, ToolProgress, ToolStart, noop_callbacks,
 };
+pub use delegation::{ActiveSubagent, DelegationCaps, DelegationRegistry, SpawnRefusal};
 pub use subagent::{SubagentManager, SubagentResult};

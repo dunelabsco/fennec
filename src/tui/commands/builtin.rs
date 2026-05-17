@@ -47,6 +47,7 @@ pub fn register_all(r: &mut CommandRegistry) {
     r.register(Box::new(Paste));
     r.register(Box::new(Copy));
     r.register(Box::new(Edit));
+    r.register(Box::new(Agents));
 }
 
 // -- Lifecycle / focus -------------------------------------------
@@ -100,6 +101,7 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("paste", "paste clipboard text into the input"),
     ("copy [n]", "copy a past assistant message to clipboard"),
     ("edit", "open $EDITOR with the current input pre-filled (also Ctrl-G)"),
+    ("agents", "open the spawn-tree dashboard (/agents pause|resume|status)"),
 ];
 
 struct Quit;
@@ -901,6 +903,91 @@ impl CommandHandler for Edit {
     }
 }
 
+struct Agents;
+impl CommandHandler for Agents {
+    fn name(&self) -> &'static str {
+        "agents"
+    }
+    fn help(&self) -> &'static str {
+        "open spawn-tree dashboard (or /agents pause|resume|status)"
+    }
+    fn aliases(&self) -> &[&'static str] {
+        &["tasks"]
+    }
+    fn execute(&self, args: &str, app: &mut App) -> Result<CommandOutcome> {
+        let trimmed = args.trim().to_lowercase();
+        match trimmed.as_str() {
+            "" | "open" | "show" => {
+                app.show_agents_overlay = true;
+                // Default the cursor to the first root if empty.
+                if app.agents_cursor.is_none() {
+                    if let Some(first) = app.spawn_tree.root_ids.first() {
+                        app.agents_cursor = Some(first.clone());
+                    } else if let Some(snap) = app.spawn_history.get(0) {
+                        if let Some(first) = snap.tree.root_ids.first() {
+                            app.agents_cursor = Some(first.clone());
+                        }
+                    }
+                }
+                Ok(CommandOutcome::Status("agents overlay open".into()))
+            }
+            "close" | "hide" => {
+                app.show_agents_overlay = false;
+                Ok(CommandOutcome::Status("agents overlay closed".into()))
+            }
+            "pause" | "resume" => {
+                let target_paused = trimmed == "pause";
+                match app.delegation_registry.as_ref() {
+                    Some(reg) => {
+                        reg.set_paused(target_paused);
+                        let line = if target_paused {
+                            "delegation · paused"
+                        } else {
+                            "delegation · resumed"
+                        };
+                        push_system(app, line.to_string());
+                        Ok(CommandOutcome::Status(line.into()))
+                    }
+                    None => {
+                        push_system(
+                            app,
+                            "/agents pause: delegation registry not attached (TUI mode only)".into(),
+                        );
+                        Ok(CommandOutcome::Status("no registry".into()))
+                    }
+                }
+            }
+            "status" => {
+                match app.delegation_registry.as_ref() {
+                    Some(reg) => {
+                        let (paused, caps) = reg.status();
+                        let active = reg.active_snapshot();
+                        let line = format!(
+                            "delegation · {} · caps d{}/{} · {} active",
+                            if paused { "paused" } else { "active" },
+                            caps.max_spawn_depth,
+                            caps.max_concurrent_children,
+                            active.len(),
+                        );
+                        push_system(app, line.clone());
+                        Ok(CommandOutcome::Status(line))
+                    }
+                    None => {
+                        push_system(
+                            app,
+                            "/agents status: delegation registry not attached (TUI mode only)".into(),
+                        );
+                        Ok(CommandOutcome::Status("no registry".into()))
+                    }
+                }
+            }
+            other => Ok(CommandOutcome::Status(format!(
+                "/agents: unknown subcommand '{other}' (expected pause/resume/status or no arg)"
+            ))),
+        }
+    }
+}
+
 // -- Helpers ----------------------------------------------------
 
 fn push_system(app: &mut App, body: String) {
@@ -1121,6 +1208,82 @@ mod tests {
         app.focus = crate::tui::app::Focus::Input;
         app.handle_key(KeyCode::Char('g'), KeyModifiers::ALT);
         assert_eq!(app.pending_editor.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn agents_no_arg_opens_overlay() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        assert!(!app.show_agents_overlay);
+        r.dispatch("agents", "", &mut app).unwrap();
+        assert!(app.show_agents_overlay);
+    }
+
+    #[test]
+    fn agents_close_subcommand_closes_overlay() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        r.dispatch("agents", "close", &mut app).unwrap();
+        assert!(!app.show_agents_overlay);
+    }
+
+    #[test]
+    fn agents_pause_without_registry_explains_tui_only() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        assert!(app.delegation_registry.is_none());
+        r.dispatch("agents", "pause", &mut app).unwrap();
+        let body = app
+            .chat
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                ChatLine::System { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(body.contains("not attached"), "got: {body}");
+    }
+
+    #[test]
+    fn agents_pause_with_registry_flips_pause_flag() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        let reg = crate::agent::DelegationRegistry::default();
+        app.delegation_registry = Some(reg.clone());
+        assert!(!reg.is_paused());
+        r.dispatch("agents", "pause", &mut app).unwrap();
+        assert!(reg.is_paused());
+        r.dispatch("agents", "resume", &mut app).unwrap();
+        assert!(!reg.is_paused());
+    }
+
+    #[test]
+    fn agents_status_with_registry_renders_one_liner() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        app.delegation_registry = Some(crate::agent::DelegationRegistry::default());
+        r.dispatch("agents", "status", &mut app).unwrap();
+        let body = app
+            .chat
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                ChatLine::System { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(body.contains("delegation · active · caps d"), "got: {body}");
+        assert!(body.contains("0 active"), "got: {body}");
+    }
+
+    #[test]
+    fn agents_alias_tasks_also_works() {
+        let r = CommandRegistry::with_builtins();
+        let mut app = App::new();
+        r.dispatch("tasks", "", &mut app).unwrap();
+        assert!(app.show_agents_overlay);
     }
 
     #[test]

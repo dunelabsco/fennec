@@ -15,6 +15,108 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
+use super::spawn_tree::SpawnTree;
+
+/// Walk a subtree depth-first appending ids in render order,
+/// with children sorted by the active overlay sort mode. Keeps
+/// the rendered row order stable when the cursor walks the flat
+/// id list.
+fn collect_subtree_ids_sorted(
+    tree: &SpawnTree,
+    id: &str,
+    sort: AgentsSortMode,
+    out: &mut Vec<String>,
+) {
+    out.push(id.to_string());
+    if let Some(node) = tree.nodes.get(id) {
+        let mut kids: Vec<&str> = node.children.iter().map(String::as_str).collect();
+        kids.sort_by(|a, b| compare_nodes(tree, a, b, sort));
+        for child in kids {
+            collect_subtree_ids_sorted(tree, child, sort, out);
+        }
+    }
+}
+
+/// Comparator used to order sibling rows under the active
+/// overlay sort mode. Mirrors Hermes' `SORT_COMPARATORS` table
+/// (`agentsOverlay.tsx:67-72`).
+fn compare_nodes(
+    tree: &SpawnTree,
+    a: &str,
+    b: &str,
+    sort: AgentsSortMode,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let na = tree.nodes.get(a);
+    let nb = tree.nodes.get(b);
+    match (na, nb) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(na), Some(nb)) => match sort {
+            AgentsSortMode::DepthFirst => a.cmp(b),
+            AgentsSortMode::ToolsDesc => {
+                let am = tree.aggregate(a).subtree_tools;
+                let bm = tree.aggregate(b).subtree_tools;
+                bm.cmp(&am).then_with(|| a.cmp(b))
+            }
+            AgentsSortMode::DurationDesc => {
+                let am = tree.aggregate(a).subtree_duration_ms;
+                let bm = tree.aggregate(b).subtree_duration_ms;
+                bm.cmp(&am).then_with(|| a.cmp(b))
+            }
+            AgentsSortMode::Status => {
+                status_rank(na.status)
+                    .cmp(&status_rank(nb.status))
+                    .then_with(|| a.cmp(b))
+            }
+        },
+    }
+}
+
+/// Ranks statuses for the "Status" sort mode. Matches Hermes'
+/// `STATUS_RANK` (`agentsOverlay.tsx:59-65`) so failed agents
+/// surface first, completed last.
+fn status_rank(status: super::spawn_tree::SubagentStatus) -> u8 {
+    use super::spawn_tree::SubagentStatus;
+    match status {
+        SubagentStatus::Failed => 0,
+        SubagentStatus::Interrupted => 1,
+        SubagentStatus::Running => 2,
+        SubagentStatus::Queued => 3,
+        SubagentStatus::Completed => 4,
+    }
+}
+
+/// Whether a node passes the active filter. Mirrors Hermes'
+/// `FILTER_PREDICATES` table. Note: `leaf` checks for zero
+/// children in the *spawn tree*, not the registry, so an
+/// archived snapshot with no recorded children counts as a leaf.
+fn filter_matches(
+    filter: AgentsFilterMode,
+    node: &super::spawn_tree::SubagentNode,
+    tree: &SpawnTree,
+) -> bool {
+    use super::spawn_tree::SubagentStatus;
+    match filter {
+        AgentsFilterMode::All => true,
+        AgentsFilterMode::Running => matches!(
+            node.status,
+            SubagentStatus::Running | SubagentStatus::Queued
+        ),
+        AgentsFilterMode::Failed => matches!(
+            node.status,
+            SubagentStatus::Failed | SubagentStatus::Interrupted
+        ),
+        AgentsFilterMode::Leaf => {
+            tree.nodes
+                .get(&node.id)
+                .map(|n| n.children.is_empty())
+                .unwrap_or(true)
+        }
+    }
+}
+
 /// One row in the sessions panel.
 #[derive(Debug, Clone)]
 pub struct SessionRow {
@@ -595,6 +697,109 @@ pub struct App {
     pub modal: Option<super::modal::Modal>,
     /// Set by `/edit` (or Ctrl-G) to the current input buffer text.
     pub pending_editor: Option<String>,
+    /// Live spawn tree of delegated sub-agents. Updated as
+    /// `TuiEvent::Subagent*` events flow in from the agent
+    /// callback bridge. Read by the `/agents` overlay renderer.
+    pub spawn_tree: super::spawn_tree::SpawnTree,
+    /// FIFO history of completed spawn trees (cap 10). Pushed
+    /// when the live tree is_settled — `/agents` then auto-pins
+    /// the most recent snapshot when the live tree empties.
+    pub spawn_history: super::spawn_tree::SpawnHistory,
+    /// Whether the `/agents` fullscreen overlay is open.
+    /// Toggled by the `/agents` slash command. When true, the
+    /// keyboard router sends ↑↓/jk/g/G/Enter/q/Esc to the
+    /// overlay handler instead of focus-dependent panes.
+    pub show_agents_overlay: bool,
+    /// Selected node id within the overlay's tree pane.
+    pub agents_cursor: Option<String>,
+    /// Active sort mode for the tree-pane row list.
+    pub agents_sort: AgentsSortMode,
+    /// Active filter mode for the tree-pane row list.
+    pub agents_filter: AgentsFilterMode,
+    /// 0 = live spawn tree; 1..N pulls the Nth-most-recent
+    /// snapshot from `spawn_history`. Bumped by `[` `<` / `]` `>`.
+    /// When the live tree clears mid-turn, `on_tick` auto-follows
+    /// onto index 1 with a flash message — matches Hermes'
+    /// "turn finished · inspect freely" pattern.
+    pub agents_history_index: usize,
+    /// Transient one-liner shown in the overlay footer.
+    /// Cleared after ~2s by `on_tick`.
+    pub agents_flash: Option<(String, Instant)>,
+    /// When `true`, keyboard scrolls the detail pane instead of
+    /// walking the tree list. Toggled by `Enter`/`l`/`→` (enter)
+    /// and `Esc`/`h`/`←` (exit; falls back to closing the overlay
+    /// when already on the list).
+    pub agents_detail_focused: bool,
+    /// Scroll offset (in rows) for the detail pane. Adjusted by
+    /// PgUp/PgDn/Ctrl-D/Ctrl-U/j/k when the detail is focused.
+    /// Reset when the cursor changes nodes.
+    pub agents_detail_scroll: u16,
+    /// Shared delegation registry — pause flag + caps + active
+    /// map. Set when the TUI is running against a real agent
+    /// (main.rs path). `None` in unit tests + smoke tests so
+    /// `App::new()` stays cheap and dependency-free.
+    pub delegation_registry: Option<crate::agent::DelegationRegistry>,
+}
+
+/// Sort modes for the `/agents` overlay tree-pane row list.
+/// `s` cycles forward through these in render order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentsSortMode {
+    DepthFirst,
+    ToolsDesc,
+    DurationDesc,
+    Status,
+}
+
+impl AgentsSortMode {
+    pub const ALL: [Self; 4] = [
+        Self::DepthFirst,
+        Self::ToolsDesc,
+        Self::DurationDesc,
+        Self::Status,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::DepthFirst => "spawn order",
+            Self::ToolsDesc => "busiest",
+            Self::DurationDesc => "slowest",
+            Self::Status => "status",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+}
+
+/// Filter modes for the `/agents` overlay. `f` cycles them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentsFilterMode {
+    All,
+    Running,
+    Failed,
+    Leaf,
+}
+
+impl AgentsFilterMode {
+    pub const ALL: [Self; 4] =
+        [Self::All, Self::Running, Self::Failed, Self::Leaf];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::Leaf => "leaves",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
 }
 
 impl App {
@@ -625,6 +830,17 @@ impl App {
             skills_dir: None,
             modal: None,
             pending_editor: None,
+            spawn_tree: super::spawn_tree::SpawnTree::new(),
+            spawn_history: super::spawn_tree::SpawnHistory::new(),
+            show_agents_overlay: false,
+            agents_cursor: None,
+            agents_sort: AgentsSortMode::DepthFirst,
+            agents_filter: AgentsFilterMode::All,
+            agents_history_index: 0,
+            agents_flash: None,
+            agents_detail_focused: false,
+            agents_detail_scroll: 0,
+            delegation_registry: None,
         }
     }
 
@@ -774,6 +990,13 @@ impl App {
     /// focus, so the user can't accidentally rotate panes while
     /// a prompt is open.
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        // Overlays consume input first — Tab does NOT cycle focus
+        // when an overlay is up so the user can't accidentally
+        // rotate panes behind it.
+        if self.show_agents_overlay {
+            self.handle_key_agents_overlay(code, modifiers);
+            return;
+        }
         if self.is_blocked() {
             self.handle_key_modal(code, modifiers);
             return;
@@ -1122,6 +1345,301 @@ impl App {
         }
     }
 
+    /// Keyboard handler active while the `/agents` overlay is
+    /// open. Layered behaviours:
+    ///
+    /// - **always**: `q`/`Q`/`Esc`/`Ctrl-C` close
+    /// - **navigation**: `↑/k` `↓/j` walk the flat tree;
+    ///   `g`/`G` top/bottom
+    /// - **sort/filter**: `s` cycles sort, `f` cycles filter
+    /// - **history**: `[`/`<` step older, `]`/`>` step toward live
+    /// - **live-only actions**: `x` kill node, `X` kill subtree,
+    ///   `p` toggle delegation pause. In replay mode these
+    ///   surface "replay mode — controls disabled" via the flash.
+    pub fn handle_key_agents_overlay(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) {
+        let ctrl_c = matches!(code, KeyCode::Char('c'))
+            && modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl_c || matches!(code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+            self.show_agents_overlay = false;
+            self.agents_detail_focused = false;
+            return;
+        }
+        // Esc returns from detail focus to list focus when in
+        // detail mode; only closes the overlay from list mode.
+        if matches!(code, KeyCode::Esc) {
+            if self.agents_detail_focused {
+                self.agents_detail_focused = false;
+                self.agents_detail_scroll = 0;
+            } else {
+                self.show_agents_overlay = false;
+            }
+            return;
+        }
+
+        // Detail-focused mode owns scroll keys.
+        if self.agents_detail_focused {
+            match code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.agents_detail_focused = false;
+                    self.agents_detail_scroll = 0;
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.agents_detail_scroll = self.agents_detail_scroll.saturating_sub(2);
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.agents_detail_scroll = self.agents_detail_scroll.saturating_add(2);
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.agents_detail_scroll = self.agents_detail_scroll.saturating_sub(10);
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.agents_detail_scroll = self.agents_detail_scroll.saturating_add(10);
+                    return;
+                }
+                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.agents_detail_scroll = self.agents_detail_scroll.saturating_add(10);
+                    return;
+                }
+                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.agents_detail_scroll = self.agents_detail_scroll.saturating_sub(10);
+                    return;
+                }
+                KeyCode::Char('g') => {
+                    self.agents_detail_scroll = 0;
+                    return;
+                }
+                KeyCode::Char('G') => {
+                    self.agents_detail_scroll = u16::MAX / 2;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // History nav + sort/filter are mode-independent.
+        match code {
+            KeyCode::Char('s') => {
+                self.agents_sort = self.agents_sort.next();
+                self.set_agents_flash(format!("sort · {}", self.agents_sort.label()));
+                return;
+            }
+            KeyCode::Char('f') => {
+                self.agents_filter = self.agents_filter.next();
+                self.set_agents_flash(format!("filter · {}", self.agents_filter.label()));
+                return;
+            }
+            KeyCode::Char('[') | KeyCode::Char('<') => {
+                self.agents_step_history(1);
+                return;
+            }
+            KeyCode::Char(']') | KeyCode::Char('>') => {
+                self.agents_step_history(-1);
+                return;
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                self.agents_detail_focused = true;
+                self.agents_detail_scroll = 0;
+                return;
+            }
+            _ => {}
+        }
+
+        // Live-only actions: x / X / p surface a flash in replay
+        // mode rather than mutating state.
+        let replay_mode = self.agents_history_index > 0;
+        match code {
+            KeyCode::Char('p') => {
+                if replay_mode {
+                    self.set_agents_flash(
+                        "replay mode — controls disabled".to_string(),
+                    );
+                    return;
+                }
+                if let Some(reg) = self.delegation_registry.clone() {
+                    let now_paused = reg.set_paused(!reg.is_paused());
+                    self.set_agents_flash(if now_paused {
+                        "spawning paused".to_string()
+                    } else {
+                        "spawning resumed".to_string()
+                    });
+                } else {
+                    self.set_agents_flash(
+                        "no delegation registry attached".to_string(),
+                    );
+                }
+                return;
+            }
+            KeyCode::Char('x') => {
+                if replay_mode {
+                    self.set_agents_flash(
+                        "replay mode — controls disabled".to_string(),
+                    );
+                    return;
+                }
+                if let Some(id) = self.agents_cursor.clone() {
+                    if let Some(reg) = self.delegation_registry.as_ref() {
+                        if reg.interrupt(&id) {
+                            self.set_agents_flash(format!("killing {id}"));
+                        }
+                    }
+                    self.spawn_tree.interrupt(&id, false);
+                }
+                return;
+            }
+            KeyCode::Char('X') => {
+                if replay_mode {
+                    self.set_agents_flash(
+                        "replay mode — controls disabled".to_string(),
+                    );
+                    return;
+                }
+                if let Some(id) = self.agents_cursor.clone() {
+                    if let Some(reg) = self.delegation_registry.as_ref() {
+                        let n = reg.interrupt_subtree(&id);
+                        self.set_agents_flash(format!(
+                            "killing subtree · {n} node{}",
+                            if n == 1 { "" } else { "s" }
+                        ));
+                    }
+                    self.spawn_tree.interrupt(&id, true);
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let flat = self.agents_flat_node_ids();
+        if flat.is_empty() {
+            return;
+        }
+        let cur_idx = self
+            .agents_cursor
+            .as_ref()
+            .and_then(|id| flat.iter().position(|x| x == id))
+            .unwrap_or(0);
+        let prev_cursor = self.agents_cursor.clone();
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                let next = cur_idx.saturating_sub(1);
+                self.agents_cursor = Some(flat[next].clone());
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let next = (cur_idx + 1).min(flat.len() - 1);
+                self.agents_cursor = Some(flat[next].clone());
+            }
+            KeyCode::Char('g') => {
+                self.agents_cursor = flat.first().cloned();
+            }
+            KeyCode::Char('G') => {
+                self.agents_cursor = flat.last().cloned();
+            }
+            _ => {}
+        }
+        if self.agents_cursor != prev_cursor {
+            // Reset detail scroll so the new node opens from the
+            // top — otherwise the user is mid-section on the new
+            // record without realising the cursor moved.
+            self.agents_detail_scroll = 0;
+        }
+    }
+
+    /// Step the history cursor by `delta` (`+1` = older,
+    /// `-1` = newer). Clamps to `[0, spawn_history.len()]`.
+    /// Resets the row cursor + emits a flash when the index
+    /// changes.
+    pub fn agents_step_history(&mut self, delta: i32) {
+        let max = self.spawn_history.len();
+        let cur = self.agents_history_index as i32;
+        let next = (cur + delta).clamp(0, max as i32) as usize;
+        if next == self.agents_history_index {
+            return;
+        }
+        self.agents_history_index = next;
+        self.agents_cursor = self.agents_flat_node_ids().first().cloned();
+        let flash = if next == 0 {
+            "live turn".to_string()
+        } else {
+            format!("replay · {next}/{max}")
+        };
+        self.set_agents_flash(flash);
+    }
+
+    /// Emit a transient flash for the overlay footer. Expires
+    /// after ~2s via `on_tick`. Replaces any in-flight flash.
+    pub fn set_agents_flash(&mut self, body: String) {
+        self.agents_flash = Some((body, Instant::now()));
+    }
+
+    /// Borrow the spawn tree that the overlay should render at
+    /// the current history index. Live tree when `index == 0`,
+    /// snapshot otherwise. Falls back to the live (possibly
+    /// empty) tree when the requested index is out of bounds.
+    pub fn agents_effective_tree(&self) -> &super::spawn_tree::SpawnTree {
+        if self.agents_history_index == 0 {
+            &self.spawn_tree
+        } else if let Some(snap) =
+            self.spawn_history.get(self.agents_history_index - 1)
+        {
+            &snap.tree
+        } else {
+            &self.spawn_tree
+        }
+    }
+
+    /// Whether the overlay is currently in replay mode (showing
+    /// a history snapshot rather than the live tree).
+    pub fn agents_replay_mode(&self) -> bool {
+        self.agents_history_index > 0
+    }
+
+    /// Flattened list of every node id in the active spawn tree
+    /// (live or selected history snapshot), in render order with
+    /// sort + filter applied. Used by the overlay's keyboard
+    /// navigation + the tree-pane renderer.
+    pub fn agents_flat_node_ids(&self) -> Vec<String> {
+        let tree = self.agents_effective_tree();
+        // Auto-fallback: when live tree is empty + we're at
+        // index 0, peek at history[0] so the user isn't stuck
+        // with a blank overlay.
+        let tree = if tree.is_empty() && self.agents_history_index == 0 {
+            self.spawn_history
+                .get(0)
+                .map(|s| &s.tree)
+                .unwrap_or(tree)
+        } else {
+            tree
+        };
+        if tree.is_empty() {
+            return Vec::new();
+        }
+        let mut roots: Vec<&str> = tree.root_ids.iter().map(String::as_str).collect();
+        let sort = self.agents_sort;
+        roots.sort_by(|a, b| compare_nodes(tree, a, b, sort));
+        let mut out = Vec::new();
+        for root in roots {
+            collect_subtree_ids_sorted(tree, root, sort, &mut out);
+        }
+        // Filter retains only matching ids; render order is the
+        // depth-first sorted walk above.
+        let filter = self.agents_filter;
+        out.into_iter()
+            .filter(|id| {
+                tree.nodes
+                    .get(id)
+                    .map(|n| filter_matches(filter, n, tree))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     fn handle_key_sessions(&mut self, code: KeyCode) {
         match code {
             KeyCode::Up | KeyCode::Char('k') => self.prev_session(),
@@ -1233,6 +1751,36 @@ impl App {
         }
         if let Some(err) = self.voice.take_error() {
             self.set_status(format!("voice: {err}"));
+        }
+        // Overlay flash expires after ~2.5 seconds so the footer
+        // returns to the static legend.
+        if let Some((_, t)) = &self.agents_flash {
+            if t.elapsed().as_millis() >= 2500 {
+                self.agents_flash = None;
+            }
+        }
+        // Auto-follow: when the live tree clears mid-turn and we
+        // were viewing it, hop onto history[0] so the user isn't
+        // dropped into an empty overlay. Only fires once per
+        // clearing — we check that the history has at least one
+        // entry and we're currently at index 0.
+        if self.show_agents_overlay
+            && self.agents_history_index == 0
+            && self.spawn_tree.is_empty()
+            && !self.spawn_history.is_empty()
+        {
+            // Already on index 0; bump to 1 only if there's a
+            // snapshot newer than what we just settled (Hermes
+            // uses the same "snapshot we just pushed" trigger).
+            // SpawnHistory.push happens elsewhere when a tree
+            // settles, so by the time we observe is_empty +
+            // history.len() >= 1, the just-finished tree IS
+            // history[0]. Jump to it.
+            self.agents_history_index = 1;
+            self.agents_cursor = self.agents_flat_node_ids().first().cloned();
+            self.set_agents_flash(
+                "turn finished · inspect freely · q to close".to_string(),
+            );
         }
     }
 
@@ -1700,5 +2248,256 @@ mod tests {
         s.backspace();
         assert_eq!(s.text(), "hél");
         assert_eq!(s.col, 3);
+    }
+
+    fn spawn(id: &str, parent: Option<&str>) -> crate::agent::callbacks::SubagentSpawn {
+        crate::agent::callbacks::SubagentSpawn {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            goal: format!("goal {id}"),
+            depth: 0,
+            index: 0,
+            model: None,
+            toolsets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn agents_overlay_arrow_keys_walk_flat_tree() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        app.spawn_tree.on_spawn(spawn("root", None));
+        app.spawn_tree.on_spawn(spawn("child", Some("root")));
+        app.spawn_tree.on_spawn(spawn("leaf", Some("child")));
+        app.agents_cursor = Some("root".into());
+
+        app.handle_key_agents_overlay(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("child"));
+        app.handle_key_agents_overlay(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("leaf"));
+        // Already at the bottom — clamps, does not wrap.
+        app.handle_key_agents_overlay(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("leaf"));
+        app.handle_key_agents_overlay(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("child"));
+        app.handle_key_agents_overlay(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("root"));
+        // Already at the top — clamps.
+        app.handle_key_agents_overlay(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn agents_overlay_gG_jump_to_top_and_bottom() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        app.spawn_tree.on_spawn(spawn("root", None));
+        app.spawn_tree.on_spawn(spawn("child", Some("root")));
+        app.spawn_tree.on_spawn(spawn("leaf", Some("child")));
+        app.agents_cursor = Some("child".into());
+
+        app.handle_key_agents_overlay(KeyCode::Char('G'), KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("leaf"));
+        app.handle_key_agents_overlay(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(app.agents_cursor.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn agents_overlay_q_and_esc_close_overlay() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        app.handle_key_agents_overlay(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.show_agents_overlay);
+
+        app.show_agents_overlay = true;
+        app.handle_key_agents_overlay(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.show_agents_overlay);
+
+        app.show_agents_overlay = true;
+        app.handle_key_agents_overlay(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!app.show_agents_overlay);
+    }
+
+    #[test]
+    fn agents_overlay_x_interrupts_single_node_capital_x_interrupts_subtree() {
+        use crate::tui::spawn_tree::SubagentStatus;
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        app.spawn_tree.on_spawn(spawn("root", None));
+        app.spawn_tree.on_spawn(spawn("child", Some("root")));
+        app.spawn_tree.on_spawn(spawn("leaf", Some("child")));
+
+        // `x` on `child` interrupts only that node.
+        app.agents_cursor = Some("child".into());
+        app.handle_key_agents_overlay(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            app.spawn_tree.nodes.get("child").map(|n| n.status),
+            Some(SubagentStatus::Interrupted)
+        );
+        assert_ne!(
+            app.spawn_tree.nodes.get("leaf").map(|n| n.status),
+            Some(SubagentStatus::Interrupted)
+        );
+
+        // `X` on `root` interrupts the whole subtree (including leaf).
+        app.agents_cursor = Some("root".into());
+        app.handle_key_agents_overlay(KeyCode::Char('X'), KeyModifiers::NONE);
+        assert_eq!(
+            app.spawn_tree.nodes.get("root").map(|n| n.status),
+            Some(SubagentStatus::Interrupted)
+        );
+        assert_eq!(
+            app.spawn_tree.nodes.get("leaf").map(|n| n.status),
+            Some(SubagentStatus::Interrupted)
+        );
+    }
+
+    #[test]
+    fn agents_overlay_s_cycles_sort_modes() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        assert_eq!(app.agents_sort, AgentsSortMode::DepthFirst);
+        app.handle_key_agents_overlay(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.agents_sort, AgentsSortMode::ToolsDesc);
+        app.handle_key_agents_overlay(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.agents_sort, AgentsSortMode::DurationDesc);
+        app.handle_key_agents_overlay(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.agents_sort, AgentsSortMode::Status);
+        app.handle_key_agents_overlay(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.agents_sort, AgentsSortMode::DepthFirst);
+    }
+
+    #[test]
+    fn agents_overlay_f_cycles_filter_modes() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        assert_eq!(app.agents_filter, AgentsFilterMode::All);
+        app.handle_key_agents_overlay(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.agents_filter, AgentsFilterMode::Running);
+        app.handle_key_agents_overlay(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.agents_filter, AgentsFilterMode::Failed);
+        app.handle_key_agents_overlay(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.agents_filter, AgentsFilterMode::Leaf);
+        app.handle_key_agents_overlay(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.agents_filter, AgentsFilterMode::All);
+    }
+
+    #[test]
+    fn agents_overlay_filter_running_hides_completed_nodes() {
+        use crate::tui::spawn_tree::SubagentStatus;
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        app.spawn_tree.on_spawn(spawn("a", None));
+        app.spawn_tree.on_spawn(spawn("b", None));
+        app.spawn_tree.on_start("a");
+        app.spawn_tree.on_complete(crate::agent::callbacks::SubagentComplete {
+            id: "a".into(),
+            success: true,
+            ..Default::default()
+        });
+        // a is completed, b is queued.
+        app.agents_filter = AgentsFilterMode::Running;
+        let flat = app.agents_flat_node_ids();
+        assert_eq!(flat, vec!["b".to_string()]);
+        // Sanity: a's status is terminal.
+        assert_eq!(
+            app.spawn_tree.nodes.get("a").map(|n| n.status),
+            Some(SubagentStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn agents_overlay_history_step_moves_through_snapshots() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        // Push 2 snapshots into history.
+        let mut t1 = crate::tui::spawn_tree::SpawnTree::new();
+        t1.on_spawn(spawn("s1", None));
+        app.spawn_history.push(t1);
+        let mut t2 = crate::tui::spawn_tree::SpawnTree::new();
+        t2.on_spawn(spawn("s2", None));
+        app.spawn_history.push(t2);
+        assert_eq!(app.spawn_history.len(), 2);
+        assert_eq!(app.agents_history_index, 0);
+
+        app.handle_key_agents_overlay(KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(app.agents_history_index, 1);
+        app.handle_key_agents_overlay(KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(app.agents_history_index, 2);
+        // Clamps at history length.
+        app.handle_key_agents_overlay(KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(app.agents_history_index, 2);
+        app.handle_key_agents_overlay(KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.agents_history_index, 1);
+    }
+
+    #[test]
+    fn agents_overlay_replay_mode_disables_kill_keys() {
+        use crate::tui::spawn_tree::SubagentStatus;
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        let mut t = crate::tui::spawn_tree::SpawnTree::new();
+        t.on_spawn(spawn("a", None));
+        app.spawn_history.push(t);
+        app.agents_history_index = 1;
+        // Cursor on the history-tree node.
+        app.agents_cursor = Some("a".into());
+        app.handle_key_agents_overlay(KeyCode::Char('x'), KeyModifiers::NONE);
+        // History snapshot's node must remain unchanged
+        // (interrupt should NOT touch it in replay mode).
+        let history_node_status = app
+            .spawn_history
+            .get(0)
+            .unwrap()
+            .tree
+            .nodes
+            .get("a")
+            .map(|n| n.status);
+        assert_eq!(history_node_status, Some(SubagentStatus::Queued));
+        // And a flash was set explaining why.
+        let flash = app.agents_flash.as_ref().map(|(b, _)| b.clone()).unwrap();
+        assert!(flash.contains("replay mode"));
+    }
+
+    #[test]
+    fn agents_overlay_detail_focus_toggles_and_routes_scroll_keys() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        assert!(!app.agents_detail_focused);
+        app.handle_key_agents_overlay(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.agents_detail_focused);
+        // While focused, `j` scrolls instead of navigating list.
+        app.handle_key_agents_overlay(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.agents_detail_scroll, 2);
+        app.handle_key_agents_overlay(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.agents_detail_scroll, 12);
+        // `h` exits detail focus + resets scroll.
+        app.handle_key_agents_overlay(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(!app.agents_detail_focused);
+        assert_eq!(app.agents_detail_scroll, 0);
+        // Re-enter + Esc behaviour: Esc unfocuses (does NOT close).
+        app.handle_key_agents_overlay(KeyCode::Char('l'), KeyModifiers::NONE);
+        assert!(app.agents_detail_focused);
+        app.handle_key_agents_overlay(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.agents_detail_focused);
+        assert!(app.show_agents_overlay, "esc from detail should NOT close overlay");
+        // Esc again now closes since we're in list mode.
+        app.handle_key_agents_overlay(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.show_agents_overlay);
+    }
+
+    #[test]
+    fn agents_overlay_p_toggles_delegation_pause_when_registry_attached() {
+        let mut app = App::new();
+        app.show_agents_overlay = true;
+        let reg = crate::agent::DelegationRegistry::default();
+        app.delegation_registry = Some(reg.clone());
+        assert!(!reg.is_paused());
+        app.handle_key_agents_overlay(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(reg.is_paused());
+        let flash = app.agents_flash.as_ref().map(|(b, _)| b.clone()).unwrap();
+        assert_eq!(flash, "spawning paused");
+        app.handle_key_agents_overlay(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(!reg.is_paused());
     }
 }

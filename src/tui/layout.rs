@@ -68,9 +68,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, status_area, app, narrow);
     draw_shortcuts(f, shortcut_area, app);
 
-    // Modal overlay always renders LAST so it paints over the
-    // panes below. Mirrors Hermes' `FloatingOverlays` order.
-    if app.modal.is_some() {
+    // Fullscreen overlays render last so they paint over the
+    // three-pane layout below. Like the modal layer in F1-2-A,
+    // the underlying scrollback stays visible behind the
+    // overlay's centered Clear-widget block.
+    if app.show_agents_overlay {
+        super::agents_overlay::draw_agents_overlay(f, f.area(), app);
+    } else if app.modal.is_some() {
         draw_modal_overlay(f, f.area(), app);
     }
 }
@@ -318,8 +322,15 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                             Style::default().fg(TOOL_PINK),
                         ),
                     ]));
+                    if bare == "delegate" {
+                        append_inline_spawn_tree(&mut lines, app);
+                    }
                 }
                 DetailsMode::Expanded => {
+                    let bare = call
+                        .split_once('(')
+                        .map(|(name, _rest)| name)
+                        .unwrap_or(call.as_str());
                     lines.push(Line::from(vec![
                         Span::styled("    ▸ ", Style::default().fg(TOOL_PINK)),
                         Span::styled(
@@ -331,6 +342,9 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
                         Span::styled(" · ", Style::default().fg(SUBDUED)),
                         Span::styled(call.clone(), Style::default().fg(TOOL_PINK)),
                     ]));
+                    if bare == "delegate" {
+                        append_inline_spawn_tree(&mut lines, app);
+                    }
                 }
             },
             ChatLine::ToolResult { summary } => match app.details_mode {
@@ -443,6 +457,99 @@ fn draw_chat_scrollback(f: &mut Frame, area: Rect, app: &App) {
         }
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Compact inline rendering of the live spawn-tree, anchored
+/// under a `delegate` tool call in chat scrollback. Only fires
+/// when there's exactly one delegate call active (mirrors
+/// Hermes' `thinking.tsx:889-890` rule). Multiple parallel
+/// delegates skip the inline view and rely on `/agents` to surface.
+fn append_inline_spawn_tree(lines: &mut Vec<Line<'static>>, app: &App) {
+    let tree = if !app.spawn_tree.is_empty() {
+        &app.spawn_tree
+    } else if let Some(snap) = app.spawn_history.get(0) {
+        &snap.tree
+    } else {
+        return;
+    };
+    if tree.is_empty() || tree.root_ids.len() != 1 {
+        return;
+    }
+    let peak = tree.peak_hotness();
+    // Render each node depth-first, capped at 6 rows to keep
+    // chat scrollback readable. Open /agents for the full tree.
+    let mut flat: Vec<String> = Vec::new();
+    for root in &tree.root_ids {
+        push_inline_descendants(tree, root, &mut flat);
+    }
+    let total = flat.len();
+    for id in flat.iter().take(6) {
+        if let Some(node) = tree.nodes.get(id) {
+            let indent = "  ".repeat(node.depth as usize + 2);
+            let metrics = tree.aggregate(id);
+            let bucket = tree.hot_bucket(id, peak);
+            let heat = if bucket >= 2 {
+                Span::styled(
+                    "▍ ",
+                    Style::default().fg(match bucket {
+                        2 => AMBER,
+                        3 => TOOL_PINK,
+                        _ => TERRACOTTA,
+                    }),
+                )
+            } else {
+                Span::styled("  ", Style::default())
+            };
+            let glyph_color = match node.status {
+                super::spawn_tree::SubagentStatus::Completed => MUTED_GREEN,
+                super::spawn_tree::SubagentStatus::Failed
+                | super::spawn_tree::SubagentStatus::Interrupted => TERRACOTTA,
+                _ => AMBER,
+            };
+            let goal_preview: String = node
+                .goal
+                .chars()
+                .take(40)
+                .collect::<String>();
+            let suffix = if metrics.local_tools > 0 {
+                format!(" · {}t", metrics.local_tools)
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{indent}└─ "), Style::default().fg(SUBDUED)),
+                heat,
+                Span::styled(
+                    format!("{} ", node.status.glyph()),
+                    Style::default().fg(glyph_color),
+                ),
+                Span::styled(goal_preview, Style::default().fg(TEXT_CREAM)),
+                Span::styled(suffix, Style::default().fg(SUBDUED)),
+            ]));
+        }
+    }
+    if total > 6 {
+        lines.push(Line::from(vec![
+            Span::styled("        ", Style::default()),
+            Span::styled(
+                format!("…+{} more · /agents for full tree", total - 6),
+                Style::default().fg(SUBDUED).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
+}
+
+fn push_inline_descendants(
+    tree: &super::spawn_tree::SpawnTree,
+    id: &str,
+    out: &mut Vec<String>,
+) {
+    out.push(id.to_string());
+    if let Some(node) = tree.nodes.get(id) {
+        for child in &node.children {
+            push_inline_descendants(tree, child, out);
+        }
+    }
 }
 
 fn draw_chat_bottom(f: &mut Frame, area: Rect, app: &App, narrow: bool) {
