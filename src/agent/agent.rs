@@ -10,6 +10,7 @@ use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider,
 use crate::security::prompt_guard::{PromptGuard, ScanResult};
 use crate::tools::traits::{Tool, ToolSpec};
 
+use super::compressor::ContextCompressor;
 use super::context::SystemPromptBuilder;
 use super::scrub;
 use super::thinking::{self, ThinkingLevel};
@@ -137,6 +138,16 @@ pub struct Agent {
     interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Lifecycle hooks for real-time frontends (TUI, dashboard).
     callbacks: super::callbacks::CallbacksHandle,
+    /// Automatic context compactor. Consulted at the top of each tool-loop
+    /// iteration: when the conversation exceeds the provider's context
+    /// threshold it summarises the middle of history in place, so long
+    /// multi-iteration turns don't grow past the model's window.
+    context_compressor: ContextCompressor,
+    /// Master switch for automatic compaction. When false, `maybe_compact`
+    /// is a no-op and history is never altered mid-turn (useful when an
+    /// operator wants strict prompt-cache stability and accepts the risk of
+    /// hitting the context limit on very long turns).
+    compression_enabled: bool,
 }
 
 /// Result of a single `turn_with_history` call.
@@ -349,6 +360,9 @@ impl Agent {
             if self.is_interrupted() {
                 bail!("interrupted by user");
             }
+            // Auto-compact before the call so a long, tool-heavy turn can't
+            // grow history past the model's context window.
+            self.maybe_compact().await;
             self.callbacks.on_status("calling provider");
             let response = self.call_provider().await?;
             self.total_api_calls += 1;
@@ -675,6 +689,9 @@ impl Agent {
             if self.is_interrupted() {
                 bail!("interrupted by user");
             }
+            // Auto-compact before the call (streaming path) — same rationale
+            // as the non-streaming loop.
+            self.maybe_compact().await;
             self.callbacks.on_status("calling provider");
 
             let enabled = self.enabled_tool_specs();
@@ -849,6 +866,53 @@ impl Agent {
         }
 
         response
+    }
+
+    /// Compact the conversation in place if it has grown past the context
+    /// threshold. Called at the top of each tool-loop iteration. No-op when
+    /// compaction is disabled, the provider reports no context window, or the
+    /// history is still under threshold. On a successful compaction the cached
+    /// system prompt is left untouched — compaction alters message history, not
+    /// the system prefix, so the provider's prompt cache stays valid.
+    async fn maybe_compact(&mut self) {
+        if !self.compression_enabled {
+            return;
+        }
+        let ctx_window = self.provider.context_window();
+        if ctx_window == 0 {
+            return;
+        }
+        if !self
+            .context_compressor
+            .should_compress(&self.history, ctx_window)
+        {
+            return;
+        }
+        let before = self.history.len();
+        // Own the compressor + provider handle so neither aliases the
+        // `&mut self.history` borrow during the summarisation call.
+        let compressor = self.context_compressor.clone();
+        let provider = Arc::clone(&self.provider);
+        match compressor
+            .compress(&mut self.history, provider.as_ref(), ctx_window)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    before_messages = before,
+                    after_messages = self.history.len(),
+                    "auto-compacted conversation context"
+                );
+                self.callbacks.on_status("compacted context");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // A compaction failure must never abort the turn — log it and
+                // continue with the uncompacted history (the provider call may
+                // still succeed, or surface its own context error).
+                tracing::warn!("context compaction failed: {e}");
+            }
+        }
     }
 
     /// Find a tool by name and execute it. Returns the formatted output string
@@ -1465,6 +1529,8 @@ pub struct AgentBuilder {
     auxiliary_client: Option<Arc<crate::providers::AuxiliaryClient>>,
     callbacks: Option<super::callbacks::CallbacksHandle>,
     interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    context_compressor: Option<ContextCompressor>,
+    compression_enabled: Option<bool>,
 }
 
 impl AgentBuilder {
@@ -1489,6 +1555,8 @@ impl AgentBuilder {
             auxiliary_client: None,
             callbacks: None,
             interrupt_flag: None,
+            context_compressor: None,
+            compression_enabled: None,
         }
     }
 
@@ -1642,6 +1710,21 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the automatic context compactor. Defaults to
+    /// `ContextCompressor::default()` (compress at 50% of the context window)
+    /// when not supplied.
+    pub fn context_compressor(mut self, compressor: ContextCompressor) -> Self {
+        self.context_compressor = Some(compressor);
+        self
+    }
+
+    /// Enable or disable automatic mid-turn context compaction. Defaults to
+    /// `true`.
+    pub fn compression_enabled(mut self, enabled: bool) -> Self {
+        self.compression_enabled = Some(enabled);
+        self
+    }
+
     /// Build the [`Agent`], validating that required fields are set.
     pub fn build(self) -> Result<Agent> {
         let provider = self
@@ -1721,6 +1804,10 @@ impl AgentBuilder {
             callbacks: self
                 .callbacks
                 .unwrap_or_else(super::callbacks::noop_callbacks),
+            context_compressor: self
+                .context_compressor
+                .unwrap_or_default(),
+            compression_enabled: self.compression_enabled.unwrap_or(true),
         })
     }
 }
