@@ -121,11 +121,13 @@ Anthropic specifically supports OAuth via `fennec login`; other providers use
 `provider.api_key` (encrypted at rest) or the equivalent env var
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `KIMI_API_KEY`).
 
-**Azure OpenAI / Foundry** (`provider.name = "azure"`) needs structured config
-rather than the setup wizard: set `provider.base_url` to your resource endpoint
-(`https://<resource>.openai.azure.com`) and `provider.model` to the *deployment*
-name. Auth is auto-detected — an `AZURE_OPENAI_API_KEY` (or `provider.api_key`)
-uses key auth; otherwise it goes keyless via Microsoft Entra ID, either through
+**Azure OpenAI / Foundry** (`provider.name = "azure"`) is configured via
+`config.toml`: set `provider.base_url` to your resource endpoint
+(`https://<resource>.openai.azure.com`) and `provider.model` to the model family
+(`gpt-5`, `o3-mini`, …). The deployment used for routing defaults to that model
+name; set `AZURE_DEPLOYMENT` when your deployment is named differently. Auth is
+auto-detected — an `AZURE_OPENAI_API_KEY` (or `provider.api_key`) uses key auth;
+otherwise it goes keyless via Microsoft Entra ID, either through
 `AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` (service principal) or
 the Azure CLI (`az login`). Override `AZURE_OPENAI_API_VERSION` /
 `AZURE_OPENAI_SCOPE` if needed.
