@@ -193,6 +193,7 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         "openai" => "OPENAI_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
+        "codex" | "openai-responses" => "OPENAI_API_KEY",
         "ollama" => return Ok(String::new()), // Ollama needs no key
         _ => "ANTHROPIC_API_KEY",
     };
@@ -390,6 +391,25 @@ fn build_provider(
         "openrouter" => {
             let or_url = base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
             Box::new(OpenAIProvider::new(api_key, Some(model), Some(or_url), None))
+        }
+        "codex" | "openai-responses" => {
+            // Back-compat: if the user switched to Codex but kept an
+            // Anthropic-flavored default model string, fall back to a
+            // Responses-capable default rather than passing a non-OpenAI id.
+            let codex_model = if model.is_empty()
+                || model == "claude-sonnet-4-6"
+                || model == "claude-sonnet-4-20250514"
+            {
+                "gpt-5-codex".to_string()
+            } else {
+                model
+            };
+            Box::new(fennec::providers::CodexResponsesProvider::new(
+                api_key,
+                Some(codex_model),
+                base_url,
+                None,
+            ))
         }
         "ollama" => {
             // Same back-compat as kimi: accept both new and old Anthropic

@@ -46,6 +46,7 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         "OpenAI (GPT-4o)",
         "Kimi (Moonshot)",
         "OpenRouter (any model)",
+        "OpenAI Codex (Responses API)",
         "Ollama (local)",
     ];
     let provider_idx = Select::new()
@@ -63,7 +64,8 @@ pub fn run_wizard(fennec_home: &std::path::Path) -> anyhow::Result<()> {
             "anthropic/claude-sonnet-4",
             "OPENROUTER_API_KEY",
         ),
-        4 => ("ollama", "llama3.1", ""),
+        4 => ("codex", "gpt-5-codex", "OPENAI_API_KEY"),
+        5 => ("ollama", "llama3.1", ""),
         _ => ("anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
     };
     frame.complete_step(StepSummary::done(
@@ -311,6 +313,7 @@ fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
         "OpenAI (GPT-4o)",
         "Kimi (Moonshot)",
         "OpenRouter (any model)",
+        "OpenAI Codex (Responses API)",
         "Ollama (local)",
     ];
     let provider_idx = Select::new()
@@ -328,7 +331,8 @@ fn run_wizard_classic(fennec_home: &std::path::Path) -> anyhow::Result<()> {
             "anthropic/claude-sonnet-4",
             "OPENROUTER_API_KEY",
         ),
-        4 => ("ollama", "llama3.1", ""),
+        4 => ("codex", "gpt-5-codex", "OPENAI_API_KEY"),
+        5 => ("ollama", "llama3.1", ""),
         _ => ("anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
     };
 
