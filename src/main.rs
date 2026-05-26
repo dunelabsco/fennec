@@ -607,8 +607,8 @@ async fn build_agent_with_callbacks(
     let browser_tool = BrowserTool::new();
 
     // Vision tool: only wired when the configured provider supports vision
-    // (anthropic, openai) AND we can resolve an API key. OAuth-only users and
-    // non-vision providers silently skip it.
+    // (anthropic, openai, gemini) AND we can resolve an API key. OAuth-only
+    // users and non-vision providers silently skip it.
     let vision_api_key = resolve_api_key(config, &secret_store)
         .ok()
         .unwrap_or_default();
