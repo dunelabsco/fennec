@@ -96,6 +96,20 @@ pub fn check_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Check
         return CheckResult::pass("api_key", "ollama requires no key");
     }
 
+    // Azure can use an API key OR keyless Entra ID, so a missing key isn't a
+    // failure here.
+    if matches!(config.provider.name.as_str(), "azure" | "foundry") {
+        for key_var in ["AZURE_OPENAI_API_KEY", "AZURE_FOUNDRY_API_KEY"] {
+            if std::env::var(key_var).map(|v| !v.is_empty()).unwrap_or(false) {
+                return CheckResult::pass("api_key", format!("from {key_var} env"));
+            }
+        }
+        if !config.provider.api_key.is_empty() {
+            return CheckResult::pass("api_key", "from config.toml");
+        }
+        return CheckResult::pass("api_key", "keyless — using Microsoft Entra ID (CLI / service principal)");
+    }
+
     if !config.provider.api_key.is_empty() {
         match secret_store.decrypt(&config.provider.api_key) {
             Ok(k) if !k.is_empty() => {
@@ -159,6 +173,14 @@ pub async fn check_provider_reachable(
     config: &FennecConfig,
     api_key: &str,
 ) -> CheckResult {
+    // Azure routing + Entra token acquisition are involved enough that a
+    // trivial GET probe isn't representative — verify it by actually running.
+    if matches!(config.provider.name.as_str(), "azure" | "foundry") {
+        return CheckResult::warn(
+            "provider_reachable",
+            "skipped — Azure provider (verify with a real request)",
+        );
+    }
     if api_key.is_empty() && config.provider.name != "ollama" {
         return CheckResult::warn(
             "provider_reachable",
