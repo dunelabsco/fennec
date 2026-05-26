@@ -108,6 +108,7 @@ both paths work.
 |---|---|---|
 | Anthropic | SSE | Extended thinking, budget tokens |
 | OpenAI | chunked | `reasoning_effort` (o1 family) |
+| OpenAI Codex (Responses API) | SSE | `reasoning.effort` (gpt-5 / codex) |
 | Ollama | ND-JSON | temperature fallback |
 | OpenRouter | passes through | passes through to underlying model |
 | Kimi / Moonshot | OpenAI-shaped | temperature fallback |
@@ -119,6 +120,10 @@ fallback chain with cooldowns and an overall deadline.
 Anthropic specifically supports OAuth via `fennec login`; other providers use
 `provider.api_key` (encrypted at rest) or the equivalent env var
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `KIMI_API_KEY`).
+
+Set `provider.name = "codex"` to use OpenAI's Responses API (`/v1/responses`,
+for gpt-5 / Codex models) instead of Chat Completions; it authenticates with the
+same `OPENAI_API_KEY`.
 
 ## Tools
 
