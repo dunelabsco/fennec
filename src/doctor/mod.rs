@@ -96,6 +96,18 @@ pub fn check_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Check
         return CheckResult::pass("api_key", "ollama requires no key");
     }
 
+    // Bedrock authenticates with AWS credentials (env vars or instance role),
+    // not a single API key.
+    if matches!(config.provider.name.as_str(), "bedrock" | "aws") {
+        if std::env::var("AWS_ACCESS_KEY_ID").map(|v| !v.is_empty()).unwrap_or(false) {
+            return CheckResult::pass("api_key", "AWS credentials from env");
+        }
+        return CheckResult::pass(
+            "api_key",
+            "AWS credentials via env or instance role (IMDS)",
+        );
+    }
+
     if !config.provider.api_key.is_empty() {
         match secret_store.decrypt(&config.provider.api_key) {
             Ok(k) if !k.is_empty() => {
@@ -159,6 +171,14 @@ pub async fn check_provider_reachable(
     config: &FennecConfig,
     api_key: &str,
 ) -> CheckResult {
+    // Bedrock requires SigV4-signed requests, so a trivial GET probe isn't
+    // representative — verify it by actually running.
+    if matches!(config.provider.name.as_str(), "bedrock" | "aws") {
+        return CheckResult::warn(
+            "provider_reachable",
+            "skipped — Bedrock (verify with a real request)",
+        );
+    }
     if api_key.is_empty() && config.provider.name != "ollama" {
         return CheckResult::warn(
             "provider_reachable",
