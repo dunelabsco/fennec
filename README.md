@@ -116,6 +116,11 @@ Switch providers by setting `provider.name` in config; no code changes. The
 `reliable_provider` wrapper (in `src/providers/reliable.rs`) lets you list a
 fallback chain with cooldowns and an overall deadline.
 
+Per-model context windows and pricing (shown in `/usage`) come from a baked-in
+baseline refined by the [models.dev](https://models.dev) catalog, cached locally
+and refreshed in the background (24h TTL) — so it works offline and gets more
+accurate online. See `src/agent/model_metadata.rs`.
+
 Anthropic specifically supports OAuth via `fennec login`; other providers use
 `provider.api_key` (encrypted at rest) or the equivalent env var
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `KIMI_API_KEY`).

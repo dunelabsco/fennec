@@ -477,6 +477,10 @@ async fn build_agent_with_callbacks(
     fennec::bus::ChatDirectory,
     Arc<dyn Provider>,
 )> {
+    // Refresh the models.dev metadata cache in the background (best-effort,
+    // TTL-gated) so per-model context windows + pricing stay current.
+    fennec::agent::model_metadata::refresh_in_background();
+
     // Create SecretStore.
     let secret_store =
         SecretStore::new(home_dir.to_path_buf()).context("creating secret store")?;
