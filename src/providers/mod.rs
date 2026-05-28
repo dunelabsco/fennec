@@ -4,6 +4,7 @@ pub mod anthropic;
 pub mod openai;
 pub mod openrouter;
 pub mod ollama;
+pub mod error_classifier;
 pub mod reliable;
 pub mod router;
 pub mod auxiliary;
