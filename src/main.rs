@@ -112,8 +112,13 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Authenticate with Anthropic via OAuth
-    Login,
+    /// Authenticate via OAuth. Defaults to Anthropic; pass
+    /// `--provider copilot` to sign in to GitHub for the Copilot provider.
+    Login {
+        /// Which provider to authenticate: `anthropic` (default) or `copilot`.
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+    },
     /// Run diagnostic checks — provider reachability, API key, memory DB, Plurum, config.
     Doctor,
     /// Manage the skill curator — periodic background consolidation
@@ -207,6 +212,9 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         "openai" => "OPENAI_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
+        // Copilot uses a GitHub OAuth token exchanged for a Copilot token by
+        // the provider — there's no single API key to read here.
+        "copilot" | "github-copilot" => return Ok(String::new()),
         "ollama" => return Ok(String::new()), // Ollama needs no key
         _ => "ANTHROPIC_API_KEY",
     };
@@ -404,6 +412,12 @@ fn build_provider(
         "openrouter" => {
             let or_url = base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
             Box::new(OpenAIProvider::new(api_key, Some(model), Some(or_url), None))
+        }
+        "copilot" | "github-copilot" => {
+            // OpenAI-compatible chat over api.githubcopilot.com; auth is a
+            // GitHub-token → Copilot-token exchange handled by the provider.
+            let _ = api_key; // Copilot uses a GitHub OAuth token, not the api_key.
+            Box::new(fennec::providers::CopilotProvider::new(Some(model), base_url, None))
         }
         "azure" | "foundry" => {
             // `model` is the Azure *deployment* name; base_url is the resource
@@ -3896,9 +3910,18 @@ async fn main() -> Result<()> {
             }
             fennec::onboard::run_wizard(&home_dir)?;
         }
-        Commands::Login => {
-            auth::run_oauth_login(&home_dir)?;
-        }
+        Commands::Login { provider } => match provider.as_str() {
+            "anthropic" => {
+                auth::run_oauth_login(&home_dir)?;
+            }
+            "copilot" | "github-copilot" => {
+                auth::github_copilot::run_device_login()?;
+                println!("Signed in to GitHub. Set `provider.name = \"copilot\"` to use Copilot.");
+            }
+            other => {
+                anyhow::bail!("unknown login provider '{other}'. Use 'anthropic' or 'copilot'.");
+            }
+        },
         Commands::Doctor => {
             run_doctor(&config, &home_dir).await?;
         }
