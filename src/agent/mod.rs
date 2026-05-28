@@ -5,6 +5,7 @@ pub mod compressor;
 pub mod context;
 pub mod delegation;
 pub mod loop_;
+pub mod model_metadata;
 pub mod pricing;
 pub mod scrub;
 pub mod subagent;

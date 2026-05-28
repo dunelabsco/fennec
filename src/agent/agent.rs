@@ -1099,8 +1099,11 @@ impl Agent {
 
     pub fn token_usage(&self) -> TokenUsage {
         let model = self.provider.model().to_string();
-        let context_max = self.provider.context_window();
-        let cost_usd = super::pricing::estimate_cost(
+        // Prefer the per-model context window (models.dev overlay → static
+        // baseline); fall back to the provider's own default when unknown.
+        let context_max = super::model_metadata::context_window(&model)
+            .unwrap_or_else(|| self.provider.context_window());
+        let cost_usd = super::model_metadata::estimate_cost(
             &model,
             self.total_input_tokens,
             self.total_output_tokens,
