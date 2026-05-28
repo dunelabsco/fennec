@@ -108,6 +108,7 @@ both paths work.
 |---|---|---|
 | Anthropic | SSE | Extended thinking, budget tokens |
 | OpenAI | chunked | `reasoning_effort` (o1 family) |
+| AWS Bedrock | event-stream (Converse) | temperature fallback |
 | Ollama | ND-JSON | temperature fallback |
 | OpenRouter | passes through | passes through to underlying model |
 | Kimi / Moonshot | OpenAI-shaped | temperature fallback |
@@ -119,6 +120,16 @@ fallback chain with cooldowns and an overall deadline.
 Anthropic specifically supports OAuth via `fennec login`; other providers use
 `provider.api_key` (encrypted at rest) or the equivalent env var
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `KIMI_API_KEY`).
+
+**AWS Bedrock** (`provider.name = "bedrock"`) uses the Converse API with
+SigV4-signed requests — no AWS SDK dependency. Set `provider.model` to the
+Bedrock model or inference-profile id (e.g.
+`anthropic.claude-3-5-sonnet-20241022-v2:0` or `us.anthropic.claude-…`).
+Credentials resolve through a chain (env static keys → web-identity / EKS IRSA
+via `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` → named profile from
+`~/.aws/credentials` (`AWS_PROFILE`) → EC2/EKS instance role via IMDSv2); region
+from `AWS_REGION` / `AWS_DEFAULT_REGION` (default `us-east-1`). SSO /
+assume-role profiles are a follow-up.
 
 ## Tools
 

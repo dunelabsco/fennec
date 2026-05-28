@@ -193,6 +193,9 @@ fn resolve_api_key(config: &FennecConfig, secret_store: &SecretStore) -> Result<
         "openai" => "OPENAI_API_KEY",
         "kimi" | "moonshot" => "KIMI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
+        // Bedrock authenticates with AWS credentials (resolved by the provider
+        // from env/IMDS), not a single API key.
+        "bedrock" | "aws" => return Ok(String::new()),
         "ollama" => return Ok(String::new()), // Ollama needs no key
         _ => "ANTHROPIC_API_KEY",
     };
@@ -390,6 +393,17 @@ fn build_provider(
         "openrouter" => {
             let or_url = base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
             Box::new(OpenAIProvider::new(api_key, Some(model), Some(or_url), None))
+        }
+        "bedrock" | "aws" => {
+            // `model` is the Bedrock model / inference-profile id; auth comes
+            // from AWS credentials (env vars or IMDS instance role). base_url,
+            // if set, overrides the derived bedrock-runtime endpoint.
+            let _ = api_key; // Bedrock uses AWS creds, not the api_key.
+            Box::new(fennec::providers::BedrockProvider::new(
+                Some(model),
+                base_url,
+                None,
+            ))
         }
         "ollama" => {
             // Same back-compat as kimi: accept both new and old Anthropic
