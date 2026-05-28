@@ -80,7 +80,7 @@ overwrite.
 | `fennec agent` | Interactive chat session. `--message <text>` for single-shot. `--model <id>` to override. |
 | `fennec gateway` | Start the multi-channel server. Runs all configured channels, the HTTP gateway, the cron scheduler, and the heartbeat loop together. |
 | `fennec onboard` | Interactive setup wizard. `--force` overwrites an existing config. |
-| `fennec login` | Anthropic OAuth (PKCE) flow. Persists encrypted token. Alternative to setting `provider.api_key`. |
+| `fennec login` | OAuth flow. Default: Anthropic (PKCE). `--provider copilot` runs the GitHub device-code flow for the Copilot provider. |
 | `fennec doctor` | Self-diagnostic — verifies provider reachability, API key validity, memory DB schema, Plurum connectivity, skill loading, and channel config. |
 | `fennec status` | Print version and quick status. |
 
@@ -108,6 +108,8 @@ both paths work.
 |---|---|---|
 | Anthropic | SSE | Extended thinking, budget tokens |
 | OpenAI | chunked | `reasoning_effort` (o1 family) |
+| Azure OpenAI / Foundry | chunked | `reasoning_effort` (o-series / gpt-5) |
+| GitHub Copilot | chunked | `reasoning_effort` (per underlying model) |
 | Ollama | ND-JSON | temperature fallback |
 | OpenRouter | passes through | passes through to underlying model |
 | Kimi / Moonshot | OpenAI-shaped | temperature fallback |
@@ -119,6 +121,25 @@ fallback chain with cooldowns and an overall deadline.
 Anthropic specifically supports OAuth via `fennec login`; other providers use
 `provider.api_key` (encrypted at rest) or the equivalent env var
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `KIMI_API_KEY`).
+
+**Azure OpenAI / Foundry** (`provider.name = "azure"`) is configured via
+`config.toml`: set `provider.base_url` to your resource endpoint
+(`https://<resource>.openai.azure.com`) and `provider.model` to the model family
+(`gpt-5`, `o3-mini`, …). The deployment used for routing defaults to that model
+name; set `AZURE_DEPLOYMENT` when your deployment is named differently. Auth is
+auto-detected — an `AZURE_OPENAI_API_KEY` (or `provider.api_key`) uses key auth;
+otherwise it goes keyless via Microsoft Entra ID, either through
+`AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` (service principal) or
+the Azure CLI (`az login`). Override `AZURE_OPENAI_API_VERSION` /
+`AZURE_OPENAI_SCOPE` if needed.
+
+**GitHub Copilot** (`provider.name = "copilot"`) uses the OpenAI-compatible
+Copilot chat API. It needs a Copilot-enabled GitHub OAuth token (`gho_`/`ghu_`,
+not a classic PAT), resolved from `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` /
+`GITHUB_TOKEN`, then `gh auth token`, then a token saved by
+`fennec login --provider copilot` (GitHub device-code flow). The provider
+exchanges it for a short-lived Copilot token automatically. Set
+`provider.model` to a Copilot model id (`gpt-4o`, `o1`, `claude-3.5-sonnet`, …).
 
 ## Tools
 
