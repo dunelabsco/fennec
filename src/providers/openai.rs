@@ -335,6 +335,23 @@ pub(crate) fn is_reasoning_model(model: &str) -> bool {
             }
         }
     }
+    // Kimi / Moonshot reasoning models. K1.5, K2, and K2.5 all reject
+    // arbitrary `temperature` values — they accept only `temperature=1`,
+    // returning 400 "invalid temperature: only 1 is allowed for this
+    // model" otherwise. Treat them as reasoning so we omit the field
+    // entirely (Kimi's API defaults to 1 when omitted). Matches both
+    // `kimi-kN.M` and `kimi-kN` shapes (dot is optional in the spec).
+    for prefix in ["kimi-k1", "kimi-k2"] {
+        if let Some(rest) = m.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with('-') || rest.starts_with('.') {
+                return true;
+            }
+        }
+    }
+    // Kimi's standalone thinking-preview alias is also a reasoning model.
+    if m.starts_with("kimi-thinking") {
+        return true;
+    }
     false
 }
 
@@ -772,6 +789,26 @@ mod tests {
         assert!(is_reasoning_model("O1"));
         assert!(is_reasoning_model("O3-Mini"));
         assert!(is_reasoning_model("GPT-5.1"));
+    }
+
+    #[test]
+    fn is_reasoning_model_kimi_family() {
+        // Kimi k1.5 / k2 / k2.5 all 400 with
+        // "invalid temperature: only 1 is allowed for this model"
+        // when temperature is sent. Treat as reasoning so we omit it.
+        assert!(is_reasoning_model("kimi-k2.5"));
+        assert!(is_reasoning_model("kimi-k2"));
+        assert!(is_reasoning_model("kimi-k1.5"));
+        assert!(is_reasoning_model("kimi-k1"));
+        assert!(is_reasoning_model("kimi-k2-instruct"));
+        assert!(is_reasoning_model("kimi-thinking-preview"));
+        // Non-reasoning moonshot chat models still accept temperature.
+        assert!(!is_reasoning_model("moonshot-v1-8k"));
+        assert!(!is_reasoning_model("moonshot-v1-32k"));
+        assert!(!is_reasoning_model("moonshot-v1-128k"));
+        // Don't false-match unrelated names that share the prefix.
+        assert!(!is_reasoning_model("kimi-old"));
+        assert!(!is_reasoning_model("kimi-chat"));
     }
 
     #[test]
