@@ -2,3 +2,4 @@ target/
 research/
 .DS_Store
 docs/
+.claude/
