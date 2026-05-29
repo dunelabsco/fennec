@@ -25,37 +25,64 @@ warn()  { echo -e "${YELLOW}[fennec]${NC} $1"; }
 error() { echo -e "${RED}[fennec]${NC} $1"; exit 1; }
 
 install_system_deps() {
-    log "Checking system dependencies..."
+    log "Installing system dependencies..."
 
-    local need_install=false
+    # We install unconditionally rather than probing for individual
+    # tools — the previous "only run if git/gcc/make missing" check
+    # silently skipped libssl-dev / pkg-config / libasound2-dev on
+    # boxes that happened to have build tools but no headers, so
+    # cargo died at link time with an inscrutable openssl-sys error.
+    # apt/dnf/etc. are idempotent — re-running install on a present
+    # package is a no-op, costing only a few seconds.
+    #
+    # Linux dep map:
+    #   pkg-config          — build-tool used by -sys crates
+    #   libssl-dev          — native-tls (SMTP via lettre)
+    #   libasound2-dev      — cpal (TUI voice/audio mode)
+    #   libxcb*-dev (×4)    — arboard (TUI /paste clipboard)
+    #   build-essential     — gcc/g++/make for any -sys crate
+    #   git, curl           — fetching the repo + rustup
 
-    for cmd in git gcc make; do
-        if ! command -v "$cmd" &>/dev/null; then
-            need_install=true
-            break
-        fi
-    done
-
-    if [ "$need_install" = true ]; then
-        log "Installing build tools..."
-        if command -v apt-get &>/dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq build-essential pkg-config libssl-dev git curl
-        elif command -v yum &>/dev/null; then
-            sudo yum install -y gcc gcc-c++ make openssl-devel pkg-config git curl
-        elif command -v dnf &>/dev/null; then
-            sudo dnf install -y gcc gcc-c++ make openssl-devel pkg-config git curl
-        elif command -v pacman &>/dev/null; then
-            sudo pacman -Sy --noconfirm base-devel openssl git curl
-        elif command -v apk &>/dev/null; then
-            sudo apk add build-base openssl-dev pkgconfig git curl
-        else
-            error "Could not detect package manager. Please install: git, gcc, make, pkg-config, libssl-dev"
-        fi
-        log "System dependencies installed."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq \
+            build-essential pkg-config libssl-dev \
+            libasound2-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            git curl
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y \
+            gcc gcc-c++ make pkg-config openssl-devel \
+            alsa-lib-devel \
+            libxcb-devel \
+            git curl
+    elif command -v yum &>/dev/null; then
+        sudo yum install -y \
+            gcc gcc-c++ make pkg-config openssl-devel \
+            alsa-lib-devel \
+            libxcb-devel \
+            git curl
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -Sy --noconfirm \
+            base-devel pkg-config openssl \
+            alsa-lib \
+            libxcb \
+            git curl
+    elif command -v apk &>/dev/null; then
+        sudo apk add \
+            build-base pkgconfig openssl-dev \
+            alsa-lib-dev \
+            libxcb-dev \
+            git curl
+    elif command -v brew &>/dev/null; then
+        # macOS: openssl + audio are system-provided; pkg-config
+        # is the one thing brew users commonly miss.
+        brew install pkg-config openssl@3 git
     else
-        log "System dependencies already present."
+        warn "Could not detect package manager. You may need to install manually:"
+        warn "  pkg-config, libssl-dev, libasound2-dev, libxcb dev headers, build tools"
     fi
+    log "System dependencies ready."
 }
 
 check_deps() {
