@@ -124,6 +124,7 @@ pub async fn run(
             },
             tool_call_id: None,
             attachments: None,
+            reasoning: None,
         };
         messages.push(assistant_msg);
 

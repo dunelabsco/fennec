@@ -79,6 +79,7 @@ pub async fn load_history(
             tool_calls: None,
             tool_call_id: None,
             attachments: None,
+            reasoning: None,
         })
         .collect();
     Ok(messages)
@@ -206,6 +207,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 attachments: None,
+                reasoning: None,
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -213,6 +215,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 attachments: None,
+                reasoning: None,
             },
         ];
         append_messages(&store, "c1", &msgs).await.unwrap();
@@ -238,6 +241,7 @@ mod tests {
                 }]),
                 tool_call_id: None,
                 attachments: None,
+                reasoning: None,
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -245,6 +249,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 attachments: None,
+                reasoning: None,
             },
         ];
         append_messages(&store, "c1", &msgs).await.unwrap();

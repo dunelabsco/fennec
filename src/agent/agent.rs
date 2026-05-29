@@ -408,11 +408,16 @@ impl Agent {
                 return Ok(text);
             }
 
-            // Push assistant message with tool calls.
+            // Push assistant message with tool calls. Preserve the
+            // turn's reasoning text alongside it — Kimi K2.5 and a
+            // few other reasoning-family endpoints 400 on the next
+            // request if a tool-call assistant message echoes back
+            // without its accompanying `reasoning_content`.
             let mut assistant_msg = ChatMessage::assistant(
                 response.content.as_deref().unwrap_or(""),
             );
             assistant_msg.tool_calls = Some(response.tool_calls.clone());
+            assistant_msg.reasoning = response.reasoning.clone();
             self.history.push(assistant_msg);
 
             // Execute each tool call and push results. Combines:
@@ -694,6 +699,7 @@ impl Agent {
             self.total_api_calls += 1;
 
             let mut accumulated_text = String::new();
+            let mut accumulated_reasoning = String::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
             // (id, name, args_buffer) for the in-flight tool call.
             let mut current_tool: Option<(String, String, String)> = None;
@@ -706,9 +712,14 @@ impl Agent {
                     }
                     StreamEvent::Reasoning(text) => {
                         // Forward reasoning deltas to the
-                        // frontend; not appended to
-                        // accumulated_text since the assistant
-                        // message is text-only at this layer.
+                        // frontend AND accumulate them so we can
+                        // attach the full reasoning trace to the
+                        // assistant message — Kimi K2.5 and other
+                        // reasoning-family providers 400 on the
+                        // next request when a tool-call assistant
+                        // message echoes back without its
+                        // accompanying `reasoning_content`.
+                        accumulated_reasoning.push_str(&text);
                         self.callbacks.on_reasoning_delta(&text);
                     }
                     StreamEvent::ToolCallStart { id, name } => {
@@ -764,6 +775,9 @@ impl Agent {
             // results, then loop for the next provider call.
             let mut assistant_msg = ChatMessage::assistant(&accumulated_text);
             assistant_msg.tool_calls = Some(tool_calls.clone());
+            if !accumulated_reasoning.is_empty() {
+                assistant_msg.reasoning = Some(accumulated_reasoning.clone());
+            }
             self.history.push(assistant_msg);
 
             for tc in &tool_calls {

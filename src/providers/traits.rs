@@ -52,6 +52,16 @@ pub struct ChatMessage {
     /// message as text-only (the common case).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<ImageAttachmentRef>>,
+    /// Reasoning/thinking text the assistant produced alongside this
+    /// turn's content + tool calls. Some reasoning-family endpoints
+    /// (Kimi K2.5, DeepSeek reasoner, Moonshot thinking-preview)
+    /// 400 on subsequent turns if an assistant message with
+    /// tool_calls is sent back without its accompanying
+    /// `reasoning_content`. Persisting this on `ChatMessage` lets
+    /// the next request reconstruct that field. `None` for
+    /// non-reasoning turns and for providers that don't surface it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Provider-agnostic image payload carried on a `ChatMessage`.
@@ -76,6 +86,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             attachments: None,
+            reasoning: None,
         }
     }
 
@@ -87,6 +98,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             attachments: None,
+            reasoning: None,
         }
     }
 
@@ -98,6 +110,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             attachments: None,
+            reasoning: None,
         }
     }
 
@@ -109,6 +122,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             attachments: None,
+            reasoning: None,
         }
     }
 }

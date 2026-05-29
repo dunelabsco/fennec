@@ -680,6 +680,7 @@ pub async fn responses(
                 tool_calls: None,
                 tool_call_id: None,
                 attachments: None,
+                reasoning: None,
             })
             .collect()
     } else if let Some(prev_id) = &prev_id_for_chain {
@@ -1363,6 +1364,7 @@ fn openai_message_to_internal(m: &ChatRequestMessage) -> ChatMessage {
             }),
         tool_call_id: m.tool_call_id.clone(),
         attachments: None,
+        reasoning: None,
     }
 }
 

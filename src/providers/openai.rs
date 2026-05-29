@@ -79,6 +79,17 @@ impl OpenAIProvider {
                                 m["content"] = json!(content);
                             }
                         }
+                        // Echo back any reasoning we captured on the
+                        // original response. Kimi K2.5 (and other
+                        // reasoning-family endpoints) 400 when a
+                        // tool-call assistant message shows up
+                        // without its matching `reasoning_content`.
+                        // Stock OpenAI ignores the extra field.
+                        if let Some(ref r) = msg.reasoning {
+                            if !r.is_empty() {
+                                m["reasoning_content"] = json!(r);
+                            }
+                        }
                         api_messages.push(m);
                     } else {
                         api_messages.push(json!({
