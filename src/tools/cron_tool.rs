@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 
-use crate::cron::jobs::{parse_schedule, CronJob, JobStore};
+use crate::cron::jobs::{
+    compute_next_run, parse_schedule_kind, schedule_display_for, CronJob, JobStore, RepeatConfig,
+};
 
 use super::traits::{Tool, ToolResult};
 
@@ -50,16 +52,6 @@ impl CronTool {
         Ok(store)
     }
 
-    /// Normalise a schedule string: if it lacks the "every " prefix, add it.
-    fn normalise_schedule(schedule: &str) -> String {
-        let trimmed = schedule.trim();
-        if trimmed.starts_with("every ") {
-            trimmed.to_string()
-        } else {
-            format!("every {}", trimmed)
-        }
-    }
-
     fn execute_create(&self, prompt: Option<&str>, schedule: Option<&str>) -> Result<ToolResult> {
         let prompt = match prompt {
             Some(p) if !p.is_empty() => p,
@@ -83,20 +75,21 @@ impl CronTool {
             }
         };
 
-        let schedule_str = Self::normalise_schedule(schedule_raw);
-        let interval_secs = match parse_schedule(&schedule_str) {
-            Some(s) => s,
-            None => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "invalid schedule '{}'. Use formats like '5m', '1h', 'every 30m', 'every 1h'.",
-                        schedule_raw
-                    )),
-                });
-            }
-        };
+        // No auto-`every`-prefix: bare durations are one-shot, `every X`
+        // is recurring, `0 9 * * *` is a cron expression, and an ISO
+        // timestamp is a one-shot at that moment. Matches the reference
+        // agent's semantics so prompts written for either work the same.
+        let schedule_str = schedule_raw.trim().to_string();
+        if parse_schedule_kind(&schedule_str).is_none() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "invalid schedule '{}'. Use:\n  - Duration (one-shot):    '30m', '2h', '1d'\n  - Interval (recurring):   'every 30m', 'every 2h'\n  - Cron expression:        '0 9 * * 1-5', '*/15 * * * *'\n  - Timestamp (one-shot):   '2026-02-03T14:00:00'",
+                    schedule_raw
+                )),
+            });
+        }
 
         // Read origin from shared state.
         //
@@ -120,17 +113,42 @@ impl CronTool {
         // human-typed: full length is fine.
         let job_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
-        let next_run = now + chrono::Duration::seconds(interval_secs as i64);
 
+        // Compute the next-run timestamp via the shared helper so this
+        // path matches the scheduler's own semantics exactly (cron
+        // expressions ask croner; one-shots return their delay or
+        // timestamp; recurring returns now + interval). `last_run=None`
+        // because the job has never fired yet.
+        let next_run_str = compute_next_run(&schedule_str, None).unwrap_or_else(|| {
+            // Schedule validated above, so this branch is unreachable
+            // in practice — keep a safe fallback so the tool never panics.
+            now.to_rfc3339()
+        });
+        let next_run_dt =
+            chrono::DateTime::parse_from_rfc3339(&next_run_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or(now);
         let job = CronJob {
             id: job_id.clone(),
             name: prompt.chars().take(60).collect::<String>(),
             schedule: schedule_str.clone(),
             command: prompt.to_string(),
             enabled: true,
-            last_run: Some(now.to_rfc3339()),
+            // No anchor — last_run is set by `mark_job_run` after the
+            // first real fire. next_run_at carries the scheduling state.
+            last_run: None,
             origin_channel: origin.as_ref().map(|o| o.channel.clone()),
             origin_chat_id: origin.as_ref().map(|o| o.chat_id.clone()),
+            state: "scheduled".to_string(),
+            created_at: Some(now.to_rfc3339()),
+            next_run_at: Some(next_run_str.clone()),
+            last_status: None,
+            last_error: None,
+            last_delivery_error: None,
+            paused_at: None,
+            paused_reason: None,
+            repeat: RepeatConfig::default(),
+            schedule_display: schedule_display_for(&schedule_str),
         };
 
         let mut store = self.load_store()?;
@@ -141,7 +159,7 @@ impl CronTool {
             "Scheduled job created.\n  ID: {}\n  Schedule: {}\n  Next run: {}\n  Prompt: {}",
             job_id,
             schedule_str,
-            next_run.format("%Y-%m-%d %H:%M:%S UTC"),
+            next_run_dt.format("%Y-%m-%d %H:%M:%S UTC"),
             prompt,
         );
 
@@ -239,7 +257,7 @@ impl Tool for CronTool {
                 },
                 "schedule": {
                     "type": "string",
-                    "description": "When to fire: '5m', '1h', 'every 30m', 'every 1h' (for create)"
+                    "description": "When to fire (for create). Four formats: (1) bare duration like '30m', '2h', '1d' — one-shot, fires once after the delay; (2) 'every <duration>' like 'every 30m', 'every 2h' — recurring; (3) cron expression like '0 9 * * 1-5' (weekdays at 9am) or '*/15 * * * *' (every 15 min) — standard 5- or 6-field syntax, recurring; (4) ISO 8601 timestamp like '2026-02-03T14:00:00' — one-shot at that specific moment."
                 },
                 "job_id": {
                     "type": "string",
@@ -322,7 +340,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_bare_duration() {
+    async fn test_create_bare_duration_is_one_shot() {
+        // Bare durations like "5m" are one-shot (fires once after the
+        // delay) — matching the upstream's semantics. The tool no
+        // longer auto-prepends "every", so a user writing "5m" gets a
+        // one-shot, not a recurring job.
         let dir = TempDir::new().unwrap();
         let tool = make_tool(&dir);
 
@@ -334,8 +356,95 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("every 5m"));
+        assert!(result.success, "create failed: {:?}", result.error);
+        assert!(
+            result.output.contains("Schedule: 5m"),
+            "expected verbatim '5m' in output, got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("every 5m"),
+            "should not auto-prepend 'every': {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_recurring_interval() {
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "Hourly status check",
+                "schedule": "every 1h"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "create failed: {:?}", result.error);
+        assert!(result.output.contains("every 1h"));
+    }
+
+    #[tokio::test]
+    async fn test_create_cron_expression() {
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "Weekday standup reminder",
+                "schedule": "0 9 * * 1-5"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "create failed: {:?}", result.error);
+        assert!(
+            result.output.contains("0 9 * * 1-5"),
+            "expected cron expression in output, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_iso_timestamp() {
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "Year-end review",
+                "schedule": "2099-12-31T23:59:00Z"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "create failed: {:?}", result.error);
+        assert!(
+            result.output.contains("2099-12-31T23:59:00Z"),
+            "expected timestamp in output, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_invalid_schedule() {
+        let dir = TempDir::new().unwrap();
+        let tool = make_tool(&dir);
+
+        let result = tool
+            .execute(json!({
+                "action": "create",
+                "prompt": "Bad schedule",
+                "schedule": "not a real schedule"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(err.contains("Cron expression"), "error should list all formats: {}", err);
+        assert!(err.contains("Timestamp"), "error should list timestamp format: {}", err);
     }
 
     #[tokio::test]
